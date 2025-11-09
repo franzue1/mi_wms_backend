@@ -3,26 +3,25 @@ from fastapi import FastAPI
 from app import database as db
 import traceback
 import contextlib
-# (Tus otras importaciones de 'app.api' están más abajo)
+
+# En mi_wms_backend/app/main.py
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
-    # El servidor se inicia CADA VEZ. Solo queremos verificar la conexión.
-    # Las tablas y datos ya fueron creados la PRIMERA VEZ.
-    print("--- Servidor iniciando, verificando conexión a BD... ---")
+    # --- VERSIÓN DE INICIALIZACIÓN ---
+    # Esto creará las tablas y los datos iniciales
+    print("--- Servidor iniciando, verificando base de datos... ---")
     try:
         conn = db.connect_db()
-        # Hacemos una consulta simple para verificar que la conexión funciona
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT 1")
+        db.create_schema(conn)      # <-- Esta línea es la clave
+        db.create_initial_data(conn) # <-- Y esta
         conn.close()
-        print("--- Conexión a Base de Datos exitosa. ---")
+        print("--- Base de datos verificada y/o inicializada. ---")
     except Exception as e:
-        print(f"!!! ERROR FATAL DURANTE EL INICIO: No se pudo conectar a la BD. {e}")
+        print(f"!!! ERROR FATAL DURANTE EL INICIO: No se pudo inicializar la BD. {e}")
         traceback.print_exc()
     
     yield
-    # Código que se ejecuta cuando la app se apaga
     print("--- Servidor apagándose. ---")
 
 app = FastAPI(
