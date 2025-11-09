@@ -4173,24 +4173,21 @@ def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id'
 
 def get_location_name_details(location_id):
     """
-    Obtiene el nombre de la ubicación y el nombre de su almacén asociado (si es interna).
-    Devuelve un diccionario {'location_name': 'Stock', 'warehouse_name': 'Almacén Lima'} o
-    {'location_name': 'Nombre Partner', 'warehouse_name': None} o None si no se encuentra.
+    Obtiene el nombre de la ubicación y el nombre/ID de su almacén asociado.
     """
     if not location_id:
         return None
-    # Usamos LEFT JOIN por si la ubicación no tiene almacén (aunque las internas deberían)
     query = """
         SELECT
             l.name as location_name,
             w.name as warehouse_name,
+            l.warehouse_id,  -- <-- ¡CORRECCIÓN! AÑADIR ESTA LÍNEA
             l.type as location_type
         FROM locations l
         LEFT JOIN warehouses w ON l.warehouse_id = w.id
-        WHERE l.id =  %s
+        WHERE l.id = %s
     """
     result = execute_query(query, (location_id,), fetchone=True)
-    # Devolvemos None si no se encontró la ubicación
     return dict(result) if result else None
 
 def get_partner_name(partner_id):
