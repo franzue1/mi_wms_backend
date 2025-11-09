@@ -1,45 +1,41 @@
 # app/main.py
 from fastapi import FastAPI
-# --- AÑADIR ESTAS IMPORTACIONES ---
 from app import database as db
 import traceback
 import contextlib
-# ---------------------------------
+# (Tus otras importaciones de 'app.api' están más abajo)
 
-# --- AÑADIR ESTE BLOQUE DE CÓDIGO ---
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Código que se ejecuta ANTES de que la app empiece a recibir peticiones
-    print("--- Servidor iniciando, verificando base de datos... ---")
+    # El servidor se inicia CADA VEZ. Solo queremos verificar la conexión.
+    # Las tablas y datos ya fueron creados la PRIMERA VEZ.
+    print("--- Servidor iniciando, verificando conexión a BD... ---")
     try:
         conn = db.connect_db()
-        db.create_schema(conn)      # Crea las tablas (ej: "users")
-        db.create_initial_data(conn) # Crea el usuario 'admin' y datos iniciales
+        # Hacemos una consulta simple para verificar que la conexión funciona
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT 1")
         conn.close()
-        print("--- Base de datos verificada y/o inicializada. ---")
+        print("--- Conexión a Base de Datos exitosa. ---")
     except Exception as e:
-        print(f"!!! ERROR FATAL DURANTE EL INICIO: No se pudo inicializar la BD. {e}")
+        print(f"!!! ERROR FATAL DURANTE EL INICIO: No se pudo conectar a la BD. {e}")
         traceback.print_exc()
     
     yield
-    # Código que se ejecuta cuando la app se apaga (no lo necesitamos ahora)
+    # Código que se ejecuta cuando la app se apaga
     print("--- Servidor apagándose. ---")
-# -----------------------------------
 
 app = FastAPI(
     title="Mi WMS Backend API",
     description="La API backend para el sistema TheBoringWMS.",
-    lifespan=lifespan # <-- AÑADIR ESTA LÍNEA
+    lifespan=lifespan # <-- Esta línea se queda igual
 )
 
-# ... (El resto de tu main.py: app.include_router(...), @app.get("/"), etc.)
-# (Asegúrate de que 'app.api' también esté importado si no lo moviste)
+# ... (El resto de tus imports de app.api y app.include_router) ...
 from app.api import (
     auth, products, warehouses, partners, locations, reports, 
     pickings, work_orders, adjustments, configuration, admin
 )
-
-# Incluimos los routers
 app.include_router(auth.router, prefix="/auth", tags=["Autenticación"])
 app.include_router(products.router, prefix="/products", tags=["Productos"])
 app.include_router(warehouses.router, prefix="/warehouses", tags=["Almacenes"])
