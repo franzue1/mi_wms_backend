@@ -4,25 +4,38 @@ from app import database as db
 import traceback
 import contextlib
 
-# En mi_wms_backend/app/main.py
-
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
-    # --- VERSIÓN DE INICIALIZACIÓN ---
-    # Esto creará las tablas y los datos iniciales
-    print("--- Servidor iniciando, verificando base de datos... ---")
+    # --- VERSIÓN DE PRODUCCIÓN (SOLO CONECTAR) ---
+    print("--- Servidor iniciando, verificando conexión a BD... ---")
     try:
         conn = db.connect_db()
-        db.create_schema(conn)      # <-- Esta línea es la clave
-        db.create_initial_data(conn) # <-- Y esta
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT 1") # Solo verifica la conexión
         conn.close()
-        print("--- Base de datos verificada y/o inicializada. ---")
+        print("--- Conexión a Base de Datos exitosa. ---")
     except Exception as e:
-        print(f"!!! ERROR FATAL DURANTE EL INICIO: No se pudo inicializar la BD. {e}")
+        print(f"!!! ERROR FATAL DURANTE EL INICIO: No se pudo conectar a la BD. {e}")
         traceback.print_exc()
     
     yield
     print("--- Servidor apagándose. ---")
+
+# ----Esto creará las tablas y los datos iniciales
+#@contextlib.asynccontextmanager
+#async def lifespan(app: FastAPI):
+#    print("--- Servidor iniciando, verificando base de datos... ---")
+#    try:
+#        conn = db.connect_db()
+#        db.create_schema(conn)      # <-- Esta línea es la clave
+#        db.create_initial_data(conn) # <-- Y esta
+#        conn.close()
+#        print("--- Base de datos verificada y/o inicializada. ---")
+#    except Exception as e:
+#        print(f"!!! ERROR FATAL DURANTE EL INICIO: No se pudo inicializar la BD. {e}")
+#        traceback.print_exc()
+#    yield
+#    print("--- Servidor apagándose. ---")
 
 app = FastAPI(
     title="Mi WMS Backend API",
