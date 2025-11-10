@@ -1,40 +1,139 @@
-# database.py
+# app/database.py
 import psycopg2
 import psycopg2.extras # Para acceder a los datos como diccionario
 import psycopg2.extensions
+import psycopg2.pool # <-- 1. IMPORTAR EL POOL
 import os
 from datetime import datetime, date, timedelta
 import traceback
 import functools
 from collections import defaultdict
-import hashlib # Ya deberías tenerlo
-from dotenv import load_dotenv # <-- 1. Importar
+import hashlib
+from dotenv import load_dotenv
 
+# --- 2. CONFIGURACIÓN DEL POOL GLOBAL ---
+# Este pool se creará UNA VEZ al iniciar la app.
+db_pool = None
 DATABASE_URL = None
 #DATABASE_URL = os.environ.get("DATABASE_URL")
 
-def connect_db():
-    global DATABASE_URL
+def init_db_pool():
+    """
+    Inicializa el pool de conexiones de la base de datos.
+    Esta función DEBE llamarse UNA SOLA VEZ al iniciar el servidor FastAPI.
+    """
+    global db_pool, DATABASE_URL
+    if db_pool:
+        return # El pool ya está inicializado
+
     load_dotenv()
     DATABASE_URL = os.environ.get("DATABASE_URL")
     if DATABASE_URL is None:
-        # Esto ahora solo fallará si no está ni en .env ni en Render
         raise ValueError("No se pudo conectar: DATABASE_URL no está configurada.")
 
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        # --- 3. CREAR EL POOL ---
+        # minconn=1, maxconn=10 (Permitirá hasta 10 conexiones simultáneas)
+        # Ideal para tus llamadas en paralelo de 'asyncio.gather'
+        db_pool = psycopg2.pool.SimpleConnectionPool(
+            1, 10, dsn=DATABASE_URL
+        )
+        
+        # Probar la conexión
+        conn = db_pool.getconn()
         conn.cursor_factory = psycopg2.extras.DictCursor
-
-        # 4. Imprimir a dónde nos estamos conectando
         if "localhost" in DATABASE_URL:
-            print(" -> Conectado a BD Local (localhost).")
+            print(" -> Pool de BD (Local) Creado (1-10 conexiones).")
         else:
-            print(" -> Conectado a BD Producción (Render/Supabase).")
+            print(" -> Pool de BD (Producción) Creado (1-10 conexiones).")
+        db_pool.putconn(conn) # Devolver la conexión de prueba
 
-        return conn
     except psycopg2.OperationalError as e:
-        print(f"!!! ERROR DE CONEXIÓN A POSTGRESQL !!!\n{e}")
+        print(f"!!! ERROR CRÍTICO AL CREAR EL POOL DE BD !!!\n{e}")
+        traceback.print_exc()
         raise
+
+def execute_query(query, params=(), fetchone=False, fetchall=False):
+    """
+    Función centralizada para ejecutar consultas de LECTURA (SELECT).
+    ¡AHORA USA EL POOL DE CONEXIONES!
+    """
+    global db_pool
+    if not db_pool:
+        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
+        init_db_pool()
+        if not db_pool:
+             raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
+
+    conn = None
+    try:
+        # --- 5. OBTENER CONEXIÓN DEL POOL ---
+        conn = db_pool.getconn() 
+        conn.cursor_factory = psycopg2.extras.DictCursor # Asegurar DictCursor
+        
+        with conn.cursor() as cursor:
+            cursor.execute(query, params)
+
+            if fetchone:
+                return cursor.fetchone()
+            if fetchall:
+                return cursor.fetchall()
+            # (Si no es fetchone/fetchall, no devuelve nada, como en un UPDATE)
+
+    except Exception as e:
+        print(f"Error inesperado en consulta de lectura (PostgreSQL): {e}")
+        traceback.print_exc()
+        raise e # Re-lanzar la excepción para que la API la capture
+    finally:
+        if conn:
+            # --- 6. DEVOLVER LA CONEXIÓN AL POOL ---
+            db_pool.putconn(conn) 
+
+# En app/database.py (añadir esto después de la función execute_query)
+
+def execute_commit_query(query, params=(), fetchone=False):
+    """
+    Función centralizada para ejecutar consultas de ESCRITURA (INSERT, UPDATE, DELETE).
+    ¡Usa el pool de conexiones y HACE COMMIT!
+    """
+    global db_pool
+    if not db_pool:
+        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
+        init_db_pool()
+        if not db_pool:
+             raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
+
+    conn = None
+    try:
+        # 1. Obtener conexión del pool
+        conn = db_pool.getconn() 
+        conn.cursor_factory = psycopg2.extras.DictCursor
+        
+        with conn.cursor() as cursor:
+            cursor.execute(query, params)
+            
+            result = None
+            if fetchone:
+                # Capturar el resultado de 'RETURNING'
+                result = cursor.fetchone() 
+                
+            # 2. ¡Hacer commit de la transacción!
+            conn.commit() 
+            
+            if fetchone:
+                return result # Devolver el resultado (ej. el ID)
+            return True # Indicar éxito para UPsDATE/DELETE
+            
+    except Exception as e:
+        print(f"Error en consulta de escritura (PostgreSQL): {e}")
+        traceback.print_exc()
+        if conn:
+            conn.rollback() # Revertir si algo falló
+        raise e # Re-lanzar la excepción para que la API la capture
+    finally:
+        if conn:
+            # 3. Devolver la conexión al pool
+            db_pool.putconn(conn)
 
 def create_schema(conn):
     cursor = conn.cursor()
@@ -484,32 +583,6 @@ def check_password(hashed_password, plain_password):
     """Verifica si la contraseña coincide con el hash."""
     return hashed_password == hash_password(plain_password)
 
-def execute_query(query, params=(), fetchone=False, fetchall=False):
-    """
-    Función centralizada para ejecutar consultas de LECTURA (SELECT) en PostgreSQL.
-    UTILIZA DictCursor PARA DEVOLVER DICCIONARIOS.
-    """
-    conn = None
-    try:
-        conn = connect_db()
-        # ¡LA LÍNEA MÁS IMPORTANTE ES ESTA! ASEGÚRATE DE QUE ESTÉ ASÍ:
-        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-            cursor.execute(query, params)
-
-            if fetchone:
-                return cursor.fetchone()
-            if fetchall:
-                return cursor.fetchall()
-
-    except Exception as e:
-        print(f"Error inesperado en consulta de lectura (PostgreSQL): {e}")
-        traceback.print_exc()
-        raise e
-    finally:
-        if conn:
-            conn.close()
-
-
 def get_product_categories(): return execute_query("SELECT id, name FROM product_categories ORDER BY name", fetchall=True)
 
 def create_product_category(name):
@@ -851,18 +924,26 @@ def get_available_serials_at_location(product_id, location_id):
     # Pasamos location_id dos veces: una para quants, otra para la subconsulta de moves
     return execute_query(query, (product_id, location_id, location_id), fetchall=True)
 
+# En app/database.py (REEMPLAZA la función create_picking existente)
+
 def create_picking(name, picking_type_id, location_src_id, location_dest_id, company_id, responsible_user, work_order_id=None):
+    """
+    Crea un nuevo picking (albarán) usando el pool de conexiones.
+    (Versión Migrada)
+    """
     s_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with connect_db() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """INSERT INTO pickings (company_id, name, picking_type_id, location_src_id, location_dest_id, scheduled_date, state, work_order_id, responsible_user) 
-                   VALUES (%s, %s, %s, %s, %s, %s, 'draft', %s, %s) RETURNING id""",
-                (company_id, name, picking_type_id, location_src_id, location_dest_id, s_date, work_order_id, responsible_user)
-            )
-            new_id = cursor.fetchone()[0]
-            conn.commit()
-            return new_id
+    
+    query = """INSERT INTO pickings (company_id, name, picking_type_id, location_src_id, location_dest_id, scheduled_date, state, work_order_id, responsible_user) 
+               VALUES (%s, %s, %s, %s, %s, %s, 'draft', %s, %s) RETURNING id"""
+    params = (company_id, name, picking_type_id, location_src_id, location_dest_id, s_date, work_order_id, responsible_user)
+    
+    # Llamar a la nueva función de ESCRITURA
+    new_id_row = execute_commit_query(query, params, fetchone=True)
+    
+    if new_id_row and new_id_row[0]:
+        return new_id_row[0] # Devolver el ID
+    else:
+        raise Exception("No se pudo crear el picking, no se devolvió ID.")
 
 def get_lot_by_name(cursor, product_id, lot_name):
     # ... (Sin cambios)
@@ -1689,6 +1770,7 @@ def update_picking_header(pid, src_id, dest_id, ref, date_transfer, purchase_ord
         return False
 
 def get_picking_type_details(type_id): return execute_query("SELECT * FROM picking_types WHERE id =  %s", (type_id,), fetchone=True)
+
 
 def update_move_quantity_done(move_id, quantity_done):
     with connect_db() as conn:

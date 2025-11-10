@@ -649,9 +649,9 @@ async def update_picking_header(picking_id: int, data: PickingHeaderUpdate, auth
     if "operations.can_edit" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
     try:
-        # --- ¡INICIO DE CORRECCIÓN! ---
-        # Llamar a la función de BD con TODOS los argumentos que espera
-        db.update_picking_header(
+# --- ¡CORREGIDO! ---
+        await asyncio.to_thread(
+            db.update_picking_header,
             pid=picking_id,
             src_id=data.location_src_id,
             dest_id=data.location_dest_id,
@@ -661,7 +661,7 @@ async def update_picking_header(picking_id: int, data: PickingHeaderUpdate, auth
             custom_op_type=data.custom_operation_type,
             partner_id=data.partner_id
         )
-        # --- FIN DE CORRECCIÓN! ---
+        # --- FIN CORRECCIÓN! ---
         
         return {"message": "Cabecera actualizada."}
     except Exception as e:
@@ -807,7 +807,7 @@ async def get_partners_by_category(auth: AuthDependency, category_name: str):
 
 @router.get("/helpers/picking-type-details", response_model=dict)
 async def get_picking_type_details(auth: AuthDependency, pt_id: int):
-    data = db.get_picking_type_details(pt_id)
+    data = await asyncio.to_thread(db.get_picking_type_details, pt_id) # <-- ¡CORREGIDO!
     if not data:
         raise HTTPException(status_code=404, detail="Tipo de Picking no encontrado")
     return dict(data)
@@ -834,19 +834,15 @@ async def get_op_type_change_data(
     company_id: int = 1
 ):
     """
-    [COMBO-V2] Obtiene todos los datos necesarios para actualizar la UI
-    cuando el usuario cambia el 'Tipo de Operación' en la vista de detalle.
-    
-    Devuelve:
-    - La regla de operación.
-    - Listas de opciones para los 4 dropdowns (wh_origin, wh_dest, partners_vendor, partners_customer).
-    - La lista de productos filtrada por 'ownership' (owned/consigned).
+    [COMBO-V2-OPTIMIZADO] Obtiene solo los datos de REGLA y DROPDOWNS
+    cuando el usuario cambia el 'Tipo de Operación'.
+    La lista de productos ya no se envía.
     """
-    print(f"\n[API-COMBO-V2] Obteniendo datos para Tipo Op: {op_type_name}")
+    print(f"\n[API-COMBO-V2] Obteniendo datos (solo dropdowns) para Tipo Op: {op_type_name}")
     
     try:
         # --- 1. Obtener la Regla de Operación ---
-        op_rule = db.get_operation_type_details_by_name(op_type_name)
+        op_rule = await asyncio.to_thread(db.get_operation_type_details_by_name, op_type_name) # <-- ¡CORREGIDO!
         if not op_rule:
             raise HTTPException(status_code=404, detail="Regla de operación no encontrada.")
             
@@ -877,25 +873,17 @@ async def get_op_type_change_data(
             elif op_name == "Transferencia entre Contratas": allowed_dest_wh_categories = ["CONTRATISTA"]
             else: allowed_dest_wh_categories = ["ALMACEN PRINCIPAL", "CONTRATISTA"]
 
-        # --- 3. Definir Filtro de Productos (Lógica de negocio) ---
-        ownership_map = {"Compra Nacional": "owned", "Consignación Recibida": "consigned"}
-        ownership_filter = ownership_map.get(op_name)
-        product_filters = {}
-        if ownership_filter:
-            product_filters["ownership"] = ownership_filter
-
-        # --- 4. Ejecutar todas las consultas de BD en paralelo ---
+        # --- 3. Ejecutar consultas de BD en paralelo (SIN PRODUCTOS) ---
         tasks = {
             "warehouses_origin": asyncio.to_thread(db.get_warehouses_by_categories, company_id, allowed_origin_wh_categories),
             "warehouses_dest": asyncio.to_thread(db.get_warehouses_by_categories, company_id, allowed_dest_wh_categories),
             "partners_vendor": asyncio.to_thread(db.get_partners, company_id, category_name="Proveedor Externo"),
             "partners_customer": asyncio.to_thread(db.get_partners, company_id, category_name="Proveedor Cliente"),
-            "products": asyncio.to_thread(db.get_products_filtered_sorted, company_id, filters=product_filters, sort_by="name", limit=None)
         }
         
         results = await asyncio.gather(*tasks.values())
         
-        # --- 5. Construir la Respuesta JSON ---
+        # --- 4. Construir la Respuesta JSON (SIN PRODUCTOS) ---
         response = {
             "op_rule": dict(op_rule),
             "dropdown_options": {
@@ -904,12 +892,15 @@ async def get_op_type_change_data(
                 "partners_vendor": [dict(r) for r in results[2]],
                 "partners_customer": [dict(r) for r in results[3]]
             },
-            "products": [dict(r) for r in results[4]]
+            "products": [] # <-- DEVOLVER LISTA VACÍA (ya no se usa)
         }
         
-        print(f"[API-COMBO-V2] Datos generados. {len(response['products'])} productos filtrados.")
+        print(f"[API-COMBO-V2] Datos (solo dropdowns) generados.")
         return response
 
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error en op-type-change-data: {e}")
+    
+
+    

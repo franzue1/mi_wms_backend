@@ -6,20 +6,22 @@ import contextlib
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
-    # --- VERSIÓN DE PRODUCCIÓN (SOLO CONECTAR) ---
-    print("--- Servidor iniciando, verificando conexión a BD... ---")
+    # --- ¡NUEVA VERSIÓN CON POOL DE CONEXIONES! ---
+    # Esto se ejecuta UNA SOLA VEZ cuando Uvicorn arranca.
+    print("--- Servidor iniciando, creando pool de conexiones... ---")
     try:
-        conn = db.connect_db()
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT 1") # Solo verifica la conexión
-        conn.close()
-        print("--- Conexión a Base de Datos exitosa. ---")
+        # Llama a la nueva función que crea el pool global (db_pool)
+        db.init_db_pool()
+        print("--- Pool de conexiones a Base de Datos creado. ---")
+        
     except Exception as e:
-        print(f"!!! ERROR FATAL DURANTE EL INICIO: No se pudo conectar a la BD. {e}")
+        print(f"!!! ERROR FATAL DURANTE EL INICIO: No se pudo crear el pool de BD. {e}")
         traceback.print_exc()
     
     yield
+    
     print("--- Servidor apagándose. ---")
+    # (El pool de psycopg2 se maneja automáticamente, no necesita cierre explícito)
 
 # ----Esto creará las tablas y los datos iniciales
 #@contextlib.asynccontextmanager
@@ -43,7 +45,6 @@ app = FastAPI(
     lifespan=lifespan # <-- Esta línea se queda igual
 )
 
-# ... (El resto de tus imports de app.api y app.include_router) ...
 from app.api import (
     auth, products, warehouses, partners, locations, reports, 
     pickings, work_orders, adjustments, configuration, admin
