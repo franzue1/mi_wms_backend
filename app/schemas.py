@@ -189,6 +189,10 @@ class PickingResponse(BaseModel):
     partner_ref: Optional[str] = None
     purchase_order: Optional[str] = None
     
+    # --- ¡AÑADE ESTA LÍNEA AQUÍ! ---
+    date_transfer: Optional[date] = None
+    # ---------------------------------
+    
     # Lista de líneas de movimiento
     moves: List[StockMoveResponse] = []
 
@@ -449,4 +453,25 @@ class KardexDetailResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+class StockDetailResponse(BaseModel):
+    """
+    Schema para el Reporte de Stock Detallado (por Serie/Lote).
+    Corresponde a la Pestaña 2 de la vista de reportes.
+    """
+    product_id: int
+    location_id: int
+    lot_id: Optional[int] = None
+    warehouse_name: str
+    location_name: str
+    sku: str
+    product_name: str
+    category_name: Optional[str] = None
+    lot_name: Optional[str] = None
+    physical_quantity: float
+    reserved_quantity: float
+    uom_name: Optional[str] = None
+
+    class Config:
+        from_attributes = True # Para que funcione con los objetos de la BD
 

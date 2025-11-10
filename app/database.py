@@ -8,37 +8,32 @@ import traceback
 import functools
 from collections import defaultdict
 import hashlib # Ya deberías tenerlo
+from dotenv import load_dotenv # <-- 1. Importar
 
-
-# Lo leemos de una variable de entorno para seguridad.
-DATABASE_URL = os.environ.get("DATABASE_URL")
+DATABASE_URL = None
+#DATABASE_URL = os.environ.get("DATABASE_URL")
 
 def connect_db():
     global DATABASE_URL
-    
-    # 1. Obtenemos la URL de la variable de entorno
-    # Render la inyectará automáticamente en producción.
+    load_dotenv()
     DATABASE_URL = os.environ.get("DATABASE_URL")
-
-    # 2. Verificación robusta
     if DATABASE_URL is None:
-        print("!!! ERROR CRÍTICO: Variable de entorno DATABASE_URL no encontrada.")
-        print("!!! Asegúrate de que el archivo .env existe o que las variables están configuradas en el servidor.")
-        # Fallar rápido si no hay URL de BD
-        raise ValueError("No se pudo conectar a la base de datos: DATABASE_URL no está configurada.")
-    
+        # Esto ahora solo fallará si no está ni en .env ni en Render
+        raise ValueError("No se pudo conectar: DATABASE_URL no está configurada.")
+
     try:
-        # 3. Conectarse usando la URL (y forzar DictCursor)
         conn = psycopg2.connect(DATABASE_URL)
         conn.cursor_factory = psycopg2.extras.DictCursor
-        
-        # Ocultamos el print de "Modo Local" ya que no aplica
-        print(" -> Conexión a PostgreSQL (con DictCursor) exitosa.")
+
+        # 4. Imprimir a dónde nos estamos conectando
+        if "localhost" in DATABASE_URL:
+            print(" -> Conectado a BD Local (localhost).")
+        else:
+            print(" -> Conectado a BD Producción (Render/Supabase).")
+
         return conn
-        
     except psycopg2.OperationalError as e:
-        print("\n\n!!! ERROR DE CONEXIÓN A POSTGRESQL !!!")
-        print(f"No se pudo conectar a la base de datos: {e}")
+        print(f"!!! ERROR DE CONEXIÓN A POSTGRESQL !!!\n{e}")
         raise
 
 def create_schema(conn):
@@ -1345,36 +1340,54 @@ def get_or_create_by_name(cursor, table, name):
         cursor.execute(f"INSERT INTO {table} (name) VALUES (%s) RETURNING id", (name,))
         return cursor.fetchone()[0]
 
-def upsert_product_from_import(company_id, sku, name, category_id, uom_id, tracking, ownership, standard_price):
+def upsert_product_from_import(company_id, sku, name, category_id, uom_id, tracking, ownership, price):
     """
-    Actualiza o crea un producto (Versión PostgreSQL).
+    Intenta insertar o actualizar un producto.
+    [CORREGIDO] Lanza una excepción (raise) si la base de datos falla.
+    [CORREGIDO 2] Se eliminó 'product_type' del INSERT; se usa el DEFAULT de la BD.
     """
-    query = """
-        INSERT INTO products (company_id, sku, name, category_id, uom_id, tracking, ownership, standard_price)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (sku) DO UPDATE SET
-            name = EXCLUDED.name,
-            category_id = EXCLUDED.category_id,
-            uom_id = EXCLUDED.uom_id,
-            tracking = EXCLUDED.tracking,
-            ownership = EXCLUDED.ownership,
-            standard_price = EXCLUDED.standard_price
-        RETURNING (xmax = 0) AS inserted; 
-    """
-    # xmax = 0 es un truco de PostgreSQL para saber si fue INSERT (True) o UPDATE (False)
-    
-    params = (company_id, sku, name, category_id, uom_id, tracking, ownership, standard_price)
-    
     try:
         with connect_db() as conn:
             with conn.cursor() as cursor:
-                cursor.execute(query, params)
-                was_inserted = cursor.fetchone()[0]
-                conn.commit()
-                return "created" if was_inserted else "updated"
+                # 1. Intentar encontrar el producto
+                cursor.execute(
+                    "SELECT id FROM products WHERE sku = %s AND company_id = %s",
+                    (sku, company_id)
+                )
+                existing_product = cursor.fetchone()
+                
+                if existing_product:
+                    # 2. Si existe, ACTUALIZAR
+                    product_id = existing_product['id']
+                    cursor.execute(
+                        """UPDATE products SET 
+                           name = %s, category_id = %s, uom_id = %s, 
+                           tracking = %s, ownership = %s, standard_price = %s 
+                           WHERE id = %s""",
+                        (name, category_id, uom_id, tracking, ownership, price, product_id)
+                    )
+                    conn.commit()
+                    return "updated"
+                else:
+                    # 3. Si no existe, CREAR
+                    # --- ¡CORRECCIÓN AQUÍ! ---
+                    # Se quitó 'product_type' de la consulta
+                    cursor.execute(
+                        """INSERT INTO products 
+                           (company_id, sku, name, category_id, uom_id, tracking, ownership, standard_price) 
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                        (company_id, sku, name, category_id, uom_id, tracking, ownership, price)
+                    )
+                    # --- FIN CORRECCIÓN ---
+                    conn.commit()
+                    return "created"
+
+    except psycopg2.Error as db_err:
+        print(f"Error procesando fila para SKU {sku}: {db_err}")
+        raise db_err 
     except Exception as e:
-        print(f"Error procesando fila para SKU {sku}: {e}")
-        return "error"
+        print(f"Error inesperado en upsert_product_from_import: {e}")
+        raise e
 
 def get_picking_details(picking_id):
     query = """
@@ -1646,10 +1659,12 @@ def get_all_locations(): return execute_query("SELECT id, path FROM locations OR
 
 def update_picking_header(pid, src_id, dest_id, ref, date_transfer, purchase_order, custom_op_type=None, partner_id=None):
     """
-    Actualiza la cabecera de un albarán.
-    (Esta es la versión que SÍ ACEPTA 'custom_operation_type')
+    [CORREGIDO] Actualiza la cabecera de un albarán aceptando todos los campos.
     """
-    print(f"[DEBUG-DB] Actualizando cabecera (update_picking_header) para Picking ID: {pid}")
+    print(f"[DEBUG-DB] 10. DATOS RECIBIDOS EN LA FUNCIÓN DE BASE DE DATOS 'update_picking_header':")
+    print(f"    - pid: {pid}, src_id: {src_id}, dest_id: {dest_id}, partner_id: {partner_id}")
+    print(f"    - ref: '{ref}', date_transfer: '{date_transfer}', purchase_order: '{purchase_order}', custom_op_type: '{custom_op_type}'")
+    
     try:
         with connect_db() as conn:
             with conn.cursor() as cursor:
@@ -2749,7 +2764,7 @@ def get_full_product_kardex_data(company_id, date_from, date_to, warehouse_id=No
 
         WHERE {" AND ".join(where_clauses)}
         
-        AND (quantity_in > 0 OR quantity_out > 0) 
+        AND sm.quantity_done > 0 -- ¡CORREGIDO!
 
         ORDER BY prod.sku ASC, p.date_done ASC, p.id ASC
     """
@@ -2840,7 +2855,7 @@ def get_stock_coverage_report(company_id, history_days=90, product_filter=None):
     product_clause = ""
     if product_filter:
         product_clause = "AND (p.sku ILIKE %s OR p.name ILIKE %s)"
-        params.append(f"%{product_filter}%")
+        params.extend([f"%{product_filter}%", f"%{product_filter}%"])
 
     # (La lógica es similar, pero reemplaza date() por ::date y usa INTERVAL)
     query = f"""
@@ -2881,6 +2896,7 @@ def get_stock_coverage_report(company_id, history_days=90, product_filter=None):
         ORDER BY coverage_days ASC, p.name ASC;
     """
     return execute_query(query, tuple(params), fetchall=True)
+
 
 def get_inventory_value_kpis(company_id):
     """
@@ -3130,7 +3146,7 @@ def upsert_warehouse_from_import(company_id, code, name, status, social_reason, 
                 if was_inserted:
                     cursor.execute("SELECT id FROM warehouses WHERE code = %s AND company_id = %s", (code, company_id))
                     new_wh_id = cursor.fetchone()[0]
-                    create_warehouse_with_data(conn, name, code, company_id, category_id, for_existing=True, warehouse_id=new_wh_id)
+                    create_warehouse_with_data(cursor, name, code, company_id, category_id, for_existing=True, warehouse_id=new_wh_id)
                 conn.commit()
                 return "created" if was_inserted else "updated"
     except Exception as e:

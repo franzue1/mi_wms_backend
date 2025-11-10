@@ -1,9 +1,15 @@
 # app/api/partners.py
-from fastapi import APIRouter, Depends, HTTPException, status, Query
-from typing import List, Annotated, Optional
+from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File
+from typing import List, Annotated, Optional, Dict
+from pydantic import BaseModel
+from datetime import date
 from app import database as db
 from app import schemas, security
 from app.security import TokenData
+import traceback
+import io # <-- AÑADIR
+import csv # <-- AÑADIR
+from fastapi.responses import StreamingResponse # <-- AÑADIR
 
 router = APIRouter()
 AuthDependency = Annotated[TokenData, Depends(security.get_current_user_data)]
@@ -150,3 +156,136 @@ async def delete_partner(partner_id: int, auth: AuthDependency):
     if not success:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
     return {"message": message}
+
+@router.get("/export/csv", response_class=StreamingResponse)
+async def export_partners_csv(
+    auth: AuthDependency,
+    company_id: int = 1,
+
+    # Reutilizamos los filtros de la vista principal
+    sort_by: Optional[str] = Query(None),
+    ascending: bool = Query(True),
+    name: Optional[str] = Query(None),
+    ruc: Optional[str] = Query(None),
+    social_reason: Optional[str] = Query(None),
+    address: Optional[str] = Query(None),
+    category_name: Optional[str] = Query(None)
+):
+    """ Genera y transmite un archivo CSV de los socios filtrados. """
+    if "partners.can_crud" not in auth.permissions:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
+
+    try:
+        filters = {"name": name, "ruc": ruc, "social_reason": social_reason, "address": address, "category_name": category_name}
+        clean_filters = {k: v for k, v in filters.items() if v is not None and v != ""}
+
+        partners_raw = db.get_partners_filtered_sorted(
+            company_id, filters=clean_filters, sort_by=sort_by or 'id', 
+            ascending=ascending, limit=None, offset=None
+        )
+
+        if not partners_raw:
+            raise HTTPException(status_code=404, detail="No hay datos para exportar.")
+
+        output = io.StringIO(newline='')
+        writer = csv.writer(output, delimiter=';')
+
+        headers = ["name", "category_name", "ruc", "social_reason", "address", "email", "phone"]
+        writer.writerow(headers)
+
+        for partner_row in partners_raw:
+            partner_dict = dict(partner_row)
+            writer.writerow([partner_dict.get(h, '') for h in headers])
+
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=socios.csv"}
+        )
+
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error al generar CSV: {e}")
+
+@router.post("/import/csv", response_model=dict)
+async def import_partners_csv(
+    auth: AuthDependency,
+    company_id: int = 1,
+    file: UploadFile = File(...)
+):
+    """ Importa socios (partners) desde un archivo CSV. """
+    if "partners.can_crud" not in auth.permissions:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
+
+    try:
+        content = await file.read()
+        content_decoded = content.decode('utf-8-sig')
+        file_io = io.StringIO(content_decoded)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error al leer el archivo: {e}")
+
+    reader = csv.DictReader(file_io, delimiter=';')
+    try:
+        rows = list(reader)
+        if not rows: raise ValueError("El archivo CSV está vacío.")
+
+        headers = {h.lower().strip() for h in reader.fieldnames or []}
+        required_headers = {"name", "category_name"} # Mínimos requeridos
+
+        if not required_headers.issubset(headers):
+            missing = required_headers - headers
+            raise ValueError(f"Faltan columnas obligatorias: {', '.join(sorted(list(missing)))}")
+
+        # Validar categorías
+        all_db_categories = {cat['name'] for cat in db.get_partner_categories()}
+        invalid_categories = {row.get('category_name','').strip() for row in rows if row.get('category_name','').strip() and row.get('category_name','').strip() not in all_db_categories}
+        if invalid_categories:
+            raise ValueError(f"Las siguientes categorías no existen: {', '.join(sorted(list(invalid_categories)))}")
+
+        cat_map = {cat['name']: cat['id'] for cat in db.get_partner_categories()}
+
+        created, updated = 0, 0
+        error_list = []
+
+        for i, row in enumerate(rows):
+            row_num = i + 2
+            name = row.get('name', '').strip()
+            category_name = row.get('category_name', '').strip()
+
+            try:
+                if not name or not category_name:
+                    raise ValueError("name y category_name son obligatorios.")
+
+                category_id = cat_map.get(category_name)
+                if category_id is None:
+                    raise ValueError(f"Categoría '{category_name}' no encontrada (cache).")
+
+                result = db.upsert_partner_from_import(
+                    company_id=company_id, name=name, category_id=category_id,
+                    ruc=row.get('ruc', '').strip() or None,
+                    social_reason=row.get('social_reason', '').strip() or None,
+                    address=row.get('address', '').strip() or None,
+                    email=row.get('email', '').strip() or None,
+                    phone=row.get('phone', '').strip() or None
+                )
+
+                if result == "created": created += 1
+                elif result == "updated": updated += 1
+
+            except Exception as e:
+                error_list.append(f"Fila {row_num} (Nombre: {name}): {e}")
+
+        if error_list:
+            raise HTTPException(
+                status_code=400, 
+                detail="Importación fallida. Corrija los errores y reintente:\n- " + "\n- ".join(error_list)
+            )
+
+        return {"created": created, "updated": updated, "errors": 0}
+
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error crítico al procesar CSV: {e}")
