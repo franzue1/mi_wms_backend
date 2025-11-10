@@ -946,7 +946,6 @@ def create_picking(name, picking_type_id, location_src_id, location_dest_id, com
         raise Exception("No se pudo crear el picking, no se devolvió ID.")
 
 def get_lot_by_name(cursor, product_id, lot_name):
-    # ... (Sin cambios)
     if cursor is None:
         return execute_query("SELECT id FROM stock_lots WHERE product_id =  %s AND name =  %s", (product_id, lot_name), fetchone=True)
     else:
@@ -1121,33 +1120,37 @@ def _check_stock_with_cursor(cursor, picking_id, picking_type_code):
     return True, "Stock disponible verificado."
 
 def check_stock_for_picking(picking_id):
-    """Función pública que abre una conexión para verificar el stock de un albarán."""
+    """(MIGRADO) Función pública que usa el POOL para verificar el stock."""
+    global db_pool
+    conn = None
     try:
-        with connect_db() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-                
-                # --- NUEVO: Obtener el tipo de picking ---
-                cursor.execute("""
-                    SELECT pt.code 
-                    FROM pickings p
-                    JOIN picking_types pt ON p.picking_type_id = pt.id
-                    WHERE p.id = %s
-                """, (picking_id,))
-                picking_info = cursor.fetchone()
-                
-                if not picking_info:
-                    return False, "Error: No se encontró el albarán."
-                
-                picking_type_code = picking_info['code']
-                # --- FIN NUEVO ---
-                
-                # Pasar el código a la función interna
-                return _check_stock_with_cursor(cursor, picking_id, picking_type_code)
-                
+        conn = db_pool.getconn() # Tomar conexión del pool
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+            
+            cursor.execute("""
+                SELECT pt.code 
+                FROM pickings p
+                JOIN picking_types pt ON p.picking_type_id = pt.id
+                WHERE p.id = %s
+            """, (picking_id,))
+            picking_info = cursor.fetchone()
+            
+            if not picking_info:
+                return False, "Error: No se encontró el albarán."
+            
+            picking_type_code = picking_info['code']
+            
+            # Llamar a la función helper que usa el cursor
+            # (Asumimos que _check_stock_with_cursor existe y es correcta)
+            return _check_stock_with_cursor(cursor, picking_id, picking_type_code)
+            
     except Exception as e:
         print(f"Error inesperado en la verificación de stock: {e}")
         traceback.print_exc()
         return False, str(e)
+    finally:
+        if conn:
+            db_pool.putconn(conn) # Devolver conexión al pool
 
 def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_tracking):
     """
@@ -1259,33 +1262,34 @@ def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_track
     return True, "Validado."
 
 def process_picking_validation(picking_id, moves_with_tracking):
-    """Función pública que maneja la transacción y llama a la lógica de validación."""
+    """(MIGRADO) Función pública que maneja la transacción usando el POOL."""
     print(f"\n[DEBUG-STOCK] ================= INICIO VALIDACIÓN: PICKING ID {picking_id} =================")
-
+    global db_pool
+    conn = None
     try:
-        with connect_db() as conn:
-            # --- ¡ESTA ES LA CORRECCIÓN! ---
-            # Necesitamos usar DictCursor para que todas las funciones
-            # de ayuda (como _check_stock_with_cursor) funcionen.
-            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-            # --- FIN DE LA CORRECCIÓN ---
-                
-                # Llama a la única función que contiene la lógica de negocio.
-                success, message = _process_picking_validation_with_cursor(cursor, picking_id, moves_with_tracking)
-                
-                if success:
-                    conn.commit()
-                    print(f"[DEBUG-STOCK] ================= FIN VALIDACIÓN: ÉXITO (COMMIT) =================")
-                    return True, message
-                else:
-                    conn.rollback()
-                    print(f"[DEBUG-STOCK] ================= FIN VALIDACIÓN: FALLO (ROLLBACK) - Causa: {message} =================")
-                    return False, message
+        conn = db_pool.getconn()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+            
+            # Llama a la única función que contiene la lógica de negocio.
+            # (Asumimos que _process_picking_validation_with_cursor existe)
+            success, message = _process_picking_validation_with_cursor(cursor, picking_id, moves_with_tracking)
+            
+            if success:
+                conn.commit()
+                print(f"[DEBUG-STOCK] ================= FIN VALIDACIÓN: ÉXITO (COMMIT) =================")
+                return True, message
+            else:
+                conn.rollback()
+                print(f"[DEBUG-STOCK] ================= FIN VALIDACIÓN: FALLO (ROLLBACK) - Causa: {message} =================")
+                return False, message
 
     except Exception as e:
+        if conn: conn.rollback() # Rollback en error crítico
         print(f"Error inesperado en la validación: {e}")
         print(f"[DEBUG-STOCK] ================= FIN VALIDACIÓN: ERROR CRÍTICO (ROLLBACK) =================")
         return False, f"Error inesperado en la base de datos: {e}"
+    finally:
+        if conn: db_pool.putconn(conn)
 
 def process_full_liquidation(wo_id, consumptions, retiros, service_act_number, date_attended_db, current_ui_location_id, user_name):
     """
@@ -1497,16 +1501,20 @@ def get_picking_details(picking_id):
     return p_info, moves
 
 def add_stock_move_to_picking(picking_id, product_id, qty, loc_src_id, loc_dest_id, price_unit=0, partner_id=None):
-    with connect_db() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """INSERT INTO stock_moves (picking_id, product_id, product_uom_qty, quantity_done, location_src_id, location_dest_id, price_unit, partner_id) 
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
-                (picking_id, product_id, qty, qty, loc_src_id, loc_dest_id, price_unit, partner_id)
-            )
-            new_id = cursor.fetchone()[0]
-            conn.commit()
-            return new_id
+    """
+    (MIGRADO) Añade una línea de stock_move usando el pool de conexiones.
+    """
+    query = """INSERT INTO stock_moves (picking_id, product_id, product_uom_qty, quantity_done, location_src_id, location_dest_id, price_unit, partner_id) 
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id"""
+    params = (picking_id, product_id, qty, qty, loc_src_id, loc_dest_id, price_unit, partner_id)
+    
+    # Usamos el helper de escritura que hace commit y devuelve el ID
+    new_id_row = execute_commit_query(query, params, fetchone=True)
+    
+    if new_id_row and new_id_row[0]:
+        return new_id_row[0]
+    else:
+        raise Exception("No se pudo crear la línea de stock, no se devolvió ID.")
 
 def get_warehouses(company_id):
     """
@@ -1740,43 +1748,50 @@ def get_all_locations(): return execute_query("SELECT id, path FROM locations OR
 
 def update_picking_header(pid, src_id, dest_id, ref, date_transfer, purchase_order, custom_op_type=None, partner_id=None):
     """
-    [CORREGIDO] Actualiza la cabecera de un albarán aceptando todos los campos.
+    [CORREGIDO] Actualiza la cabecera de un albarán usando el pool de conexiones.
+    (Versión Migrada)
     """
     print(f"[DEBUG-DB] 10. DATOS RECIBIDOS EN LA FUNCIÓN DE BASE DE DATOS 'update_picking_header':")
-    print(f"    - pid: {pid}, src_id: {src_id}, dest_id: {dest_id}, partner_id: {partner_id}")
-    print(f"    - ref: '{ref}', date_transfer: '{date_transfer}', purchase_order: '{purchase_order}', custom_op_type: '{custom_op_type}'")
+    print(f"     - pid: {pid}, src_id: {src_id}, dest_id: {dest_id}, partner_id: {partner_id}")
+    print(f"     - ref: '{ref}', date_transfer: '{date_transfer}', purchase_order: '{purchase_order}', custom_op_type: '{custom_op_type}'")
     
+    query = """UPDATE pickings SET 
+                   location_src_id = %s, 
+                   location_dest_id = %s, 
+                   partner_ref = %s, 
+                   date_transfer = %s, 
+                   purchase_order = %s, 
+                   custom_operation_type = %s, 
+                   partner_id = %s 
+               WHERE id = %s"""
+    params = (src_id, dest_id, ref, date_transfer, purchase_order, custom_op_type, partner_id, pid)
+
     try:
-        with connect_db() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """UPDATE pickings SET 
-                           location_src_id = %s, 
-                           location_dest_id = %s, 
-                           partner_ref = %s, 
-                           date_transfer = %s, 
-                           purchase_order = %s, 
-                           custom_operation_type = %s, 
-                           partner_id = %s 
-                       WHERE id = %s""",
-                    (src_id, dest_id, ref, date_transfer, purchase_order, custom_op_type, partner_id, pid)
-                )
-                conn.commit()
+        # --- ¡CAMBIO CLAVE! ---
+        # Usamos la nueva función que hace commit y usa el pool
+        execute_commit_query(query, params)
+        # --- FIN DEL CAMBIO ---
+        
         print(f" -> Cabecera {pid} actualizada con TipoOp: {custom_op_type}")
-        return True
+        return True # Devolver True en éxito
+        
     except Exception as e:
-        print(f"!!! ERROR en update_picking_header: {e}")
-        traceback.print_exc()
-        return False
+        # El error ya fue impreso por execute_commit_query
+        print(f"!!! ERROR en update_picking_header (capturado en la función wrapper): {e}")
+        return False # Devolver False en caso de fallo
 
 def get_picking_type_details(type_id): return execute_query("SELECT * FROM picking_types WHERE id =  %s", (type_id,), fetchone=True)
 
-
 def update_move_quantity_done(move_id, quantity_done):
-    with connect_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE stock_moves SET product_uom_qty =  %s, quantity_done =  %s WHERE id =  %s", (quantity_done, quantity_done, move_id))
-        conn.commit()
+    """
+    (MIGRADO) Actualiza la cantidad de un move usando el pool de conexiones.
+    """
+    query = "UPDATE stock_moves SET product_uom_qty = %s, quantity_done = %s WHERE id = %s"
+    params = (quantity_done, quantity_done, move_id)
+    
+    # Usamos el helper de escritura (sin fetchone)
+    execute_commit_query(query, params)
+    return True # Asumimos éxito si no hay excepción
 def get_warehouse_categories():
     return execute_query("SELECT id, name FROM warehouse_categories ORDER BY name", fetchall=True)
 
@@ -2083,36 +2098,35 @@ def get_partner_details(partner_id):
     return execute_query("SELECT * FROM partners WHERE id =  %s", (partner_id,), fetchone=True)
 
 def cancel_picking(picking_id):
-    """
-    Cancela un albarán y sus movimientos si está en estado 'borrador' o 'listo'.
-    """
+    """(MIGRADO) Cancela un albarán usando el POOL."""
+    global db_pool
+    conn = None
     try:
-        with connect_db() as conn:
-            # ¡Usamos DictCursor aquí!
-            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-                
-                # 1. VERIFICACIÓN DE SEGURIDAD
-                cursor.execute("SELECT state FROM pickings WHERE id = %s", (picking_id,))
-                picking = cursor.fetchone()
-                
-                if not picking:
-                    return False, "El albarán no existe."
-                
-                # Ahora 'picking' es un diccionario, esto funcionará:
-                if picking['state'] not in ('draft', 'listo'):
-                    return False, f"Solo se pueden cancelar albaranes en estado 'Borrador' o 'Listo' (Estado actual: {picking['state']})."
+        conn = db_pool.getconn()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+            
+            cursor.execute("SELECT state FROM pickings WHERE id = %s", (picking_id,))
+            picking = cursor.fetchone()
+            
+            if not picking:
+                return False, "El albarán no existe."
+            
+            if picking['state'] not in ('draft', 'listo'):
+                return False, f"Solo se pueden cancelar albaranes en estado 'Borrador' o 'Listo' (Estado actual: {picking['state']})."
 
-                # 2. Si es seguro, proceder con la cancelación.
-                cursor.execute("UPDATE pickings SET state = 'cancelled' WHERE id = %s", (picking_id,))
-                cursor.execute("UPDATE stock_moves SET state = 'cancelled' WHERE picking_id = %s", (picking_id,))
-                
-                conn.commit()
+            cursor.execute("UPDATE pickings SET state = 'cancelled' WHERE id = %s", (picking_id,))
+            cursor.execute("UPDATE stock_moves SET state = 'cancelled' WHERE picking_id = %s", (picking_id,))
+            
+        conn.commit()
         return True, "Albarán cancelado correctamente."
 
     except Exception as e:
+        if conn: conn.rollback()
         print(f"[DB-ERROR] cancel_picking: {e}")
         traceback.print_exc()
         return False, f"Error al cancelar: {e}"
+    finally:
+        if conn: db_pool.putconn(conn)
 
 def get_location_path(location_id):
     """Devuelve el 'path' de una ubicación a partir de su ID."""
@@ -2162,23 +2176,47 @@ def get_next_remission_number():
     return f"{prefix}{str(next_number).zfill(5)}"
 
 def delete_stock_move(move_id):
-    """Elimina una línea de movimiento de stock y sus líneas de detalle asociadas."""
-    with connect_db() as conn:
-        cursor = conn.cursor()
-        # Primero, eliminar los detalles de series/lotes
-        cursor.execute("DELETE FROM stock_move_lines WHERE move_id =  %s", (move_id,))
-        # Luego, eliminar la línea de movimiento principal
-        cursor.execute("DELETE FROM stock_moves WHERE id =  %s", (move_id,))
-        conn.commit()
-    return True
+    """
+    (MIGRADO) Elimina un move y sus move_lines usando el pool de conexiones.
+    """
+    global db_pool # Accedemos al pool global
+    conn = None
+    try:
+        conn = db_pool.getconn() # Tomar una conexión del pool
+        with conn.cursor() as cursor:
+            # Primero, eliminar los detalles de series/lotes
+            cursor.execute("DELETE FROM stock_move_lines WHERE move_id = %s", (move_id,))
+            # Luego, eliminar la línea de movimiento principal
+            cursor.execute("DELETE FROM stock_moves WHERE id = %s", (move_id,))
+        conn.commit() # Hacer commit de la transacción
+        return True
+    except Exception as e:
+        if conn:
+            conn.rollback() # Revertir en caso de error
+        print(f"Error en delete_stock_move: {e}")
+        traceback.print_exc()
+        raise e # Re-lanzar el error para que la API lo vea
+    finally:
+        if conn:
+            db_pool.putconn(conn) # Devolver la conexión al pool
 
 def mark_picking_as_ready(picking_id):
-    """Cambia el estado de un albarán de 'draft' a 'listo'."""
-    with connect_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE pickings SET state = 'listo' WHERE id =  %s AND state = 'draft'", (picking_id,))
+    """(MIGRADO) Cambia el estado a 'listo' usando el POOL."""
+    global db_pool
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        with conn.cursor() as cursor:
+            cursor.execute("UPDATE pickings SET state = 'listo' WHERE id = %s AND state = 'draft'", (picking_id,))
+            rows_affected = cursor.rowcount # Obtener filas afectadas
         conn.commit()
-        return cursor.rowcount # Devuelve 1 si tuvo éxito, 0 si no
+        return rows_affected # Devuelve 1 si tuvo éxito, 0 si no
+    except Exception as e:
+        if conn: conn.rollback()
+        print(f"Error en mark_picking_as_ready: {e}")
+        raise e
+    finally:
+        if conn: db_pool.putconn(conn)
 
 def get_companies():
     return execute_query("SELECT id, name FROM companies ORDER BY name", fetchall=True)
@@ -3346,95 +3384,95 @@ def get_data_for_export(company_id, export_type='headers'):
     return full_export_data
 
 def return_picking_to_draft(picking_id):
-    """
-    Cambia el estado de un albarán de 'listo' de vuelta a 'draft'.
-    (Versión PostgreSQL)
-    """
+    """(MIGRADO) Regresa a 'draft' usando el POOL."""
+    global db_pool
+    conn = None
     try:
-        with connect_db() as conn:
-            # Usamos un cursor que devuelve diccionarios
-            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-                # 1. Verificar estado actual (CORREGIDO)
-                cursor.execute("SELECT state FROM pickings WHERE id = %s", (picking_id,))
-                current_state_row = cursor.fetchone()
+        conn = db_pool.getconn()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+            
+            cursor.execute("SELECT state FROM pickings WHERE id = %s", (picking_id,))
+            current_state_row = cursor.fetchone()
 
-                if not current_state_row:
-                    return False, "El albarán no existe."
-                if current_state_row['state'] != 'listo':
-                    return False, f"Solo se puede regresar desde el estado 'Listo' (estado actual: {current_state_row['state']})."
+            if not current_state_row:
+                return False, "El albarán no existe."
+            if current_state_row['state'] != 'listo':
+                return False, f"Solo se puede regresar desde el estado 'Listo' (estado actual: {current_state_row['state']})."
 
-                # 2. Actualizar estado
-                cursor.execute("UPDATE pickings SET state = 'draft' WHERE id = %s AND state = 'listo'", (picking_id,))
-                rows_affected = cursor.rowcount # Obtener filas afectadas
-                conn.commit()
+            cursor.execute("UPDATE pickings SET state = 'draft' WHERE id = %s AND state = 'listo'", (picking_id,))
+            rows_affected = cursor.rowcount
+        
+        conn.commit() # Commit de la transacción
 
-                if rows_affected > 0:
-                    return True, "Albarán regresado a estado 'Borrador'."
-                else:
-                    return False, "No se pudo actualizar el estado (posible concurrencia o error)."
+        if rows_affected > 0:
+            return True, "Albarán regresado a estado 'Borrador'."
+        else:
+            return False, "No se pudo actualizar el estado (posible concurrencia o error)."
 
     except Exception as e:
+        if conn: conn.rollback()
         print(f"Error en return_picking_to_draft: {e}")
         traceback.print_exc()
         return False, f"Error inesperado en base de datos: {e}"
+    finally:
+        if conn: db_pool.putconn(conn)
 
 def save_move_lines_for_move(move_id, tracking_data: dict):
     """
-    Reemplaza las líneas de serie/lote (stock_move_lines) para un movimiento específico.
-    tracking_data es un diccionario { 'serial_name': quantity } (qty suele ser 1 para series).
+    (MIGRADO) Reemplaza las move_lines para un move usando el pool de conexiones.
+    Esta función es transaccional.
     """
     print(f"[DB] Guardando/Actualizando move_lines para move_id: {move_id}. Datos: {tracking_data}")
+    global db_pool # Accedemos al pool global
+    conn = None
     try:
-        with connect_db() as conn:
-            # ¡Usamos un 'with' para el cursor!
-            with conn.cursor() as cursor:
+        conn = db_pool.getconn() # Tomar una conexión del pool
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor: # Usar DictCursor aquí
 
-                # --- ¡CORRECCIÓN 1: Separar execute y fetchone! ---
-                # 0. Obtener product_id del move
-                cursor.execute("SELECT product_id FROM stock_moves WHERE id = %s", (move_id,))
-                move_info = cursor.fetchone()
-                # --- FIN CORRECCIÓN 1 ---
+            # 0. Obtener product_id del move
+            cursor.execute("SELECT product_id FROM stock_moves WHERE id = %s", (move_id,))
+            move_info = cursor.fetchone()
+            
+            if not move_info:
+                print(f"[DB-ERROR] No se encontró el stock_move con ID: {move_id}")
+                return False, f"Movimiento ID {move_id} no encontrado."
+            
+            product_id = move_info['product_id'] # move_info es ahora un DictRow
+
+            # 1. Borrar líneas existentes para este movimiento
+            cursor.execute("DELETE FROM stock_move_lines WHERE move_id = %s", (move_id,))
+            print(f" -> Líneas antiguas para move_id {move_id} eliminadas.")
+
+            # 2. Insertar las nuevas líneas
+            inserted_count = 0
+            for serial_name, qty in tracking_data.items():
+                if qty <= 0: continue
+
+                # Buscar o crear el stock_lot (pasando el cursor)
+                lot = get_lot_by_name(cursor, product_id, serial_name)
                 
-                if not move_info:
-                    print(f"[DB-ERROR] No se encontró el stock_move con ID: {move_id}")
-                    return False, f"Movimiento ID {move_id} no encontrado."
-                
-                # --- ¡CORRECCIÓN 2: Acceder por índice de tupla! ---
-                # (El cursor estándar devuelve una tupla, no un dict)
-                product_id = move_info[0] 
-                # --- FIN CORRECCIÓN 2 ---
+                lot_id = lot['id'] if lot else create_lot(cursor, product_id, serial_name) 
 
-                # 1. Borrar líneas existentes para este movimiento
-                cursor.execute("DELETE FROM stock_move_lines WHERE move_id = %s", (move_id,))
-                print(f" -> Líneas antiguas para move_id {move_id} eliminadas.")
+                # Insertar la stock_move_line
+                cursor.execute(
+                    "INSERT INTO stock_move_lines (move_id, lot_id, qty_done) VALUES (%s, %s, %s)",
+                    (move_id, lot_id, qty)
+                )
+                inserted_count += 1
 
-                # 2. Insertar las nuevas líneas
-                inserted_count = 0
-                for serial_name, qty in tracking_data.items():
-                    if qty <= 0: continue
-
-                    # Buscar o crear el stock_lot
-                    lot = get_lot_by_name(cursor, product_id, serial_name)
-                    
-                    # --- ¡CORRECCIÓN 3: Acceder por índice y usar la función create_lot corregida! ---
-                    lot_id = lot[0] if lot else create_lot(cursor, product_id, serial_name) 
-                    # --- FIN CORRECCIÓN 3 ---
-
-                    # Insertar la stock_move_line
-                    cursor.execute(
-                        "INSERT INTO stock_move_lines (move_id, lot_id, qty_done) VALUES (%s, %s, %s)",
-                        (move_id, lot_id, qty)
-                    )
-                    inserted_count += 1
-
-                conn.commit()
-                print(f" -> {inserted_count} nuevas líneas insertadas para move_id {move_id}.")
-                return True, f"{inserted_count} series/lotes guardados."
+            conn.commit() # Hacer commit de toda la transacción
+            print(f" -> {inserted_count} nuevas líneas insertadas para move_id {move_id}.")
+            return True, f"{inserted_count} series/lotes guardados."
 
     except Exception as e:
+        if conn:
+            conn.rollback() # Revertir en caso de error
         print(f"Error en save_move_lines_for_move: {e}")
         traceback.print_exc()
         return False, f"Error inesperado al guardar series: {e}"
+    finally:
+        if conn:
+            db_pool.putconn(conn) # Devolver la conexión al pool
 
 def get_operation_type_details_by_name(name):
     """
