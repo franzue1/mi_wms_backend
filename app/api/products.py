@@ -10,6 +10,7 @@ import traceback
 import io
 import csv
 from fastapi.responses import StreamingResponse
+import asyncio
 
 router = APIRouter()
 AuthDependency = Annotated[TokenData, Depends(security.get_current_user_data)]
@@ -104,6 +105,38 @@ async def create_product(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error interno: {e}")
+
+# En app/api/products.py (añadir al final)
+
+@router.get("/all-for-cache", response_model=List[schemas.ProductResponse])
+async def get_all_products_for_cache(
+    auth: AuthDependency,
+    company_id: int = 1
+):
+    """
+    Obtiene TODOS los productos (SKU, nombre, tracking, etc.)
+    para ser guardados en la caché del frontend.
+    """
+    if "operations.can_view" not in auth.permissions: # O "products.can_crud"
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
+    
+    try:
+        # Llamada a la BD sin paginación
+        products_raw = await asyncio.to_thread(
+            db.get_products_filtered_sorted,
+            company_id, 
+            filters={}, # Sin filtros
+            sort_by='sku', 
+            ascending=True, 
+            limit=None, # <-- Trae TODOS
+            offset=None
+        )
+        return [dict(p) for p in products_raw]
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error al cargar productos para caché: {e}")
+
+
 
 @router.get("/{product_id}", response_model=schemas.ProductResponse)
 async def get_product(product_id: int, auth: AuthDependency):
@@ -351,3 +384,4 @@ async def import_products_csv(
         traceback.print_exc()
         # Aquí es donde se generaba el 500
         raise HTTPException(status_code=500, detail=f"Error crítico al procesar CSV: {e}")
+    
