@@ -109,21 +109,20 @@ async def get_picking_ui_details(picking_id: int, auth: AuthDependency, company_
             raise HTTPException(status_code=404, detail="Albarán no encontrado")
         
         # Usar asyncio.gather para ejecutar todo en paralelo
-
         tasks = {
             "serials": asyncio.to_thread(db.get_serials_for_picking, picking_id),
-            # "all_products" HA SIDO ELIMINADO
+            "all_products": asyncio.to_thread(db.get_products_filtered_sorted, company_id, limit=None),
             "partners_vendor": asyncio.to_thread(db.get_partners, company_id, category_name="Proveedor Externo"),
             "partners_customer": asyncio.to_thread(db.get_partners, company_id, category_name="Proveedor Cliente")
         }
         
         results = await asyncio.gather(*tasks.values())
         
-        # Mapear resultados (¡ÍNDICES CORREGIDOS!)
+        # Mapear resultados
         serials_data = results[0]
-        partners_vendor = [dict(p) for p in results[1]] # <--- Índice 1 (antes 2)
-        partners_customer = [dict(p) for p in results[2]] # <--- Índice 2 (antes 3)
-
+        all_products = [dict(p) for p in results[1]]
+        partners_vendor = [dict(p) for p in results[2]]
+        partners_customer = [dict(p) for p in results[3]]
 
         # --- 2. Lógica de Dropdowns (depende de los datos principales) ---
         op_code = picking_header['type_code']
@@ -165,7 +164,7 @@ async def get_picking_ui_details(picking_id: int, auth: AuthDependency, company_
             "picking_data": dict(picking_header),
             "moves_data": [dict(m) for m in moves_raw],
             "serials_data": serials_data,
-            #"all_products": all_products,
+            "all_products": all_products,
             "dropdown_options": {
                 "operation_types": op_types,
                 "warehouses_origin": wh_origin_list,
