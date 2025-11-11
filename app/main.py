@@ -6,38 +6,45 @@ import contextlib
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
-    # --- ¡NUEVA VERSIÓN CON POOL DE CONEXIONES! ---
+    # --- VERSIÓN FUSIONADA ---
     # Esto se ejecuta UNA SOLA VEZ cuando Uvicorn arranca.
-    print("--- Servidor iniciando, creando pool de conexiones... ---")
+    print("--- Servidor iniciando, creando pool y verificando BD... ---")
+    
+    conn = None # Para asegurarnos de que podemos cerrarlo si algo falla
     try:
-        # Llama a la nueva función que crea el pool global (db_pool)
+        # 1. Llama a la función que crea el pool global
         db.init_db_pool()
         print("--- Pool de conexiones a Base de Datos creado. ---")
         
+        # 2. Obtener UNA conexión del pool para la configuración inicial
+        #    (Esto solo lo haremos una vez al arrancar)
+        conn = db.db_pool.getconn() 
+        
+        # 3. Ejecutar la creación de tablas
+        print("--- Creando/Verificando esquema de tablas... ---")
+        db.create_schema(conn)
+        
+        # 4. Ejecutar la creación de datos iniciales
+        print("--- Creando/Verificando datos iniciales... ---")
+        db.create_initial_data(conn)
+        
+        print("--- Base de datos verificada e inicializada. ---")
+
     except Exception as e:
-        print(f"!!! ERROR FATAL DURANTE EL INICIO: No se pudo crear el pool de BD. {e}")
+        print(f"!!! ERROR FATAL DURANTE EL INICIO: {e}")
         traceback.print_exc()
+        if conn:
+            conn.rollback() # Revertir cambios si la creación de datos falló
+            
+    finally:
+        # 5. Devolver la conexión de configuración al pool
+        if conn:
+            db.db_pool.putconn(conn)
     
     yield
     
     print("--- Servidor apagándose. ---")
-    # (El pool de psycopg2 se maneja automáticamente, no necesita cierre explícito)
-
-# ----Esto creará las tablas y los datos iniciales
-#@contextlib.asynccontextmanager
-#async def lifespan(app: FastAPI):
-#    print("--- Servidor iniciando, verificando base de datos... ---")
-#    try:
-#        conn = db.connect_db()
-#        db.create_schema(conn)      # <-- Esta línea es la clave
-#        db.create_initial_data(conn) # <-- Y esta
-#        conn.close()
-#        print("--- Base de datos verificada y/o inicializada. ---")
-#    except Exception as e:
-#        print(f"!!! ERROR FATAL DURANTE EL INICIO: No se pudo inicializar la BD. {e}")
-#        traceback.print_exc()
-#    yield
-#    print("--- Servidor apagándose. ---")
+    # (El pool se maneja automáticamente al salir)
 
 app = FastAPI(
     title="Mi WMS Backend API",
