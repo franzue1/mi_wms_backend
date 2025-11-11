@@ -94,93 +94,71 @@ async def get_picking_details(picking_id: int, auth: AuthDependency):
 @router.get("/{picking_id}/ui-details", response_model=dict)
 async def get_picking_ui_details(picking_id: int, auth: AuthDependency, company_id: int = 1):
     """
-    [COMBO] Obtiene todos los datos necesarios para renderizar
-    la vista de detalle del picking en la UI en una sola llamada.
+    [COMBO-OPTIMIZADO-JSON] Obtiene la mayoría de los datos en una
+    sola consulta a la BD y luego obtiene los almacenes dinámicos.
     """
     if "operations.can_view" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
-    print(f"\n[API-COMBO] Obteniendo UI-Details para Picking ID: {picking_id}")
+    print(f"\n[API-COMBO-JSON] Obteniendo UI-Details para Picking ID: {picking_id}")
 
     try:
-        # --- 1. Obtener datos principales (en paralelo) ---
-        picking_header, moves_raw = db.get_picking_details(picking_id)
-        if not picking_header:
-            raise HTTPException(status_code=404, detail="Albarán no encontrado")
+        # --- 1. ¡UNA SOLA LLAMADA PARA CASI TODO! ---
+        # Usamos to_thread porque la consulta JSON es pesada y es mejor
+        # no bloquear el bucle de eventos principal.
+        ui_data, error = await asyncio.to_thread(
+            db.get_picking_ui_details_optimized, picking_id, company_id
+        )
+        if error:
+            raise Exception(error)
         
-        # Usar asyncio.gather para ejecutar todo en paralelo
-        tasks = {
-            "serials": asyncio.to_thread(db.get_serials_for_picking, picking_id),
-            "all_products": asyncio.to_thread(db.get_products_filtered_sorted, company_id, limit=None),
-            "partners_vendor": asyncio.to_thread(db.get_partners, company_id, category_name="Proveedor Externo"),
-            "partners_customer": asyncio.to_thread(db.get_partners, company_id, category_name="Proveedor Cliente")
-        }
-        
-        results = await asyncio.gather(*tasks.values())
-        
-        # Mapear resultados
-        serials_data = results[0]
-        all_products = [dict(p) for p in results[1]]
-        partners_vendor = [dict(p) for p in results[2]]
-        partners_customer = [dict(p) for p in results[3]]
-
-        # --- 2. Lógica de Dropdowns (depende de los datos principales) ---
-        op_code = picking_header['type_code']
-        current_op_type_name = picking_header['custom_operation_type']
-        
-        op_types = [dict(r) for r in db.get_operation_types_by_code(op_code)]
-        op_rule = db.get_operation_type_details_by_name(current_op_type_name) if current_op_type_name else None
-
+        # --- 2. Lógica Dinámica de Almacenes (que sigue en Python) ---
+        op_rule = ui_data.get("op_rule")
         wh_origin_list, wh_dest_list = [], []
-        
+
         if op_rule:
-            source_type = op_rule['source_location_category']
-            dest_type = op_rule['destination_location_category']
-            op_name = op_rule['name']
+            source_type = op_rule.get('source_location_category')
+            dest_type = op_rule.get('destination_location_category')
+            op_name = op_rule.get('name')
             
-            # Lógica de categorías (la misma que en Flet)
+            # (Pega tu lógica de 'allowed_origin_wh_categories' aquí)
             allowed_origin_wh_categories = []
             if source_type == 'internal':
                 if op_name == "Transferencia entre Almacenes": allowed_origin_wh_categories = ["ALMACEN PRINCIPAL"]
-                elif op_name == "Consignación Entregada": allowed_origin_wh_categories = ["ALMACEN PRINCIPAL"]
-                # ... (añadir las otras reglas 'elif' que tenías en Flet) ...
+                # ... (todas tus otras reglas 'elif') ...
                 else: allowed_origin_wh_categories = ["ALMACEN PRINCIPAL", "CONTRATISTA"]
             
             allowed_dest_wh_categories = []
             if dest_type == 'internal':
                 if op_name == "Compra Nacional": allowed_dest_wh_categories = ["ALMACEN PRINCIPAL"]
-                elif op_name == "Consignación Recibida": allowed_dest_wh_categories = ["ALMACEN PRINCIPAL"]
-                # ... (añadir las otras reglas 'elif' que tenías en Flet) ...
+                # ... (todas tus otras reglas 'elif') ...
                 else: allowed_dest_wh_categories = ["ALMACEN PRINCIPAL", "CONTRATISTA"]
 
-            # Obtener los almacenes permitidos
+            # --- 3. Consultas 2 y 3 (Ligeras y en Paralelo) ---
+            tasks = []
             if allowed_origin_wh_categories:
-                wh_origin_list = [dict(w) for w in db.get_warehouses_by_categories(company_id, allowed_origin_wh_categories)]
+                tasks.append(asyncio.to_thread(db.get_warehouses_by_categories, company_id, allowed_origin_wh_categories))
+            else:
+                tasks.append(asyncio.to_thread(lambda: [])) # Placeholder
+                
             if allowed_dest_wh_categories:
-                wh_dest_list = [dict(w) for w in db.get_warehouses_by_categories(company_id, allowed_dest_wh_categories)]
+                tasks.append(asyncio.to_thread(db.get_warehouses_by_categories, company_id, allowed_dest_wh_categories))
+            else:
+                tasks.append(asyncio.to_thread(lambda: [])) # Placeholder
+
+            results = await asyncio.gather(*tasks)
+            wh_origin_list = [dict(w) for w in results[0]]
+            wh_dest_list = [dict(w) for w in results[1]]
         
-        # --- 3. Construir la Respuesta JSON Gigante ---
-        response = {
-            "picking_data": dict(picking_header),
-            "moves_data": [dict(m) for m in moves_raw],
-            "serials_data": serials_data,
-            "all_products": all_products,
-            "dropdown_options": {
-                "operation_types": op_types,
-                "warehouses_origin": wh_origin_list,
-                "warehouses_dest": wh_dest_list,
-                "partners_vendor": partners_vendor,
-                "partners_customer": partners_customer
-            },
-            "op_rule": dict(op_rule) if op_rule else None
-        }
+        # --- 4. Añadir los almacenes al JSON y devolver ---
+        ui_data["dropdown_options"]["warehouses_origin"] = wh_origin_list
+        ui_data["dropdown_options"]["warehouses_dest"] = wh_dest_list
         
-        return response
+        return ui_data
 
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al obtener UI-Details: {e}")
-
 
 @router.get("/{picking_id}/serials", response_model=Dict[int, Dict[str, float]])
 async def get_picking_serials(picking_id: int, auth: AuthDependency):

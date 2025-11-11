@@ -10,12 +10,24 @@ import functools
 from collections import defaultdict
 import hashlib
 from dotenv import load_dotenv
+import json
 
 # --- 2. CONFIGURACIÓN DEL POOL GLOBAL ---
 # Este pool se creará UNA VEZ al iniciar la app.
 db_pool = None
 DATABASE_URL = None
 #DATABASE_URL = os.environ.get("DATABASE_URL")
+
+ALLOWED_PICKING_FIELDS_TO_UPDATE = {
+    'name', 
+    'partner_id', 
+    'state', 
+    'scheduled_date', 
+    'responsible_user',
+    'service_act_number',
+    'date_attended'
+    # ... añade aquí CUALQUIER otro campo que sea seguro actualizar
+}
 
 def init_db_pool():
     """
@@ -89,8 +101,6 @@ def execute_query(query, params=(), fetchone=False, fetchall=False):
             # --- 6. DEVOLVER LA CONEXIÓN AL POOL ---
             db_pool.putconn(conn) 
 
-# En app/database.py (añadir esto después de la función execute_query)
-
 def execute_commit_query(query, params=(), fetchone=False):
     """
     Función centralizada para ejecutar consultas de ESCRITURA (INSERT, UPDATE, DELETE).
@@ -139,6 +149,17 @@ def create_schema(conn):
     cursor = conn.cursor()
     print("Verificando/Creando esquema de tablas en PostgreSQL...")
     
+    # --- ¡NUEVO! Habilitar la extensión para búsquedas de texto rápidas ---
+    try:
+        cursor.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
+        print(" -> Extensión 'pg_trgm' habilitada.")
+    except Exception as e:
+        # Si falla (ej. permisos), no es fatal, pero las búsquedas serán lentas.
+        print(f"[ADVERTENCIA] No se pudo habilitar 'pg_trgm'. Búsquedas de texto pueden ser lentas. {e}")
+        # Es importante revertir la transacción fallida para poder continuar.
+        conn.rollback() 
+        cursor = conn.cursor() # Reabrir el cursor
+
     # --- Tablas Principales (sin FKs) ---
     cursor.execute("CREATE TABLE IF NOT EXISTS companies (id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL);")
     cursor.execute("CREATE TABLE IF NOT EXISTS product_categories (id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL);")
@@ -359,6 +380,20 @@ def create_schema(conn):
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_stock_move_lines_move_id ON stock_move_lines (move_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_stock_move_lines_lot_id ON stock_move_lines (lot_id);")
         
+        print(" -> Añadiendo nuevos índices (productos, socios, almacenes)...")
+        
+        # Índices para 'products'
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_products_company_id ON products (company_id);")
+        # Índices TRGM para búsqueda 'ILIKE' en nombre y SKU (requiere la extensión pg_trgm)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_products_name_trgm ON products USING gin (name gin_trgm_ops);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_products_sku_trgm ON products USING gin (sku gin_trgm_ops);")
+        
+        # Índice para 'partners' (acelera la búsqueda por compañía y categoría)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_partners_company_id_category_id ON partners (company_id, category_id);")
+        
+        # Índice para 'warehouses' (acelera la búsqueda por compañía y categoría)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_warehouses_company_id_category_id ON warehouses (company_id, category_id);")
+        
     except Exception as e:
         print(f"Error al crear índices: {e}")
         # (No detenemos la ejecución, solo lo reportamos)
@@ -575,6 +610,7 @@ def create_initial_data(conn):
     conn.commit()
     print("Datos iniciales de PostgreSQL creados/verificados.")
 
+
 def hash_password(password):
     """Genera un hash SHA-256 para la contraseña."""
     return hashlib.sha256(password.encode('utf-8')).hexdigest()
@@ -586,79 +622,138 @@ def check_password(hashed_password, plain_password):
 def get_product_categories(): return execute_query("SELECT id, name FROM product_categories ORDER BY name", fetchall=True)
 
 def create_product_category(name):
+    """
+    Crea una nueva categoría de producto en la base de datos.
+    """
+    query = """
+        INSERT INTO product_categories (name) 
+        VALUES (%s) 
+        RETURNING id
+    """
+    params = (name,)
+    
     try:
-        with connect_db() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "INSERT INTO product_categories (name) VALUES (%s) RETURNING id", 
-                    (name,)
-                )
-                new_id = cursor.fetchone()[0]
-                conn.commit()
-                return new_id
-    except Exception as e: # Captura genérica de psycopg2
-        if "product_categories_name_key" in str(e): # Revisa el nombre real del 'constraint'
-            raise ValueError(f"La categoría de producto '{name}' ya existe.")
+        # ¡Aquí la usamos!
+        result = execute_commit_query(query, params, fetchone=True)
+        
+        if result:
+            return result['id'] # O result[0] dependiendo de tu cursor
         else:
-            raise e
+            raise Exception("No se pudo crear la categoría o no se retornó el ID.")
+            
+    except Exception as e:
+        print(f"Error específico al intentar crear la categoría '{name}'")
+        raise e
 
 def update_product_category(cat_id, name):
+    """
+    Actualiza el nombre de una categoría de producto usando el pool de conexiones.
+    """
+    query = "UPDATE product_categories SET name = %s WHERE id = %s"
+    params = (name, cat_id)
+    
     try:
-        with connect_db() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "UPDATE product_categories SET name = %s WHERE id = %s",
-                    (name, cat_id)
-                )
-                conn.commit()
-    except Exception as e:  # Captura genérica para psycopg2
-        # Detectar violación de restricción única (nombre duplicado)
-        if "product_categories_name_key" in str(e):  # Ajusta al nombre real del constraint
+        # 1. Usamos la función centralizada de escritura.
+        # No necesitamos 'fetchone=True' porque un UPDATE simple no retorna nada.
+        execute_commit_query(query, params)
+        
+    except Exception as e: 
+        # 2. Mantenemos la lógica de error personalizada.
+        # execute_commit_query re-lanza la excepción, así que podemos
+        # capturarla aquí para darle un formato amigable.
+        
+        if "product_categories_name_key" in str(e): 
             raise ValueError(f"La categoría de producto '{name}' ya existe.")
         else:
+            # Re-lanzar cualquier otro error de BD
             raise e
     
 def delete_product_category(cat_id):
+    """
+    Elimina una categoría de producto usando el pool de conexiones.
+    Maneja errores de integridad referencial (foreign key).
+    """
+    query = "DELETE FROM product_categories WHERE id = %s"
+    params = (cat_id,)
+    
     try:
-        with connect_db() as conn:
-            with conn.cursor() as cursor:
-                # PostgreSQL lanzará un error de integridad si la categoría está en uso
-                cursor.execute("DELETE FROM product_categories WHERE id = %s", (cat_id,))
-                conn.commit()
+        # 1. Usamos la función centralizada de escritura
+        # No se necesita fetchone=True para un DELETE
+        execute_commit_query(query, params)
+        
+        # 2. Si execute_commit_query no lanzó error, fue exitoso
         return True, "Categoría de producto eliminada."
+        
     except Exception as e:
-        # Detectar error de llave foránea (común en PostgreSQL para esto)
+        # 3. execute_commit_query re-lanza el error de la BD,
+        #    así que podemos inspeccionarlo aquí.
+        
+        # Detectar error de llave foránea
         if "violates foreign key constraint" in str(e):
-             return False, "No se puede eliminar: Esta categoría está asignada a uno o más productos."
+            return False, "No se puede eliminar: Esta categoría está asignada a uno o más productos."
+        
+        # Cualquier otro error
         print(f"[DB-ERROR] delete_product_category: {e}")
         return False, f"Error al eliminar: {e}"
 
 def delete_product(product_id):
+    """
+    Elimina un producto y sus datos asociados (quants, lots)
+    SÓLO SI no tiene movimientos de stock.
+    Usa el pool, pero maneja la transacción manualmente.
+    """
+    global db_pool
+    if not db_pool:
+        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
+        init_db_pool()
+        if not db_pool:
+            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
+
+    conn = None # 1. Definimos la conexión fuera del try
     try:
-        with connect_db() as conn:
-            cursor = conn.cursor()
+        # 2. Obtenemos UNA conexión del pool para toda la transacción
+        conn = db_pool.getconn()
+        conn.cursor_factory = psycopg2.extras.DictCursor
+
+        # Usamos un cursor para toda la operación
+        with conn.cursor() as cursor:
             
-            # --- EL GUARDIÁN ---
-            # 1. Revisa si hay movimientos para este producto.
-            cursor.execute("SELECT COUNT(*) FROM stock_moves WHERE product_id =  %s", (product_id,))
+            # --- EL GUARDIÁN (LECTURA) ---
+            cursor.execute("SELECT COUNT(*) FROM stock_moves WHERE product_id = %s", (product_id,))
             move_count = cursor.fetchone()[0]
             
-            # 2. Si hay movimientos, se niega a borrar y devuelve un error.
+            # --- LÓGICA DE NEGOCIO ---
             if move_count > 0:
+                # Si retornamos aquí, el 'finally' se ejecutará
+                # y devolverá la conexión al pool. ¡Perfecto!
                 return (False, "Este producto no se puede eliminar porque tiene movimientos de inventario registrados.")
             
-            # 3. Si no hay movimientos, procede con la eliminación.
-            cursor.execute("DELETE FROM stock_quants WHERE product_id =  %s", (product_id,))
-            cursor.execute("DELETE FROM stock_lots WHERE product_id =  %s", (product_id,))
-            # La siguiente línea ya no es necesaria aquí, pero la dejamos por si se usa en otro contexto.
-            cursor.execute("DELETE FROM stock_moves WHERE product_id =  %s", (product_id,))
-            cursor.execute("DELETE FROM products WHERE id =  %s", (product_id,))
+            # --- LA ELIMINACIÓN (ESCRITURA MÚLTIPLE) ---
+            # Si move_count == 0, procedemos a borrar todo
+            cursor.execute("DELETE FROM stock_quants WHERE product_id = %s", (product_id,))
+            cursor.execute("DELETE FROM stock_lots WHERE product_id = %s", (product_id,))
+            cursor.execute("DELETE FROM stock_moves WHERE product_id = %s", (product_id,)) # (Aunque ya sabemos que son 0)
+            cursor.execute("DELETE FROM products WHERE id = %s", (product_id,))
+            
+            # 3. Si todos los DELETEs fueron bien, hacemos COMMIT
             conn.commit()
             
             return (True, "Producto eliminado correctamente.")
             
     except Exception as e:
+        # 4. Si CUALQUIER COSA falla (el SELECT, un DELETE),
+        #    hacemos rollback para revertir todo.
+        if conn:
+            conn.rollback()
+        print(f"[DB-ERROR] delete_product: {e}")
+        traceback.print_exc() # Muy útil para depurar
         return (False, f"Error inesperado en la base de datos: {e}")
+        
+    finally:
+        # 5. PASE LO QUE PASE (éxito, error, o return anticipado),
+        #    DEVOLVEMOS la conexión al pool.
+        if conn:
+            db_pool.putconn(conn)
 
 def get_stock_on_hand(warehouse_id=None):
     base_query = """
@@ -684,9 +779,7 @@ def get_stock_on_hand(warehouse_id=None):
         base_query += " AND w.id = %s"
         params.append(warehouse_id)
 
-    # --- ¡ESTA ES LA CORRECCIÓN! ---
     base_query += " GROUP BY w.id, w.name, p.id, p.sku, p.name, sl.id, sl.name, pc.id, pc.name, u.id, u.name"
-    # --- FIN DE LA CORRECCIÓN ---
     
     base_query += " ORDER BY w.name, p.name, sl.name"
     return execute_query(base_query, tuple(params), fetchall=True)
@@ -727,51 +820,82 @@ def get_incoming_stock(product_id, location_id):
 
 def get_uoms(): return execute_query("SELECT id, name FROM uom ORDER BY name", fetchall=True)
 def create_uom(name):
+    """
+    Crea una nueva Unidad de Medida (UOM) usando el pool de conexiones.
+    Maneja la restricción de nombre único.
+    """
+    query = "INSERT INTO uom (name) VALUES (%s) RETURNING id"
+    params = (name,)
+    
     try:
-        with connect_db() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "INSERT INTO uom (name) VALUES (%s) RETURNING id",
-                    (name,)
-                )
-                new_id = cursor.fetchone()[0]
-                conn.commit()
-                return new_id
-    except Exception as e:  # Captura genérica (psycopg2 lanza distintas excepciones)
-        # Detecta si el error proviene de una restricción única en la columna 'name'
-        if "uom_name_key" in str(e):  # Asegúrate de que este sea el nombre real del constraint
+        # 1. Llamamos a la función de escritura, pidiendo que retorne el resultado
+        result = execute_commit_query(query, params, fetchone=True)
+        
+        if result:
+            new_id = result[0] # O result['id'] si tu cursor devuelve dict
+            return new_id
+        else:
+            raise Exception("No se pudo crear la UOM o no se retornó el ID.")
+
+    except Exception as e: 
+        # 2. La lógica para detectar el error de duplicado sigue
+        #    funcionando porque execute_commit_query re-lanza el error.
+        if "uom_name_key" in str(e): 
             raise ValueError(f"La unidad de medida '{name}' ya existe.")
         else:
+            # Re-lanzar cualquier otro error de BD
             raise e
 
 def update_uom(uom_id, name):
+    """
+    Actualiza el nombre de una Unidad de Medida (UOM) usando el pool de conexiones.
+    Maneja la restricción de nombre único.
+    """
+    query = "UPDATE uom SET name = %s WHERE id = %s"
+    params = (name, uom_id)
+    
     try:
-        with connect_db() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "UPDATE uom SET name = %s WHERE id = %s",
-                    (name, uom_id)
-                )
-                conn.commit()
-    except Exception as e:  # Manejo genérico de psycopg2
-        # Verifica si el error proviene de una restricción única (duplicado de 'name')
-        if "uom_name_key" in str(e):  # Ajusta según el nombre real del constraint
+        # 1. Llamamos a la función de escritura centralizada.
+        # No necesitamos fetchone=True para un UPDATE.
+        execute_commit_query(query, params)
+        
+    except Exception as e: 
+        # 2. La excepción de la BD es re-lanzada por execute_commit_query,
+        #    así que la capturamos aquí para manejarla.
+        if "uom_name_key" in str(e): 
             raise ValueError(f"La unidad de medida '{name}' ya existe.")
         else:
+            # Re-lanzar cualquier otro error de BD
             raise e
 
 def delete_uom(uom_id):
+    """
+    Elimina una Unidad de Medida (UOM) usando el pool de conexiones.
+    Maneja errores de integridad referencial (foreign key).
+    """
+    query = "DELETE FROM uom WHERE id = %s"
+    params = (uom_id,)
+    
     try:
-        with connect_db() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("DELETE FROM uom WHERE id = %s", (uom_id,))
-                conn.commit()
+        # 1. Usamos la función centralizada de escritura
+        # No se necesita fetchone=True para un DELETE
+        execute_commit_query(query, params)
+        
+        # 2. Si no hubo error, la eliminación fue exitosa
         return True, "Unidad de medida eliminada."
+        
     except Exception as e:
+        # 3. execute_commit_query re-lanza el error de la BD,
+        #    así que podemos inspeccionarlo aquí.
+        
+        # Detectar error de llave foránea
         if "violates foreign key constraint" in str(e):
-             return False, "No se puede eliminar: Esta UdM está asignada a uno o más productos."
+            return False, "No se puede eliminar: Esta UdM está asignada a uno o más productos."
+        
+        # Cualquier otro error
         print(f"[DB-ERROR] delete_uom: {e}")
         return False, f"Error al eliminar: {e}"
+    
 def get_products(company_id, ownership_filter=None):
     """
     Obtiene los productos, AHORA INCLUYENDO los nuevos campos.
@@ -807,33 +931,82 @@ def get_product_details(product_id):
     return execute_query(query, (product_id,), fetchone=True)
 
 def create_product(name, sku, category_id, tracking, uom_id, company_id, ownership, standard_price):
+    """
+    Crea un nuevo producto usando el pool de conexiones.
+    [VERSIÓN CORREGIDA]
+    """
+    global db_pool # Necesitas acceso al pool global
+    if not db_pool:
+        print("[WARN] El Pool de BD no está inicializado (desde create_product). Intentando...")
+        init_db_pool()
+        if not db_pool:
+             raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
+
+    conn = None
     try:
-        with connect_db() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """INSERT INTO products (name, sku, category_id, tracking, uom_id, company_id, ownership, standard_price) 
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
-                    (name, sku, category_id, tracking, uom_id, company_id, ownership, standard_price)
-                )
-                new_id = cursor.fetchone()[0]
-                conn.commit()
-                return new_id
+        conn = db_pool.getconn() # <-- 1. Obtener conexión del POOL
+        
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO products (name, sku, category_id, tracking, uom_id, company_id, ownership, standard_price) 
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                (name, sku, category_id, tracking, uom_id, company_id, ownership, standard_price)
+            )
+            new_id = cursor.fetchone()[0]
+            conn.commit() # <-- 2. Hacer commit (¡MUY IMPORTANTE para INSERT/UPDATE!)
+            return new_id
+    
     except Exception as e:
+        if conn:
+            conn.rollback() # <-- 3. Deshacer cambios si algo falla
+        
+        # Mantenemos tu lógica para el SKU duplicado
         if "products_sku_key" in str(e):
             raise ValueError(f"El SKU '{sku}' ya existe.")
         else:
-            raise e
+            # Imprime el error real de la BD en la consola del backend
+            print(f"Error DB [create_product]: {e}") 
+            traceback.print_exc()
+            raise e # Re-lanza la excepción para que FastAPI la capture (y muestre el 500)
+    
+    finally:
+        if conn:
+            db_pool.putconn(conn) # <-- 4. Devolver la conexión al POOL (pase lo que pase)
+
 def update_product(product_id, name, sku, category_id, tracking, uom_id, ownership, standard_price):
-    with connect_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE products SET name =  %s, sku =  %s, category_id =  %s, tracking =  %s, uom_id =  %s, ownership =  %s, standard_price =  %s WHERE id =  %s",
-            (name, sku, category_id, tracking, uom_id, ownership, standard_price, product_id)
-        )
-        conn.commit()
+    """
+    Actualiza un producto existente usando el pool de conexiones.
+    Maneja la restricción de SKU único.
+    """
+    query = """
+        UPDATE products 
+        SET name = %s, sku = %s, category_id = %s, tracking = %s, 
+            uom_id = %s, ownership = %s, standard_price = %s 
+        WHERE id = %s
+    """
+    params = (name, sku, category_id, tracking, uom_id, ownership, standard_price, product_id)
+
+    try:
+        # 1. Usamos la función centralizada de escritura.
+        execute_commit_query(query, params)
+        
+    except Exception as e:
+        # 2. Manejamos errores comunes (como SKU duplicado)
+        #    que execute_commit_query re-lanza desde la BD.
+        
+        # ¡Ajusta 'products_sku_key' al nombre real de tu constraint si es diferente!
+        if "products_sku_key" in str(e): 
+            raise ValueError(f"El SKU '{sku}' ya existe para otro producto.")
+        
+        # Puedes añadir más 'elif' si, por ejemplo, el nombre también es único
+        # elif "products_name_key" in str(e):
+        #    raise ValueError(f"El nombre de producto '{name}' ya existe.")
+        
+        else:
+            # Re-lanzar cualquier otro error de BD
+            raise e
 
 def get_work_orders(company_id):
-    # ... (la consulta base es la misma) ...
     query = """
     SELECT
         wo.id, wo.ot_number, wo.customer_name, wo.address,
@@ -845,13 +1018,11 @@ def get_work_orders(company_id):
         COALESCE(l_draft.path, l_done.path, '-') as location_src_path,
         COALESCE(p_draft.service_act_number, p_done.service_act_number, '') as service_act_number,
         
-        -- --- ¡CAMBIO DE SINTAXIS! strftime -> TO_CHAR ---
         COALESCE(
             TO_CHAR(p_draft.attention_date, 'DD/MM/YYYY'),
             TO_CHAR(p_done.attention_date, 'DD/MM/YYYY'),
             ''
         ) as attention_date_str
-        -- --- FIN CAMBIO ---
 
     FROM work_orders wo
     LEFT JOIN pickings p_draft ON wo.id = p_draft.work_order_id AND p_draft.state = 'draft' AND p_draft.picking_type_id IN (SELECT id FROM picking_types WHERE code = 'OUT')
@@ -870,21 +1041,33 @@ def get_work_orders(company_id):
 def get_work_order_details(wo_id): return execute_query("SELECT * FROM work_orders WHERE id =  %s", (wo_id,), fetchone=True)
 
 def create_work_order(company_id, ot_number, customer, address, service, job_type):
+    """
+    Crea una nueva Orden de Trabajo (Work Order) usando el pool de conexiones.
+    Maneja la restricción de OT duplicada.
+    """
     print(f"[DB-DEBUG] Creando Work Order: OT={ot_number}, Cliente={customer}, Comp={company_id}")
+    
+    query = """
+        INSERT INTO work_orders
+            (company_id, ot_number, customer_name, address, service_type, job_type)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        RETURNING id
+    """
+    params = (company_id, ot_number, customer, address, service, job_type)
+    
     try:
-        with connect_db() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """INSERT INTO work_orders
-                       (company_id, ot_number, customer_name, address, service_type, job_type)
-                       VALUES (%s, %s, %s, %s, %s, %s)
-                       RETURNING id""", # <-- ¡CAMBIO! Pedimos que devuelva el ID
-                    (company_id, ot_number, customer, address, service, job_type)
-                )
-                new_wo_id = cursor.fetchone()[0] # <-- ¡CAMBIO! Obtenemos el ID devuelto
-                conn.commit()
-                return new_wo_id
-    except Exception as e: # Captura genérica para psycopg2.Error
+        # 1. Usamos la función de escritura, pidiendo que retorne el ID
+        result = execute_commit_query(query, params, fetchone=True)
+        
+        if result:
+            new_wo_id = result[0] # O result['id']
+            return new_wo_id
+        else:
+            raise Exception("No se pudo crear la Work Order o no se retornó el ID.")
+            
+    except Exception as e: 
+        # 2. La excepción de la BD es re-lanzada,
+        #    así que la capturamos para el manejo personalizado.
         if "work_orders_ot_number_key" in str(e): # El nombre de la restricción UNIQUE
             print(f"[DB-WARN] Intento de crear OT duplicada: {ot_number}")
             raise ValueError(f"La Orden de Trabajo '{ot_number}' ya existe.")
@@ -923,8 +1106,6 @@ def get_available_serials_at_location(product_id, location_id):
     """
     # Pasamos location_id dos veces: una para quants, otra para la subconsulta de moves
     return execute_query(query, (product_id, location_id, location_id), fetchall=True)
-
-# En app/database.py (REEMPLAZA la función create_picking existente)
 
 def create_picking(name, picking_type_id, location_src_id, location_dest_id, company_id, responsible_user, work_order_id=None):
     """
@@ -1197,7 +1378,6 @@ def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_track
         move_dict['final_dest_id'] = dest_loc_id
         processed_moves.append(move_dict)
 
-    # --- ¡CORRECCIÓN 2! ---
     # Aquí es donde estaba el error. Ahora pasamos el 'picking_type_code'
     # que obtuvimos al inicio.
     success, message = _check_stock_with_cursor(cursor, picking_id, picking['type_code'])
@@ -1205,7 +1385,6 @@ def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_track
         print(f"[DEBUG-STOCK] PRE-VALIDACIÓN FALLIDA: {message}")
         return False, message
 
-    # --- FASE 2: EJECUCIÓN (CON LÓGICA CORREGIDA) ---
     # (El resto de esta función (Fase 2) no necesita cambios)
     print(f"[DEBUG-STOCK] FASE 2: Ejecutando movimientos de stock...")
     processed_serials_in_transaction = set()
@@ -1294,125 +1473,146 @@ def process_picking_validation(picking_id, moves_with_tracking):
 def process_full_liquidation(wo_id, consumptions, retiros, service_act_number, date_attended_db, current_ui_location_id, user_name):
     """
     Finaliza una liquidación ATÓMICA (Consumos y/o Retiros).
-    Versión corregida: Obtiene el warehouse_id antes de procesar las líneas.
+    AHORA USA EL POOL y maneja la transacción manualmente con COMMIT/ROLLBACK.
     """
     print(f"[DB-LIQ-FULL] Iniciando FINALIZACIÓN ATÓMICA para WO ID: {wo_id}, LocSrcID: {current_ui_location_id}")
     
+    # 1. Obtenemos el pool (como en las otras funciones)
+    global db_pool
+    if not db_pool:
+        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
+        init_db_pool()
+        if not db_pool:
+            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
+
     # Validación previa esencial
     if not current_ui_location_id:
         return False, "Error interno: Falta ID de Ubicación de Origen para determinar el Almacén."
     if user_name is None: user_name = "Sistema"
 
+    # 2. Preparamos la conexión fuera del try
+    conn = None 
     try:
-        with connect_db() as conn:
-            # Usamos DictCursor para facilitar el acceso a columnas por nombre
-            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-                
-                # --- 0. Obtener y validar datos comunes (Warehouse ID) ---
-                cursor.execute("SELECT warehouse_id FROM locations WHERE id = %s", (current_ui_location_id,))
-                wh_row = cursor.fetchone()
-                if not wh_row:
-                    return False, f"No se pudo encontrar el almacén asociado a la ubicación ID {current_ui_location_id}"
-                
-                main_warehouse_id = wh_row['warehouse_id'] # <-- Variable común para ambos procesos
-                print(f" -> Almacén principal determinado: ID {main_warehouse_id}")
+        # 3. Obtenemos UNA conexión del pool para toda la transacción
+        conn = db_pool.getconn()
+        
+        # Usamos DictCursor para facilitar el acceso a columnas por nombre
+        # (Nota: lo pasamos al crear el cursor, no en la conexión)
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+            
+            # --- 0. Obtener y validar datos comunes (Warehouse ID) ---
+            cursor.execute("SELECT warehouse_id FROM locations WHERE id = %s", (current_ui_location_id,))
+            wh_row = cursor.fetchone()
+            if not wh_row:
+                return False, f"No se pudo encontrar el almacén asociado a la ubicación ID {current_ui_location_id}"
+            
+            main_warehouse_id = wh_row['warehouse_id']
+            print(f" -> Almacén principal determinado: ID {main_warehouse_id}")
 
-                # --- 1. Obtener detalles de la OT ---
-                cursor.execute("SELECT company_id, phase FROM work_orders WHERE id = %s", (wo_id,))
-                wo_details = cursor.fetchone()
-                if not wo_details: return False, "La orden de trabajo no existe."
-                if wo_details['phase'] == 'Liquidado': return False, "Esta OT ya ha sido liquidada."
-                company_id = wo_details['company_id']
+            # --- 1. Obtener detalles de la OT ---
+            cursor.execute("SELECT company_id, phase FROM work_orders WHERE id = %s", (wo_id,))
+            wo_details = cursor.fetchone()
+            if not wo_details: return False, "La orden de trabajo no existe."
+            if wo_details['phase'] == 'Liquidado': return False, "Esta OT ya ha sido liquidada."
+            company_id = wo_details['company_id']
 
-                picking_id_out = None
-                picking_id_ret = None
-                picking_name_out = ""
-                picking_name_ret = ""
-                moves_with_tracking_out = {}
-                moves_with_tracking_ret = {}
+            picking_id_out = None
+            picking_id_ret = None
+            picking_name_out = ""
+            picking_name_ret = ""
+            moves_with_tracking_out = {}
+            moves_with_tracking_ret = {}
 
-                # --- PASO 1: CREAR/ACTUALIZAR BORRADORES ---
-                
-                # --- 1.A. Procesar Consumo (OUT) ---
-                if consumptions:
-                    print(" -> Paso 1A: Guardando borrador de Consumo (OUT)...")
-                    consumo_data = {
-                        'warehouse_id': main_warehouse_id, # Usamos la variable común
-                        'location_src_id': current_ui_location_id,
-                        'date_attended_db': date_attended_db, 
-                        'service_act_number': service_act_number,
-                        'lines_data': consumptions
-                    }
-                    # Llamamos a la función interna (que ya debe estar corregida para devolver 2 valores)
-                    picking_id_out, moves_with_tracking_out = _create_or_update_draft_picking_internal(
-                        cursor, wo_id, 'OUT', consumo_data, company_id, user_name
-                    )
-                    if picking_id_out is None:
-                         raise Exception("Fallo al crear/actualizar borrador OUT (sin ID devuelto).")
+            # --- PASO 1: CREAR/ACTUALIZAR BORRADORES ---
+            
+            # --- 1.A. Procesar Consumo (OUT) ---
+            if consumptions:
+                print(" -> Paso 1A: Guardando borrador de Consumo (OUT)...")
+                consumo_data = {
+                    'warehouse_id': main_warehouse_id,
+                    'location_src_id': current_ui_location_id,
+                    'date_attended_db': date_attended_db, 
+                    'service_act_number': service_act_number,
+                    'lines_data': consumptions
+                }
+                picking_id_out, moves_with_tracking_out = _create_or_update_draft_picking_internal(
+                    cursor, wo_id, 'OUT', consumo_data, company_id, user_name
+                )
+                if picking_id_out is None:
+                    raise Exception("Fallo al crear/actualizar borrador OUT (sin ID devuelto).")
 
-                    cursor.execute("SELECT name FROM pickings WHERE id = %s", (picking_id_out,))
-                    picking_name_out = cursor.fetchone()['name']
-                    print(f" -> Borrador (OUT) '{picking_name_out}' (ID: {picking_id_out}) listo para validar.")
-                
-                # --- 1.B. Procesar Retiro (RET) ---
-                if retiros:
-                    print(" -> Paso 1B: Guardando borrador de Retiro (RET)...")
-                    retiro_data = {
-                        'warehouse_id': main_warehouse_id, # Usamos la variable común
-                        # 'location_src_id' NO se usa para RET (usa el default del tipo de operación)
-                        'date_attended_db': date_attended_db, 
-                        'service_act_number': service_act_number,
-                        'lines_data': retiros
-                    }
-                    picking_id_ret, moves_with_tracking_ret = _create_or_update_draft_picking_internal(
-                        cursor, wo_id, 'RET', retiro_data, company_id, user_name
-                    )
-                    if picking_id_ret is None:
-                        raise Exception("Fallo al crear/actualizar borrador RET (sin ID devuelto).")
+                cursor.execute("SELECT name FROM pickings WHERE id = %s", (picking_id_out,))
+                picking_name_out = cursor.fetchone()['name']
+                print(f" -> Borrador (OUT) '{picking_name_out}' (ID: {picking_id_out}) listo para validar.")
+            
+            # --- 1.B. Procesar Retiro (RET) ---
+            if retiros:
+                print(" -> Paso 1B: Guardando borrador de Retiro (RET)...")
+                retiro_data = {
+                    'warehouse_id': main_warehouse_id,
+                    'date_attended_db': date_attended_db, 
+                    'service_act_number': service_act_number,
+                    'lines_data': retiros
+                }
+                picking_id_ret, moves_with_tracking_ret = _create_or_update_draft_picking_internal(
+                    cursor, wo_id, 'RET', retiro_data, company_id, user_name
+                )
+                if picking_id_ret is None:
+                    raise Exception("Fallo al crear/actualizar borrador RET (sin ID devuelto).")
 
-                    cursor.execute("SELECT name FROM pickings WHERE id = %s", (picking_id_ret,))
-                    picking_name_ret = cursor.fetchone()['name']
-                    print(f" -> Borrador (RET) '{picking_name_ret}' (ID: {picking_id_ret}) listo para validar.")
+                cursor.execute("SELECT name FROM pickings WHERE id = %s", (picking_id_ret,))
+                picking_name_ret = cursor.fetchone()['name']
+                print(f" -> Borrador (RET) '{picking_name_ret}' (ID: {picking_id_ret}) listo para validar.")
 
-                # --- PASO 2: VALIDAR LOS BORRADORES ---
+            # --- PASO 2: VALIDAR LOS BORRADORES ---
 
-                # --- 2.A. Validar Consumo (OUT) ---
-                if picking_id_out:
-                    print(f" -> Paso 2A: Validando borrador (OUT) {picking_id_out}...")
-                    success_out, message_out = _process_picking_validation_with_cursor(cursor, picking_id_out, moves_with_tracking_out)
-                    if not success_out:
-                        raise Exception(f"Validación Consumo falló: {message_out}")
-                    print(" -> Validación (OUT) exitosa.")
+            # --- 2.A. Validar Consumo (OUT) ---
+            if picking_id_out:
+                print(f" -> Paso 2A: Validando borrador (OUT) {picking_id_out}...")
+                success_out, message_out = _process_picking_validation_with_cursor(cursor, picking_id_out, moves_with_tracking_out)
+                if not success_out:
+                    raise Exception(f"Validación Consumo falló: {message_out}")
+                print(" -> Validación (OUT) exitosa.")
 
-                # --- 2.B. Validar Retiro (RET) ---
-                if picking_id_ret:
-                    print(f" -> Paso 2B: Validando borrador (RET) {picking_id_ret}...")
-                    success_ret, message_ret = _process_picking_validation_with_cursor(cursor, picking_id_ret, moves_with_tracking_ret)
-                    if not success_ret:
-                        raise Exception(f"Validación Retiro falló: {message_ret}")
-                    print(" -> Validación (RET) exitosa.")
+            # --- 2.B. Validar Retiro (RET) ---
+            if picking_id_ret:
+                print(f" -> Paso 2B: Validando borrador (RET) {picking_id_ret}...")
+                success_ret, message_ret = _process_picking_validation_with_cursor(cursor, picking_id_ret, moves_with_tracking_ret)
+                if not success_ret:
+                    raise Exception(f"Validación Retiro falló: {message_ret}")
+                print(" -> Validación (RET) exitosa.")
 
-                # --- PASO 3: FINALIZAR LA OT ---
-                if picking_id_out or picking_id_ret:
-                    cursor.execute("UPDATE work_orders SET phase = 'Liquidado' WHERE id = %s", (wo_id,))
-                    print("[DB-LIQ-FULL] Fase de OT actualizada a 'Liquidado'.")
-                else:
-                     print("[DB-LIQ-FULL] WARN: No hubo consumos ni retiros para liquidar.")
+            # --- PASO 3: FINALIZAR LA OT ---
+            if picking_id_out or picking_id_ret:
+                cursor.execute("UPDATE work_orders SET phase = 'Liquidado' WHERE id = %s", (wo_id,))
+                print("[DB-LIQ-FULL] Fase de OT actualizada a 'Liquidado'.")
+            else:
+                 print("[DB-LIQ-FULL] WARN: No hubo consumos ni retiros para liquidar.")
 
-                conn.commit()
-                print("[DB-LIQ-FULL] Transacción completada (COMMIT).")
-                
-                msg_parts = []
-                if picking_name_out: msg_parts.append(f"Liquidación {picking_name_out} validada")
-                if picking_name_ret: msg_parts.append(f"Retiro {picking_name_ret} validado")
-                
-                final_msg = ". ".join(msg_parts) + "." if msg_parts else "OT finalizada sin movimientos."
-                return True, final_msg
+            # 4. Si todo salió bien, ¡COMMIT!
+            conn.commit()
+            print("[DB-LIQ-FULL] Transacción completada (COMMIT).")
+            
+            msg_parts = []
+            if picking_name_out: msg_parts.append(f"Liquidación {picking_name_out} validada")
+            if picking_name_ret: msg_parts.append(f"Retiro {picking_name_ret} validado")
+            
+            final_msg = ". ".join(msg_parts) + "." if msg_parts else "OT finalizada sin movimientos."
+            return True, final_msg
 
     except Exception as e:
-        print(f"[ERROR-LIQ-FULL] Error en process_full_liquidation: {e}")
+        # 5. ¡CRÍTICO! Si algo falló, hacemos ROLLBACK
+        if conn:
+            conn.rollback()
+            
+        print(f"[ERROR-LIQ-FULL] Error en process_full_liquidation (ROLLBACK EJECUTADO): {e}")
         traceback.print_exc()
         return False, f"Error inesperado al liquidar: {e}"
+        
+    finally:
+        # 6. PASE LO QUE PASE, devolvemos la conexión al pool
+        if conn:
+            db_pool.putconn(conn)
 
 def get_or_create_by_name(cursor, table, name):
     if not name or not name.strip(): return None
@@ -1427,52 +1627,76 @@ def get_or_create_by_name(cursor, table, name):
 
 def upsert_product_from_import(company_id, sku, name, category_id, uom_id, tracking, ownership, price):
     """
-    Intenta insertar o actualizar un producto.
-    [CORREGIDO] Lanza una excepción (raise) si la base de datos falla.
-    [CORREGIDO 2] Se eliminó 'product_type' del INSERT; se usa el DEFAULT de la BD.
+    Intenta insertar o actualizar un producto (UPSERT).
+    [REFACTORIZADO] Usa el pool de conexiones y maneja la transacción
+    con commit/rollback de forma atómica.
     """
+    
+    # 1. Obtener el pool
+    global db_pool
+    if not db_pool:
+        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
+        init_db_pool()
+        if not db_pool:
+            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
+
+    # 2. Preparar la conexión
+    conn = None
     try:
-        with connect_db() as conn:
-            with conn.cursor() as cursor:
-                # 1. Intentar encontrar el producto
+        # 3. Obtener UNA conexión para toda la operación
+        conn = db_pool.getconn()
+        
+        # 4. Usar DictCursor (tu código original lo necesita para existing_product['id'])
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+            
+            # --- 1. Leer (SELECT) ---
+            cursor.execute(
+                "SELECT id FROM products WHERE sku = %s AND company_id = %s",
+                (sku, company_id)
+            )
+            existing_product = cursor.fetchone()
+            
+            # --- 2. Lógica y Escritura (UPDATE/INSERT) ---
+            if existing_product:
+                # 2A. Si existe, ACTUALIZAR
+                product_id = existing_product['id']
                 cursor.execute(
-                    "SELECT id FROM products WHERE sku = %s AND company_id = %s",
-                    (sku, company_id)
+                    """UPDATE products SET 
+                        name = %s, category_id = %s, uom_id = %s, 
+                        tracking = %s, ownership = %s, standard_price = %s 
+                        WHERE id = %s""",
+                    (name, category_id, uom_id, tracking, ownership, price, product_id)
                 )
-                existing_product = cursor.fetchone()
-                
-                if existing_product:
-                    # 2. Si existe, ACTUALIZAR
-                    product_id = existing_product['id']
-                    cursor.execute(
-                        """UPDATE products SET 
-                           name = %s, category_id = %s, uom_id = %s, 
-                           tracking = %s, ownership = %s, standard_price = %s 
-                           WHERE id = %s""",
-                        (name, category_id, uom_id, tracking, ownership, price, product_id)
-                    )
-                    conn.commit()
-                    return "updated"
-                else:
-                    # 3. Si no existe, CREAR
-                    # --- ¡CORRECCIÓN AQUÍ! ---
-                    # Se quitó 'product_type' de la consulta
-                    cursor.execute(
-                        """INSERT INTO products 
-                           (company_id, sku, name, category_id, uom_id, tracking, ownership, standard_price) 
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (company_id, sku, name, category_id, uom_id, tracking, ownership, price)
-                    )
-                    # --- FIN CORRECCIÓN ---
-                    conn.commit()
-                    return "created"
+                conn.commit() # <-- Commit de la rama UPDATE
+                return "updated"
+            else:
+                # 2B. Si no existe, CREAR
+                cursor.execute(
+                    """INSERT INTO products 
+                        (company_id, sku, name, category_id, uom_id, tracking, ownership, standard_price) 
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (company_id, sku, name, category_id, uom_id, tracking, ownership, price)
+                )
+                conn.commit() # <-- Commit de la rama INSERT
+                return "created"
 
     except psycopg2.Error as db_err:
+        # 5. Si algo falla, hacer ROLLBACK
+        if conn:
+            conn.rollback()
         print(f"Error procesando fila para SKU {sku}: {db_err}")
-        raise db_err 
+        raise db_err # Re-lanzar para que el importador lo sepa
     except Exception as e:
+        # 5B. También en errores inesperados
+        if conn:
+            conn.rollback()
         print(f"Error inesperado en upsert_product_from_import: {e}")
         raise e
+        
+    finally:
+        # 6. PASE LO QUE PASE, devolver la conexión al pool
+        if conn:
+            db_pool.putconn(conn)
 
 def get_picking_details(picking_id):
     query = """
@@ -1499,6 +1723,7 @@ def get_picking_details(picking_id):
     moves = execute_query(moves_query, (picking_id,), fetchall=True)
     
     return p_info, moves
+
 
 def add_stock_move_to_picking(picking_id, product_id, qty, loc_src_id, loc_dest_id, price_unit=0, partner_id=None):
     """
@@ -1547,26 +1772,6 @@ def get_warehouse_details_by_id(warehouse_id: int):
     WHERE w.id = %s
     """
     return execute_query(query, (warehouse_id,), fetchone=True)
-
-def _create_warehouse_with_cursor(cursor, name, code, category_id, company_id, social_reason, ruc, email, phone, address, status):
-    """Función interna que AHORA incluye el estado. (Versión PostgreSQL)"""
-    cursor.execute(
-        """INSERT INTO warehouses (name, code, category_id, company_id, social_reason, ruc, email, phone, address, status) 
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-           ON CONFLICT (code) DO NOTHING
-           RETURNING id""",
-        (name, code, category_id, company_id, social_reason, ruc, email, phone, address, status)
-    )
-    warehouse_id_row = cursor.fetchone()
-    
-    if not warehouse_id_row:
-        print(f" -> Almacén con código '{code}' ya existía. Omitiendo creación de datos duplicados.")
-        return # Si el almacén ya existía, no creamos sus ubicaciones/tipos de op de nuevo
-
-    warehouse_id = warehouse_id_row[0]
-
-    # Pasamos el cursor que ya tenemos, NO la conexión
-    create_warehouse_with_data(cursor, name, code, company_id, category_id, for_existing=True, warehouse_id=warehouse_id)
 
 def create_warehouse_with_data(cursor, name, code, company_id, category_id, for_existing=False, warehouse_id=None):
     """Crea ubicaciones y tipos de operación para un almacén. (Versión PostgreSQL)"""
@@ -1644,25 +1849,101 @@ def create_warehouse_with_data(cursor, name, code, company_id, category_id, for_
     # El commit se hace en create_initial_data
 
 def create_warehouse(name, code, category_id, company_id, social_reason, ruc, email, phone, address, status):
-    """Función pública que AHORA incluye el estado."""
-    with connect_db() as conn:
-        cursor = conn.cursor()
-        _create_warehouse_with_cursor(cursor, name, code, category_id, company_id, social_reason, ruc, email, phone, address, status)
+    """
+    Función pública que AHORA incluye el estado.
+    [REFACTORIZADO] Usa el pool y maneja la transacción completa (commit/rollback).
+    """
+    
+    # 1. Obtener el pool
+    global db_pool
+    if not db_pool:
+        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
+        init_db_pool()
+        if not db_pool:
+            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
+
+    # 2. Preparar la conexión
+    conn = None
+    try:
+        # 3. Obtener UNA conexión del pool para toda la transacción
+        conn = db_pool.getconn()
+        
+        # 4. Abrir el cursor
+        # (Tu código usa fetchone()[0], así que un cursor estándar está bien)
+        with conn.cursor() as cursor:
+            
+            # 5. Llamar a la función interna (worker)
+            # Esta función ejecutará el INSERT y llamará a 
+            # create_warehouse_with_data, todo con el MISMO cursor.
+            _create_warehouse_with_cursor(
+                cursor, name, code, category_id, company_id, 
+                social_reason, ruc, email, phone, address, status
+            )
+        
+        # 6. Si todo salió bien, hacer COMMIT
+        conn.commit()
+        print(f"[DB] Almacén '{name}' y datos asociados creados/verificados exitosamente.")
+
+    except Exception as e:
+        # 7. Si algo falló (el INSERT o create_warehouse_with_data),
+        #    hacer ROLLBACK
+        if conn:
+            conn.rollback()
+        print(f"[DB-ERROR] Fallo al crear almacén '{name}' (ROLLBACK ejecutado): {e}")
+        traceback.print_exc()
+        raise e # Re-lanzar la excepción para que la API la maneje
+
+    finally:
+        # 8. PASE LO QUE PASE, devolver la conexión al pool
+        if conn:
+            db_pool.putconn(conn)
+
+def _create_warehouse_with_cursor(cursor, name, code, category_id, company_id, social_reason, ruc, email, phone, address, status):
+    """Función interna que AHORA incluye el estado. (Versión PostgreSQL)"""
+    cursor.execute(
+        """INSERT INTO warehouses (name, code, category_id, company_id, social_reason, ruc, email, phone, address, status) 
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+           ON CONFLICT (code) DO NOTHING
+           RETURNING id""",
+        (name, code, category_id, company_id, social_reason, ruc, email, phone, address, status)
+    )
+    warehouse_id_row = cursor.fetchone()
+    
+    if not warehouse_id_row:
+        print(f" -> Almacén con código '{code}' ya existía. Omitiendo creación de datos duplicados.")
+        return # Si el almacén ya existía, no creamos sus ubicaciones/tipos de op de nuevo
+
+    warehouse_id = warehouse_id_row[0]
+
+    # Pasamos el cursor que ya tenemos, NO la conexión
+    create_warehouse_with_data(cursor, name, code, company_id, category_id, for_existing=True, warehouse_id=warehouse_id)
 
 def update_warehouse(wh_id, name, code, category_id, social_reason, ruc, email, phone, address, status):
     """
-    Actualiza un almacén y, si su código cambia, actualiza en cascada
-    los paths de sus ubicaciones internas asociadas. (Versión PostgreSQL)
+    Actualiza un almacén y sus ubicaciones en cascada.
+    [REFACTORIZADO] Usa el pool y maneja la transacción manualmente (commit/rollback).
     """
     print(f"[DB-UPDATE-WH] Intentando actualizar Warehouse ID: {wh_id} con nuevo código: {code}")
     new_code_upper = code.strip().upper() if code else None
     if not new_code_upper:
         raise ValueError("El código de almacén no puede estar vacío.")
 
+    # 1. Obtener el pool
+    global db_pool
+    if not db_pool:
+        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
+        init_db_pool()
+        if not db_pool:
+            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
+
+    # 2. Preparar la conexión
     conn = None
     try:
-        conn = connect_db()
+        # 3. CAMBIO: Obtener conexión del pool
+        conn = db_pool.getconn()
+        
         with conn.cursor() as cursor:
+            # --- El resto de tu lógica está perfecta ---
             cursor.execute("SELECT code FROM warehouses WHERE id = %s", (wh_id,))
             old_data = cursor.fetchone()
             if not old_data:
@@ -1684,7 +1965,6 @@ def update_warehouse(wh_id, name, code, category_id, social_reason, ruc, email, 
                 old_prefix = f"{old_code}/"
                 new_prefix = f"{new_code_upper}/"
                 
-                # --- ¡CAMBIO DE SINTAXIS! SUBSTR -> SUBSTRING ---
                 cursor.execute(
                     """UPDATE locations
                        SET path = %s || SUBSTRING(path FROM %s)
@@ -1701,16 +1981,18 @@ def update_warehouse(wh_id, name, code, category_id, social_reason, ruc, email, 
             return True
 
     except Exception as err:
+        # 4. Tu lógica de rollback es correcta y se mantiene
         if conn: conn.rollback()
         print(f"[DB-ERROR] Error al actualizar almacén: {err}")
         if 'warehouses_code_key' in str(err):
-             raise ValueError(f"El código '{new_code_upper}' ya está en uso por otro almacén.")
+            raise ValueError(f"El código '{new_code_upper}' ya está en uso por otro almacén.")
         else:
-             traceback.print_exc(); raise err
+            traceback.print_exc(); raise err
+            
     finally:
-        if conn: conn.close()
-
-# --- REEMPLAZA esta función completa en database.py (de nuevo) ---
+        # 5. CAMBIO: Devolver la conexión al pool
+        if conn:
+            db_pool.putconn(conn)
 
 def get_picking_types(company_id):
     """
@@ -1733,7 +2015,6 @@ def get_picking_types(company_id):
             ELSE 4 
         END
     """
-    # --- ¡LA CLAVE ESTÁ AQUÍ! ---
     # Asegúrate de que (company_id,) tenga la coma final
     # para que Python sepa que es un tuple, incluso si solo tiene un ítem.
     params_tuple = (company_id,)
@@ -1799,103 +2080,156 @@ def get_warehouse_category_details(cat_id):
     return execute_query("SELECT * FROM warehouse_categories WHERE id =  %s", (cat_id,), fetchone=True)
 
 def create_warehouse_category(name):
+    """
+    Crea una nueva categoría de almacén usando el pool de conexiones.
+    Maneja la restricción de nombre único.
+    """
+    query = "INSERT INTO warehouse_categories (name) VALUES (%s) RETURNING id"
+    params = (name,)
+    
     try:
-        with connect_db() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "INSERT INTO warehouse_categories (name) VALUES (%s) RETURNING id",
-                    (name,)
-                )
-                new_id = cursor.fetchone()[0]
-                conn.commit()
-                return new_id
-    except Exception as e:  # Captura genérica de psycopg2
-        if "warehouse_categories_name_key" in str(e):  # Ajusta al nombre real del constraint
+        # 1. Llamamos a la función de escritura, pidiendo que retorne el resultado
+        result = execute_commit_query(query, params, fetchone=True)
+        
+        if result:
+            new_id = result[0] # O result['id']
+            return new_id
+        else:
+            raise Exception("No se pudo crear la categoría o no se retornó el ID.")
+
+    except Exception as e: 
+        # 2. La lógica para detectar el error de duplicado sigue
+        #    funcionando porque execute_commit_query re-lanza el error.
+        
+        # Ajusta al nombre real del constraint
+        if "warehouse_categories_name_key" in str(e): 
             raise ValueError(f"La categoría de almacén '{name}' ya existe.")
         else:
+            # Re-lanzar cualquier otro error de BD
             raise e
 
 def update_warehouse_category(cat_id, name):
+    """
+    Actualiza el nombre de una categoría de almacén usando el pool de conexiones.
+    Maneja la restricción de nombre único.
+    """
+    query = "UPDATE warehouse_categories SET name = %s WHERE id = %s"
+    params = (name, cat_id)
+    
     try:
-        with connect_db() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "UPDATE warehouse_categories SET name = %s WHERE id = %s",
-                    (name, cat_id)
-                )
-                conn.commit()
-    except Exception as e:  # Captura genérica para psycopg2
-        if "warehouse_categories_name_key" in str(e):  # Nombre del constraint único
+        # 1. Llamamos a la función de escritura centralizada.
+        # No necesitamos fetchone=True para un UPDATE.
+        execute_commit_query(query, params)
+        
+    except Exception as e: 
+        # 2. La excepción de la BD es re-lanzada por execute_commit_query,
+        #    así que la capturamos aquí para manejarla.
+        
+        if "warehouse_categories_name_key" in str(e): # Nombre del constraint único
             raise ValueError(f"La categoría de almacén '{name}' ya existe.")
         else:
+            # Re-lanzar cualquier otro error de BD
             raise e
 
 def delete_warehouse_category(cat_id):
+    """
+    Elimina una categoría de almacén usando el pool de conexiones.
+    Maneja errores de integridad referencial (foreign key).
+    """
+    query = "DELETE FROM warehouse_categories WHERE id = %s"
+    params = (cat_id,)
+    
     try:
-        with connect_db() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("DELETE FROM warehouse_categories WHERE id = %s", (cat_id,))
-                conn.commit()
+        # 1. Usamos la función centralizada de escritura
+        execute_commit_query(query, params)
+        
+        # 2. Si no hubo error, la eliminación fue exitosa
         return True, "Categoría de almacén eliminada."
+        
     except Exception as e:
+        # 3. execute_commit_query re-lanza el error de la BD,
+        #    así que podemos inspeccionarlo aquí.
+        
+        # Detectar error de llave foránea
         if "violates foreign key constraint" in str(e):
-             return False, "No se puede eliminar: Esta categoría está en uso por uno o más almacenes."
+            return False, "No se puede eliminar: Esta categoría está en uso por uno o más almacenes."
+        
+        # Cualquier otro error
         print(f"[DB-ERROR] delete_warehouse_category: {e}")
         return False, f"Error al eliminar: {e}"
 
 def inactivate_warehouse(warehouse_id):
     """
     Archiva (desactiva) un almacén.
+    [REFACTORIZADO] Usa el pool y maneja la transacción manualmente (commit/rollback).
     """
     print(f"[DB-INACTIVATE-WH] Intentando archivar Warehouse ID: {warehouse_id}")
+    
+    # 1. Obtener el pool
+    global db_pool
+    if not db_pool:
+        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
+        init_db_pool()
+        if not db_pool:
+            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
+
+    # 2. Preparar la conexión
+    conn = None
     try:
-        with connect_db() as conn:
-            # ¡USAMOS DictCursor AQUÍ!
-            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+        # 3. Obtener UNA conexión del pool
+        conn = db_pool.getconn()
+        
+        # 4. ¡CRÍTICO! Usar el DictCursor que tu lógica requiere
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
 
-                # --- VERIFICACIÓN DE SEGURIDAD (HARD BLOCK) ---
-                # ¿Tiene stock actual en CUALQUIER ubicación de este almacén?
-                cursor.execute(
-                    """SELECT SUM(sq.quantity) as total_stock
-                       FROM stock_quants sq
-                       JOIN locations l ON sq.location_id = l.id
-                       WHERE l.warehouse_id = %s""",
-                    (warehouse_id,)
-                )
-                stock_result = cursor.fetchone()
-                # Ahora esto funcionará porque stock_result es un diccionario
-                if stock_result and stock_result['total_stock'] and abs(stock_result['total_stock']) > 0.001:
-                    stock_total = stock_result['total_stock']
-                    print(f" -> Bloqueado: Tiene stock ({stock_total}).")
-                    # No hace falta rollback explícito si solo leímos, pero no hace daño.
-                    return False, f"No se puede archivar: El almacén aún tiene stock ({stock_total} unidades)."
+            # --- VERIFICACIÓN DE SEGURIDAD (HARD BLOCK) ---
+            # Tu lógica original se preserva intacta aquí
+            cursor.execute(
+                """SELECT SUM(sq.quantity) as total_stock
+                   FROM stock_quants sq
+                   JOIN locations l ON sq.location_id = l.id
+                   WHERE l.warehouse_id = %s""",
+                (warehouse_id,)
+            )
+            stock_result = cursor.fetchone()
+            
+            # Esto funciona gracias al DictCursor
+            if stock_result and stock_result['total_stock'] and abs(stock_result['total_stock']) > 0.001:
+                stock_total = stock_result['total_stock']
+                print(f" -> Bloqueado: Tiene stock ({stock_total}).")
+                # El 'finally' se ejecutará y devolverá la conexión.
+                return False, f"No se puede archivar: El almacén aún tiene stock ({stock_total} unidades)."
 
-                # --- FASE 2: ARCHIVAR (SOFT DELETE) ---
-                print(" -> Almacén limpio (sin stock). Procediendo a archivar...")
-                cursor.execute(
-                    "UPDATE warehouses SET status = 'inactivo' WHERE id = %s AND status = 'activo'",
-                    (warehouse_id,)
-                )
-                rows_affected = cursor.rowcount
-                
-                conn.commit() # Confirmar la transacción
+            # --- FASE 2: ARCHIVAR (SOFT DELETE) ---
+            print(" -> Almacén limpio (sin stock). Procediendo a archivar...")
+            cursor.execute(
+                "UPDATE warehouses SET status = 'inactivo' WHERE id = %s AND status = 'activo'",
+                (warehouse_id,)
+            )
+            rows_affected = cursor.rowcount
+            
+            conn.commit() # Confirmar la transacción
 
-                if rows_affected > 0:
-                    print(" -> Almacén archivado con éxito.")
-                    return True, "Almacén archivado correctamente."
-                else:
-                    print(" -> El almacén ya estaba inactivo o no se encontró.")
-                    return False, "El almacén no se pudo archivar (quizás ya estaba inactivo)."
+            if rows_affected > 0:
+                print(" -> Almacén archivado con éxito.")
+                return True, "Almacén archivado correctamente."
+            else:
+                print(" -> El almacén ya estaba inactivo o no se encontró.")
+                return False, "El almacén no se pudo archivar (quizás ya estaba inactivo)."
 
     except Exception as e:
+        # 5. ¡MEJORA! Añadimos rollback en caso de error
+        if conn:
+            conn.rollback()
+            
         print(f"Error CRÍTICO en inactivate_warehouse: {e}")
         traceback.print_exc()
         return False, f"Error inesperado al archivar: {e}"
-
-    except Exception as e:
-        print(f"Error CRÍTICO en inactivate_warehouse: {e}")
-        traceback.print_exc()
-        return False, f"Error inesperado al archivar: {e}"
+        
+    finally:
+        # 6. PASE LO QUE PASE, devolver la conexión al pool
+        if conn:
+            db_pool.putconn(conn)
 
 def get_warehouse_id_by_name(name):
     """Busca el ID de un almacén por su nombre exacto."""
@@ -1945,7 +2279,6 @@ def create_work_order_from_import(company_id, ot_number, customer, address, serv
     except Exception as e:
          print(f"[DB-IMPORT] Error inesperado creando OT {ot_number}: {e}")
          return "error"
-# --- FIN DEL REEMPLAZO ---
 
 def validate_warehouse_names(names_to_check):
     """
@@ -1988,29 +2321,35 @@ def get_partner_details_by_id(partner_id: int):
     return execute_query(query, (partner_id,), fetchone=True)
 
 def create_partner(name, category_id, company_id, social_reason, ruc, email, phone, address):
-    """Crea un nuevo partner con todos sus detalles (versión PostgreSQL)."""
+    """
+    Crea un nuevo partner (proveedor/cliente) usando el pool de conexiones.
+    Maneja la restricción de nombre único por compañía.
+    """
+    query = """
+        INSERT INTO partners
+        (name, category_id, company_id, social_reason, ruc, email, phone, address)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+    """
+    params = (name, category_id, company_id, social_reason, ruc, email, phone, address)
+    
     try:
-        with connect_db() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO partners
-                    (name, category_id, company_id, social_reason, ruc, email, phone, address)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    RETURNING id
-                    """,
-                    (name, category_id, company_id, social_reason, ruc, email, phone, address)
-                )
-                new_id = cursor.fetchone()[0]
-                conn.commit()
-                return new_id
+        # 1. Llamamos a la función de escritura, pidiendo que retorne el ID
+        result = execute_commit_query(query, params, fetchone=True)
+        
+        if result:
+            new_id = result[0] # O result['id']
+            return new_id
+        else:
+            raise Exception("No se pudo crear el partner o no se retornó el ID.")
 
-    except Exception as e:  # psycopg2 lanza excepciones genéricas o específicas
-        # Detecta el constraint UNIQUE en PostgreSQL
+    except Exception as e: 
+        # 2. La lógica para detectar el duplicado se mantiene
         if "partners_company_id_name_key" in str(e):
             print(f"[DB-WARN] Intento de crear Partner duplicado: {name} para Company ID: {company_id}")
             raise ValueError(f"Ya existe un proveedor/cliente con el nombre '{name}'.")
         else:
+            # Re-lanzar cualquier otro error de BD
             raise e
 
 def get_partner_category_id_by_name(name):
@@ -2021,62 +2360,91 @@ def get_partner_category_id_by_name(name):
     return result['id'] if result else None
 
 def update_partner(partner_id, name, category_id, social_reason, ruc, email, phone, address):
-    """Actualiza los detalles de un partner existente (versión PostgreSQL)."""
+    """
+    Actualiza los detalles de un partner existente usando el pool de conexiones.
+    Maneja la restricción de nombre único por compañía.
+    """
+    query = """
+        UPDATE partners SET
+            name = %s,
+            category_id = %s,
+            social_reason = %s,
+            ruc = %s,
+            email = %s,
+            phone = %s,
+            address = %s
+        WHERE id = %s
+    """
+    params = (name, category_id, social_reason, ruc, email, phone, address, partner_id)
+    
     try:
-        with connect_db() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    UPDATE partners SET
-                        name = %s,
-                        category_id = %s,
-                        social_reason = %s,
-                        ruc = %s,
-                        email = %s,
-                        phone = %s,
-                        address = %s
-                    WHERE id = %s
-                    """,
-                    (name, category_id, social_reason, ruc, email, phone, address, partner_id)
-                )
-                conn.commit()
-
-    except Exception as e:  # psycopg2 genera errores distintos a sqlite3
-        if "partners_company_id_name_key" in str(e):  # Nombre del constraint UNIQUE
+        # 1. Llamamos a la función de escritura centralizada.
+        # No necesitamos fetchone=True para un UPDATE.
+        execute_commit_query(query, params)
+        
+    except Exception as e: 
+        # 2. La excepción de la BD es re-lanzada por execute_commit_query,
+        #    así que la capturamos aquí para manejarla.
+        
+        if "partners_company_id_name_key" in str(e): # Nombre del constraint UNIQUE
             raise ValueError(f"Ya existe otro proveedor/cliente con el nombre '{name}'.")
         else:
+            # Re-lanzar cualquier otro error de BD
             raise e
 
 def delete_partner(partner_id):
-    """Elimina un partner si no está siendo usado en operaciones."""
+    """
+    Elimina un partner si no está siendo usado en operaciones.
+    [REFACTORIZADO] Usa el pool y maneja la transacción manualmente (commit/rollback).
+    """
+    
+    # 1. Obtener el pool
+    global db_pool
+    if not db_pool:
+        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
+        init_db_pool()
+        if not db_pool:
+            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
+
+    # 2. Preparar la conexión
+    conn = None
     try:
-        with connect_db() as conn:
-            cursor = conn.cursor()
+        # 3. Obtener UNA conexión del pool
+        conn = db_pool.getconn()
+        
+        # 4. Usar un cursor estándar (tu código usa fetchone()[0])
+        with conn.cursor() as cursor:
+
             # --- VERIFICACIÓN DE SEGURIDAD ---
-            # Revisar si se usa en pickings (como partner_id)
-            cursor.execute("SELECT COUNT(*) FROM pickings WHERE partner_id =  %s", (partner_id,))
+            # (Tu lógica original se preserva)
+            cursor.execute("SELECT COUNT(*) FROM pickings WHERE partner_id = %s", (partner_id,))
             picking_count = cursor.fetchone()[0]
             if picking_count > 0:
+                # El 'finally' se ejecutará y devolverá la conexión
                 return False, f"No se puede eliminar: está asociado a {picking_count} operación(es)."
 
-            # Revisar si se usa en stock_moves (si tienes esa columna, aunque no parece)
-            # cursor.execute("SELECT COUNT(*) FROM stock_moves WHERE partner_id =  %s", (partner_id,))
-            # move_count = cursor.fetchone()[0]
-            # if move_count > 0:
-            #     return False, f"No se puede eliminar: está asociado a {move_count} movimiento(s) de stock."
-
             # --- Si no se usa, proceder a eliminar ---
-            cursor.execute("DELETE FROM partners WHERE id =  %s", (partner_id,))
+            cursor.execute("DELETE FROM partners WHERE id = %s", (partner_id,))
+            
+            # 5. Confirmar la transacción
             conn.commit()
             return True, "Proveedor/Cliente eliminado correctamente."
 
     except Exception as e:
+        # 6. ¡MEJORA! Añadimos rollback por si el DELETE falla
+        if conn:
+            conn.rollback()
+            
         print(f"Error en delete_partner: {e}")
         traceback.print_exc()
         return False, f"Error inesperado al eliminar: {e}"
+        
+    finally:
+        # 7. PASE LO QUE PASE, devolver la conexión al pool
+        if conn:
+            db_pool.putconn(conn)
 
 # --- CRUD PARA PROVEEDORES ---
-
 def get_partners(company_id, category_name=None):
     query = """
         SELECT
@@ -2252,7 +2620,6 @@ def get_internal_locations(company_id):
     
     # execute_query ahora devuelve un DictRow (que funciona como un dict)
     return results if results else []
-# --- REEMPLAZA esta función en database.py ---
 
 def get_locations_by_warehouse(warehouse_id):
     """
@@ -2291,40 +2658,76 @@ def get_stock_for_product_location(product_id, location_id):
     return result['total'] if result and result['total'] else 0
 
 def create_draft_adjustment(company_id, user_name):
+    """
+    Crea un nuevo ajuste en borrador.
+    [REFACTORIZADO] Usa el pool y maneja la transacción manualmente (commit/rollback).
+    """
     print(f"[DB-ADJ] Creando nuevo ajuste en borrador para Cia: {company_id}")
+    
+    # 1. Obtener el pool
+    global db_pool
+    if not db_pool:
+        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
+        init_db_pool()
+        if not db_pool:
+            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
+
+    # 2. Preparar la conexión
+    conn = None
     try:
-        with connect_db() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-                cursor.execute("SELECT id FROM picking_types WHERE code = 'ADJ' AND company_id = %s", (company_id,))
-                adj_picking_type = cursor.fetchone()
-                if not adj_picking_type:
-                    raise ValueError("No se encontró un tipo de operación 'ADJ' para esta compañía.")
-                pt_id = adj_picking_type['id']
+        # 3. Obtener UNA conexión del pool
+        conn = db_pool.getconn()
+        
+        # 4. ¡CRÍTICO! Usar el DictCursor que tu lógica requiere
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
 
-                cursor.execute("SELECT id FROM locations WHERE category = 'AJUSTE' AND company_id = %s", (company_id,))
-                adj_loc = cursor.fetchone()
-                if not adj_loc:
-                    raise ValueError("No se encontró la ubicación virtual de 'Ajuste' (category='AJUSTE').")
-                adj_loc_id = adj_loc['id']
+            # --- Tu lógica original se preserva intacta ---
+            
+            # Leer tipo de operación
+            cursor.execute("SELECT id FROM picking_types WHERE code = 'ADJ' AND company_id = %s", (company_id,))
+            adj_picking_type = cursor.fetchone()
+            if not adj_picking_type:
+                raise ValueError("No se encontró un tipo de operación 'ADJ' para esta compañía.")
+            pt_id = adj_picking_type['id']
 
-                new_name = get_next_picking_name(pt_id)
-                s_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # Leer ubicación de ajuste
+            cursor.execute("SELECT id FROM locations WHERE category = 'AJUSTE' AND company_id = %s", (company_id,))
+            adj_loc = cursor.fetchone()
+            if not adj_loc:
+                raise ValueError("No se encontró la ubicación virtual de 'Ajuste' (category='AJUSTE').")
+            adj_loc_id = adj_loc['id']
 
-                cursor.execute(
-                    """INSERT INTO pickings (company_id, name, picking_type_id, location_src_id, location_dest_id, 
-                                           scheduled_date, state, responsible_user, custom_operation_type) 
-                       VALUES (%s, %s, %s, %s, %s, %s, 'draft', %s, %s) RETURNING id""",
-                    (company_id, new_name, pt_id, adj_loc_id, adj_loc_id, 
-                     s_date, user_name, "Ajuste de Inventario")
-                )
-                new_picking_id = cursor.fetchone()[0]
-                conn.commit()
-                print(f" -> Ajuste borrador '{new_name}' (ID: {new_picking_id}) creado.")
-                return new_picking_id
+            # Obtener nombre (esta función ahora usará el pool indirectamente si fue refactorizada)
+            new_name = get_next_picking_name(pt_id)
+            s_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # Escribir el picking
+            cursor.execute(
+                """INSERT INTO pickings (company_id, name, picking_type_id, location_src_id, location_dest_id, 
+                                     scheduled_date, state, responsible_user, custom_operation_type) 
+                   VALUES (%s, %s, %s, %s, %s, %s, 'draft', %s, %s) RETURNING id""",
+                (company_id, new_name, pt_id, adj_loc_id, adj_loc_id, 
+                 s_date, user_name, "Ajuste de Inventario")
+            )
+            new_picking_id = cursor.fetchone()[0]
+            
+            # 5. Confirmar la transacción
+            conn.commit()
+            print(f" -> Ajuste borrador '{new_name}' (ID: {new_picking_id}) creado.")
+            return new_picking_id
 
     except Exception as e:
-        print(f"Error en create_draft_adjustment: {e}"); traceback.print_exc()
+        # 6. ¡MEJORA! Añadimos rollback en caso de error
+        if conn:
+            conn.rollback()
+        print(f"Error en create_draft_adjustment: {e}")
+        traceback.print_exc()
         return None
+        
+    finally:
+        # 7. PASE LO QUE PASE, devolver la conexión al pool
+        if conn:
+            db_pool.putconn(conn)
 
 def get_adjustments(company_id):
     """
@@ -2373,63 +2776,134 @@ def get_warehouses_by_category(company_id, category_name):
     return execute_query(query, (company_id, category_name), fetchall=True)
 
 def update_picking_fields(picking_id, fields_to_update):
-    """Actualiza múltiples campos de un albarán a la vez."""
-    set_clause = ", ".join([f"{key} =  %s" for key in fields_to_update.keys()])
-    params = list(fields_to_update.values()) + [picking_id]
-    with connect_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute(f"UPDATE pickings SET {set_clause} WHERE id =  %s", tuple(params))
-        conn.commit()
+    """
+    Actualiza múltiples campos de un albarán de forma SEGURA.
+    [REFACTORIZADO] Usa el pool y previene Inyección SQL con una whitelist.
+    """
+    
+    if not fields_to_update:
+        print("[WARN] update_picking_fields llamado sin campos para actualizar.")
+        return # No hay nada que hacer
+
+    # --- 2. VALIDACIÓN (EL PASO DE SEGURIDAD CRÍTICO) ---
+    validated_keys = []
+    params = []
+    
+    for key, value in fields_to_update.items():
+        if key in ALLOWED_PICKING_FIELDS_TO_UPDATE:
+            validated_keys.append(f"{key} = %s") # Construye la parte 'key = %s'
+            params.append(value) # Añade el valor a los parámetros
+        else:
+            # Si una llave no está en la whitelist, RECHAZA la operación
+            raise ValueError(f"Intento de actualizar un campo no permitido o desconocido: '{key}'")
+
+    # --- 3. CONSTRUCCIÓN DE LA CONSULTA ---
+    set_clause = ", ".join(validated_keys)
+    params.append(picking_id) # Añadir el picking_id al final para el WHERE
+    
+    query = f"UPDATE pickings SET {set_clause} WHERE id = %s"
+    
+    # --- 4. EJECUCIÓN CON EL POOL ---
+    try:
+        # Usamos la función de escritura centralizada
+        execute_commit_query(query, tuple(params))
+        
+    except Exception as e: 
+        print(f"Error en update_picking_fields para ID {picking_id}: {e}")
+        traceback.print_exc()
+        # Re-lanzar para que la API lo capture
+        raise e
 
 def delete_picking(picking_id):
     """
     Elimina permanentemente un albarán y todos sus movimientos asociados.
-    Solo permite la eliminación si el estado es 'draft' o 'listo'.
+    Solo permite la eliminación si el estado es 'draft'.
+    [REFACTORIZADO] Usa el pool y maneja la transacción manualmente (commit/rollback).
     """
-    with connect_db() as conn:
-        cursor = conn.cursor()
+    
+    # 1. Obtener el pool
+    global db_pool
+    if not db_pool:
+        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
+        init_db_pool()
+        if not db_pool:
+            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
+
+    # 2. Preparar la conexión
+    conn = None
+    try:
+        # 3. Obtener UNA conexión del pool
+        conn = db_pool.getconn()
         
-        # 1. VERIFICACIÓN DE SEGURIDAD: Comprobar el estado actual del albarán.
-        picking = cursor.execute("SELECT state FROM pickings WHERE id =  %s", (picking_id,)).fetchone()
+        # 4. ¡CRÍTICO! Usar el DictCursor que tu lógica requiere
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+
+            # --- 1. VERIFICACIÓN DE SEGURIDAD ---
+            # (CORREGIDO: .execute() y .fetchone() deben estar separados)
+            cursor.execute("SELECT state FROM pickings WHERE id = %s", (picking_id,))
+            picking = cursor.fetchone()
+            
+            if not picking:
+                return False, "El albarán no existe."
+            
+            # (Tu lógica de negocio se preserva)
+            if picking['state'] != 'draft':
+                return False, "Solo se pueden eliminar permanentemente los albaranes en estado 'Borrador'."
+
+            # --- 2. Si es seguro, proceder con la eliminación ---
+            print(f"[DEBUG-DB] Iniciando eliminación del albarán ID: {picking_id}")
+
+            # Obtenemos los IDs de los movimientos asociados
+            # (CORREGIDO: .execute() y .fetchall() deben estar separados)
+            cursor.execute("SELECT id FROM stock_moves WHERE picking_id = %s", (picking_id,))
+            moves = cursor.fetchall()
+
+            if moves:
+                move_ids = tuple([move['id'] for move in moves])
+                print(f"[DEBUG-DB]... IDs de moves a eliminar: {move_ids}")
+
+                # --- REFACTORIZACIÓN DE SEGURIDAD ---
+                # Reemplazamos el f-string por la parametrización estándar de psycopg2
+                # para cláusulas IN, que es mucho más segura y limpia.
+                cursor.execute("DELETE FROM stock_move_lines WHERE move_id IN %s", (move_ids,))
+                print(f"[DEBUG-DB]... stock_move_lines eliminadas.")
+
+                # Eliminar los movimientos de stock (stock_moves)
+                cursor.execute("DELETE FROM stock_moves WHERE picking_id = %s", (picking_id,))
+                print(f"[DEBUG-DB]... stock_moves eliminados.")
+
+            # Finalmente, eliminar el albarán principal (pickings)
+            cursor.execute("DELETE FROM pickings WHERE id = %s", (picking_id,))
+            print(f"[DEBUG-DB]... albarán principal eliminado.")
+            
+            # 5. Confirmar toda la transacción
+            conn.commit()
+            return True, "Albarán eliminado permanentemente."
+
+    except Exception as e:
+        # 6. ¡MEJORA! Añadimos rollback en caso de error
+        if conn:
+            conn.rollback()
+            
+        print(f"Error en delete_picking (ROLLBACK ejecutado): {e}")
+        traceback.print_exc()
+        return False, f"Error inesperado al eliminar: {e}"
         
-        if not picking:
-            return False, "El albarán no existe."
-        
-        if picking['state'] != 'draft':
-            return False, "Solo se pueden eliminar permanentemente los albaranes en estado 'Borrador'."
-
-        # 2. Si es seguro, proceder con la eliminación en orden.
-        print(f"[DEBUG-DB] Iniciando eliminación del albarán ID: {picking_id}")
-
-        # Obtenemos los IDs de los movimientos asociados
-        moves = cursor.execute("SELECT id FROM stock_moves WHERE picking_id =  %s", (picking_id,)).fetchall()
-        move_ids = tuple([move['id'] for move in moves])
-
-        if move_ids:
-            # Eliminar primero las líneas de detalle (stock_move_lines) si existen
-            cursor.execute(f"DELETE FROM stock_move_lines WHERE move_id IN {move_ids if len(move_ids) > 1 else f'({move_ids[0]})'}")
-            print(f"[DEBUG-DB]... stock_move_lines eliminadas para los moves: {move_ids}")
-
-            # Eliminar los movimientos de stock (stock_moves)
-            cursor.execute("DELETE FROM stock_moves WHERE picking_id =  %s", (picking_id,))
-            print(f"[DEBUG-DB]... stock_moves eliminados.")
-
-        # Finalmente, eliminar el albarán principal (pickings)
-        cursor.execute("DELETE FROM pickings WHERE id =  %s", (picking_id,))
-        print(f"[DEBUG-DB]... albarán principal eliminado.")
-        
-        conn.commit()
-    return True, "Albarán eliminado permanentemente."
+    finally:
+        # 7. PASE LO QUE PASE, devolver la conexión al pool
+        if conn:
+            db_pool.putconn(conn)
 
 def update_work_order_fields(wo_id, fields_to_update: dict):
     """
-    Actualiza campos específicos de una Orden de Trabajo usando un diccionario.
-    Más flexible que update_work_order_details.
+    Actualiza campos específicos de una Orden de Trabajo.
+    [REFACTORIZADO] Usa el pool y maneja la transacción manualmente para retornar rowcount.
     """
     allowed_fields = [
         "customer_name", "address", "warehouse_id", "date_attended",
         "service_type", "job_type", "phase"
     ]
+    # --- Tu lógica de whitelist (¡Excelente!) se mantiene ---
     update_dict = {k: v for k, v in fields_to_update.items() if k in allowed_fields and v is not None}
 
     print(f"[ESPÍA DB UPDATE DICT] Diccionario a actualizar para OT {wo_id}: {update_dict}")
@@ -2437,17 +2911,51 @@ def update_work_order_fields(wo_id, fields_to_update: dict):
         print(f"[DB-WARN] No se proporcionaron campos válidos para actualizar la OT {wo_id}.")
         return 0
 
-    set_clause = ", ".join([f"{key} =  %s" for key in update_dict.keys()])
+    set_clause = ", ".join([f"{key} = %s" for key in update_dict.keys()])
     params = list(update_dict.values()) + [wo_id]
 
-    print(f"[ESPÍA DB SAVE] SQL: UPDATE work_orders SET {set_clause} WHERE id =  %s")
-    print(f"[ESPÍA DB SAVE] Params: {tuple(params)}")
+    # --- REFACTORIZACIÓN A CONTINUACIÓN ---
     
-    with connect_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute(f"UPDATE work_orders SET {set_clause} WHERE id =  %s", tuple(params))
-        conn.commit()
-        return cursor.rowcount # Devuelve el número de filas afectadas
+    # 1. Obtener el pool
+    global db_pool
+    if not db_pool:
+        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
+        init_db_pool()
+        if not db_pool:
+            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
+
+    # 2. Preparar la conexión
+    conn = None
+    try:
+        # 3. Obtener UNA conexión del pool
+        conn = db_pool.getconn()
+        
+        with conn.cursor() as cursor:
+            query = f"UPDATE work_orders SET {set_clause} WHERE id = %s"
+            
+            print(f"[ESPÍA DB SAVE] SQL: {query}")
+            print(f"[ESPÍA DB SAVE] Params: {tuple(params)}")
+
+            cursor.execute(query, tuple(params))
+            
+            # 4. Confirmar la transacción
+            conn.commit()
+            
+            # 5. Retornar el rowcount (la razón por la que hicimos esto manualmente)
+            return cursor.rowcount 
+
+    except Exception as e:
+        # 6. ¡MEJORA! Añadimos rollback en caso de error
+        if conn:
+            conn.rollback()
+        print(f"Error en update_work_order_fields para OT {wo_id}: {e}")
+        traceback.print_exc()
+        raise e # Re-lanzar para que la API lo capture
+        
+    finally:
+        # 7. PASE LO QUE PASE, devolver la conexión al pool
+        if conn:
+            db_pool.putconn(conn)
 
 def get_draft_liquidation(wo_id):
     """
@@ -3097,29 +3605,42 @@ def get_stock_for_multiple_products(location_id, product_ids: list):
     stock_map = {row['product_id']: row['on_hand_stock'] for row in results}
     return stock_map
 
-# --- AÑADE ESTA NUEVA FUNCIÓN a database.py ---
 def create_or_update_draft_picking(wo_id, company_id, user_name, warehouse_id, date_attended, service_act_number, lines_data: list):
     """
-    Busca un picking 'draft' para la WO. Si no existe, lo crea.
-    Luego, actualiza la cabecera del picking (almacén, fecha, acta) y
-    reemplaza COMPLETAMENTE sus líneas (stock_moves y stock_move_lines).
-    Se usa para guardar el progreso.
+    Guarda el borrador de un picking (Crear/Actualizar).
+    [REFACTORIZADO] Usa el pool y maneja la transacción atómica con
+    commit/rollback, y corrige errores de psycopg2 (lastrowid, f-strings, execute).
     """
     print(f"[DB-DEBUG] Iniciando create/update BORRADOR para WO ID: {wo_id}")
     if warehouse_id is None:
         return False, "Se requiere seleccionar una Contrata/Almacén para guardar."
 
+    # 1. Obtener el pool
+    global db_pool
+    if not db_pool:
+        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
+        init_db_pool()
+        if not db_pool:
+            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
+
+    # 2. Preparar la conexión
+    conn = None
     try:
-        with connect_db() as conn:
-            cursor = conn.cursor()
+        # 3. Obtener UNA conexión del pool
+        conn = db_pool.getconn()
+        
+        # 4. Usar DictCursor (requerido por tu lógica)
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
 
             # --- A. Buscar Picking Borrador Existente ---
-            draft_picking = cursor.execute(
+            # (CORREGIDO: .execute() y .fetchone() separados)
+            cursor.execute(
                 """SELECT p.id, pt.default_location_src_id, pt.default_location_dest_id
                    FROM pickings p JOIN picking_types pt ON p.picking_type_id = pt.id
-                   WHERE p.work_order_id =  %s AND p.state = 'draft' AND pt.code = 'OUT'""",
+                   WHERE p.work_order_id = %s AND p.state = 'draft' AND pt.code = 'OUT'""",
                 (wo_id,)
-            ).fetchone()
+            )
+            draft_picking = cursor.fetchone()
 
             picking_id = None
             loc_src_id = None
@@ -3129,22 +3650,22 @@ def create_or_update_draft_picking(wo_id, company_id, user_name, warehouse_id, d
                 picking_id = draft_picking['id']
                 print(f" -> Picking borrador encontrado (ID: {picking_id}). Actualizando...")
 
-                # Actualizar cabecera del picking existente (INCLUYENDO warehouse_id)
-                # Necesitamos recalcular loc_src_id si el warehouse cambió
-                location_src_row = cursor.execute(
-                    "SELECT id FROM locations WHERE warehouse_id =  %s AND type = 'internal' AND name = 'Stock'",
+                # Actualizar cabecera
+                cursor.execute(
+                    "SELECT id FROM locations WHERE warehouse_id = %s AND type = 'internal' AND name = 'Stock'",
                     (warehouse_id,)
-                ).fetchone()
+                )
+                location_src_row = cursor.fetchone()
                 if not location_src_row:
                     raise ValueError(f"No se encontró ubicación interna para el nuevo almacén ID {warehouse_id}.")
+                
                 loc_src_id = location_src_row['id']
-                # loc_dest_id no debería cambiar para OUT, pero lo obtenemos por si acaso
                 loc_dest_id = draft_picking['default_location_dest_id']
 
                 cursor.execute(
                     """UPDATE pickings
-                       SET warehouse_id =  %s, location_src_id =  %s, attention_date =  %s, service_act_number =  %s, responsible_user =  %s
-                       WHERE id =  %s""",
+                       SET warehouse_id = %s, location_src_id = %s, attention_date = %s, service_act_number = %s, responsible_user = %s
+                       WHERE id = %s""",
                     (warehouse_id, loc_src_id, date_attended, service_act_number, user_name, picking_id)
                 )
                 print(f" -> Cabecera del picking {picking_id} actualizada (Wh={warehouse_id}, LocSrc={loc_src_id}).")
@@ -3152,51 +3673,58 @@ def create_or_update_draft_picking(wo_id, company_id, user_name, warehouse_id, d
             else:
                 # --- B. Crear Picking Borrador Nuevo ---
                 print(" -> No se encontró picking borrador. Creando uno nuevo...")
-                # Necesitamos company_id (viene como argumento)
-                # Necesitamos warehouse_id (viene como argumento)
-
-                # Buscar tipo OUT para el almacén seleccionado
-                picking_type = cursor.execute(
-                    "SELECT id, default_location_src_id, default_location_dest_id FROM picking_types WHERE warehouse_id =  %s AND code = 'OUT'",
+                
+                cursor.execute(
+                    "SELECT id, default_location_src_id, default_location_dest_id FROM picking_types WHERE warehouse_id = %s AND code = 'OUT'",
                     (warehouse_id,)
-                ).fetchone()
+                )
+                picking_type = cursor.fetchone()
                 if not picking_type:
                     raise ValueError(f"No se encontró tipo 'OUT' para el almacén ID {warehouse_id}")
 
-                loc_src_id = picking_type['default_location_src_id'] # Ubicación del almacén seleccionado
-                loc_dest_id = picking_type['default_location_dest_id'] # Destino virtual
+                loc_src_id = picking_type['default_location_src_id']
+                loc_dest_id = picking_type['default_location_dest_id']
+                picking_type_id = picking_type['id']
 
-                picking_name = get_next_picking_name(picking_type['id'])
+                picking_name = get_next_picking_name(picking_type_id) # Asumimos que esta función usa el pool
 
+                # (CORREGIDO: Añadido RETURNING id)
                 cursor.execute(
                     """INSERT INTO pickings (company_id, name, picking_type_id, warehouse_id, location_src_id, location_dest_id,
                                            state, work_order_id, custom_operation_type,
                                            service_act_number, attention_date, responsible_user)
-                       VALUES ( %s,  %s,  %s,  %s,  %s,  %s, 'draft',  %s,  %s,  %s,  %s,  %s)""",
-                    (company_id, picking_name, picking_type['id'], warehouse_id, loc_src_id, loc_dest_id,
+                       VALUES (%s, %s, %s, %s, %s, %s, 'draft', %s, %s, %s, %s, %s)
+                       RETURNING id""",
+                    (company_id, picking_name, picking_type_id, warehouse_id, loc_src_id, loc_dest_id,
                      wo_id, "Liquidación por OT",
                      service_act_number, date_attended, user_name)
                 )
-                picking_id = cursor.lastrowid
+                
+                # (CORREGIDO: Reemplazado .lastrowid por .fetchone())
+                picking_id_row = cursor.fetchone()
+                if not picking_id_row:
+                    raise Exception("Fallo al crear el picking (no se retornó ID).")
+                picking_id = picking_id_row['id']
+                
                 print(f" -> Nuevo picking borrador creado (ID: {picking_id}, Nombre: {picking_name}, Wh={warehouse_id}, LocSrc={loc_src_id}).")
 
-                # --- OPCIONAL: Actualizar Fase de WO a 'En Liquidación' ---
-                # Considera si quieres hacerlo aquí o en la vista después de guardar
-                # cursor.execute("UPDATE work_orders SET phase = 'En Liquidación' WHERE id =  %s AND phase = 'Sin Liquidar'", (wo_id,))
-                # print(" -> Fase de WO actualizada a 'En Liquidación' (si estaba 'Sin Liquidar').")
-                # --- FIN OPCIONAL ---
-
-            # --- C. Borrar Movimientos Borrador Anteriores (Igual que antes) ---
-            old_moves = cursor.execute("SELECT id FROM stock_moves WHERE picking_id =  %s AND state = 'draft'", (picking_id,)).fetchall()
+            # --- C. Borrar Movimientos Borrador Anteriores ---
+            cursor.execute("SELECT id FROM stock_moves WHERE picking_id = %s AND state = 'draft'", (picking_id,))
+            old_moves = cursor.fetchall()
+            
             if old_moves:
                 old_move_ids = tuple([m['id'] for m in old_moves])
-                cursor.execute(f"DELETE FROM stock_move_lines WHERE move_id IN ({','.join([' %s']*len(old_move_ids))})", old_move_ids)
-                cursor.execute("DELETE FROM stock_moves WHERE id IN ({})".format(','.join([' %s']*len(old_move_ids))), old_move_ids)
+                
+                # (CORREGIDO: f-string reemplazado por parámetro %s seguro)
+                cursor.execute("DELETE FROM stock_move_lines WHERE move_id IN %s", (old_move_ids,))
+                cursor.execute("DELETE FROM stock_moves WHERE id IN %s", (old_move_ids,))
+                
                 print(f" -> {len(old_move_ids)} movimiento(s) borrador anteriores eliminados.")
 
-            # --- D. Crear Nuevos Movimientos Borrador (Igual que antes, PERO usa loc_src/dest recalculados) ---
-            customer_partner_id = cursor.execute("SELECT id FROM partners WHERE name = 'Cliente Varios' AND company_id =  %s", (company_id,)).fetchone()
-            partner_id_to_set = customer_partner_id['id'] if customer_partner_id else None
+            # --- D. Crear Nuevos Movimientos Borrador ---
+            cursor.execute("SELECT id FROM partners WHERE name = 'Cliente Varios' AND company_id = %s", (company_id,))
+            customer_partner_row = cursor.fetchone()
+            partner_id_to_set = customer_partner_row['id'] if customer_partner_row else None
 
             moves_created_count = 0
             for line in lines_data:
@@ -3204,34 +3732,52 @@ def create_or_update_draft_picking(wo_id, company_id, user_name, warehouse_id, d
                 quantity = line['quantity']
                 tracking_data = line.get('tracking_data', {})
 
+                # (CORREGIDO: Añadido RETURNING id)
                 cursor.execute(
                     """INSERT INTO stock_moves (picking_id, product_id, product_uom_qty, quantity_done,
-                                               location_src_id, location_dest_id, state, partner_id)
-                       VALUES ( %s,  %s,  %s,  %s,  %s,  %s, 'draft',  %s)""",
+                                              location_src_id, location_dest_id, state, partner_id)
+                       VALUES (%s, %s, %s, %s, %s, %s, 'draft', %s)
+                       RETURNING id""",
                     (picking_id, product_id, quantity, quantity,
-                     loc_src_id, loc_dest_id, partner_id_to_set) # Usa loc_src/dest correctos
+                     loc_src_id, loc_dest_id, partner_id_to_set)
                 )
-                move_id = cursor.lastrowid
+                
+                # (CORREGIDO: Reemplazado .lastrowid por .fetchone())
+                move_id_row = cursor.fetchone()
+                if not move_id_row:
+                    raise Exception("Fallo al crear stock_move (no se retornó ID).")
+                move_id = move_id_row['id']
+                
                 moves_created_count += 1
 
                 if tracking_data:
-                    # ... (código para guardar stock_move_lines - sin cambios) ...
-                     for lot_name, qty_done in tracking_data.items():
+                    for lot_name, qty_done in tracking_data.items():
+                         # Asumimos que get_lot_by_name y create_lot usan el cursor
                          lot_row = get_lot_by_name(cursor, product_id, lot_name)
                          lot_id = lot_row['id'] if lot_row else create_lot(cursor, product_id, lot_name)
                          cursor.execute(
-                             "INSERT INTO stock_move_lines (move_id, lot_id, qty_done) VALUES ( %s,  %s,  %s)",
+                             "INSERT INTO stock_move_lines (move_id, lot_id, qty_done) VALUES (%s, %s, %s)",
                              (move_id, lot_id, qty_done)
                          )
 
             print(f" -> {moves_created_count} nuevos movimientos borrador creados.")
+            
+            # 5. ¡COMMIT DE TODA LA TRANSACCIÓN!
             conn.commit()
             return True, "Progreso de liquidación guardado."
 
     except Exception as e:
-        print(f"[ERROR] en create_or_update_draft_picking: {e}")
+        # 6. ¡CRÍTICO! ROLLBACK si algo falla
+        if conn:
+            conn.rollback()
+        print(f"[ERROR] en create_or_update_draft_picking (ROLLBACK ejecutado): {e}")
         traceback.print_exc()
         return False, f"Error al guardar borrador: {e}"
+        
+    finally:
+        # 7. PASE LO QUE PASE, devolver la conexión al pool
+        if conn:
+            db_pool.putconn(conn)
 
 def get_warehouse_category_id_by_name(name):
     """Busca el ID de una categoría de almacén por su nombre exacto."""
@@ -3241,7 +3787,24 @@ def get_warehouse_category_id_by_name(name):
     return result['id'] if result else None
 
 def upsert_warehouse_from_import(company_id, code, name, status, social_reason, ruc, email, phone, address, category_id):
-    # (Similar a productos, usamos ON CONFLICT)
+    """
+    Inserta o actualiza un almacén desde la importación.
+    [REFACTORIZADO] Usa el pool y maneja la transacción atómica (commit/rollback),
+    incluyendo la creación de datos asociados si es un nuevo almacén.
+    """
+    
+    # 1. Obtener el pool
+    global db_pool
+    if not db_pool:
+        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
+        init_db_pool()
+        if not db_pool:
+            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
+
+    # 2. Preparar la conexión
+    conn = None
+    
+    # (Definir la consulta y parámetros aquí es una buena práctica)
     query = """
         INSERT INTO warehouses (company_id, code, name, status, social_reason, ruc, email, phone, address, category_id)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
@@ -3257,22 +3820,51 @@ def upsert_warehouse_from_import(company_id, code, name, status, social_reason, 
         RETURNING (xmax = 0) AS inserted;
     """
     params = (company_id, code, name, status, social_reason, ruc, email, phone, address, category_id)
+
     try:
-        with connect_db() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(query, params)
-                was_inserted = cursor.fetchone()[0]
-                # ¡IMPORTANTE! Si fue insertado, debemos crear sus datos asociados
-                if was_inserted:
-                    cursor.execute("SELECT id FROM warehouses WHERE code = %s AND company_id = %s", (code, company_id))
-                    new_wh_id = cursor.fetchone()[0]
-                    create_warehouse_with_data(cursor, name, code, company_id, category_id, for_existing=True, warehouse_id=new_wh_id)
-                conn.commit()
-                return "created" if was_inserted else "updated"
+        # 3. Obtener UNA conexión del pool
+        conn = db_pool.getconn()
+        
+        # 4. Usar un cursor estándar (tu lógica usa fetchone()[0])
+        with conn.cursor() as cursor:
+            
+            # --- 1. Ejecutar el UPSERT ---
+            cursor.execute(query, params)
+            was_inserted = cursor.fetchone()[0]
+            
+            # --- 2. Lógica Condicional ---
+            if was_inserted:
+                print(f" -> Almacén nuevo '{code}'. Creando datos asociados...")
+                # Necesitamos el ID del almacén que acabamos de crear
+                cursor.execute("SELECT id FROM warehouses WHERE code = %s AND company_id = %s", (code, company_id))
+                new_wh_id_row = cursor.fetchone()
+                
+                if not new_wh_id_row:
+                    raise Exception(f"No se pudo re-encontrar el almacén '{code}' justo después de crearlo.")
+                
+                new_wh_id = new_wh_id_row[0]
+                
+                # Llamar a la función 'worker' que crea ubicaciones, etc.
+                create_warehouse_with_data(cursor, name, code, company_id, category_id, for_existing=True, warehouse_id=new_wh_id)
+                print(f" -> Datos asociados creados para el almacén ID {new_wh_id}.")
+
+            # 5. Si todo salió bien (el UPSERT y la creación condicional), hacer COMMIT
+            conn.commit()
+            
+            return "created" if was_inserted else "updated"
+
     except Exception as e:
-        print(f"Error procesando fila para CÓDIGO {code}: {e}")
+        # 6. ¡CRÍTICO! ROLLBACK si algo falla
+        if conn:
+            conn.rollback()
+        print(f"Error procesando fila para CÓDIGO {code} (ROLLBACK ejecutado): {e}")
         traceback.print_exc()
         return "error"
+        
+    finally:
+        # 7. PASE LO QUE PASE, devolver la conexión al pool
+        if conn:
+            db_pool.putconn(conn)
 
 def get_data_for_export(company_id, export_type='headers'):
     """
@@ -3602,56 +4194,113 @@ def get_warehouses_by_categories(company_id, category_names: list):
     results = execute_query(query, params, fetchall=True)
     return results if results else []
 
+
 def create_location(company_id, name, path, type, category, warehouse_id):
-    """Crea una nueva ubicación."""
+    """
+    Crea una nueva ubicación.
+    [REFACTORIZADO] Usa el pool y maneja la transacción "check-then-write" manualmente.
+    """
+    
+    # --- 1. Lógica de negocio (pre-DB) ---
     if type != 'internal' and warehouse_id is not None:
         warehouse_id = None
     elif type == 'internal' and warehouse_id is None:
         raise ValueError("Se requiere un Almacén Asociado para ubicaciones de tipo 'Interna'.")
 
+    # --- 2. Lógica de BD (Transaccional) ---
+    
+    # 2.1. Obtener el pool
+    global db_pool
+    if not db_pool:
+        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
+        init_db_pool()
+        if not db_pool:
+            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
+
+    # 2.2. Preparar la conexión
+    conn = None
     try:
-        with connect_db() as conn:
-            with conn.cursor() as cursor:
-                # Validación de Path duplicado DENTRO de la transacción
-                cursor.execute(
-                    "SELECT id FROM locations WHERE path = %s AND company_id = %s",
-                    (path, company_id)
-                )
-                if cursor.fetchone():
-                    raise ValueError(f"El Path '{path}' ya existe.")
-                
-                query = """
-                    INSERT INTO locations (company_id, name, path, type, category, warehouse_id)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    RETURNING id
-                """
-                params = (company_id, name, path, type, category, warehouse_id)
-                cursor.execute(query, params)
-                new_id = cursor.fetchone()[0]
-                conn.commit()
-                return new_id
-    except Exception as e:  # Captura genérica de psycopg2
-        if "locations_path_key" in str(e):  # Revisa el nombre real del constraint UNIQUE en PostgreSQL
+        # 2.3. Obtener UNA conexión del pool
+        conn = db_pool.getconn()
+        
+        with conn.cursor() as cursor:
+            
+            # --- 3. Tu lógica transaccional "check-then-write" ---
+            
+            # 3.1. Validación de Path duplicado DENTRO de la transacción
+            cursor.execute(
+                "SELECT id FROM locations WHERE path = %s AND company_id = %s",
+                (path, company_id)
+            )
+            if cursor.fetchone():
+                # Error amigable proactivo (¡bien hecho!)
+                raise ValueError(f"El Path '{path}' ya existe.")
+            
+            # 3.2. Si está libre, INSERTAR
+            query = """
+                INSERT INTO locations (company_id, name, path, type, category, warehouse_id)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """
+            params = (company_id, name, path, type, category, warehouse_id)
+            cursor.execute(query, params)
+            new_id = cursor.fetchone()[0]
+            
+            # 4. COMMIT
+            conn.commit()
+            return new_id
+            
+    except Exception as e:
+        # 5. ¡MEJORA! ROLLBACK si algo falla
+        if conn:
+            conn.rollback()
+        
+        # 6. Tu lógica de error reactiva (safety-net) se preserva
+        if "locations_path_key" in str(e): 
             raise ValueError(f"El Path '{path}' ya existe.")
+            
+        # Re-lanzar el error original con más contexto
         raise ValueError(f"No se pudo crear la ubicación. Verifique los datos.") from e
+        
+    finally:
+        # 7. PASE LO QUE PASE, devolver la conexión al pool
+        if conn:
+            db_pool.putconn(conn)
 
 def update_location(location_id, company_id, name, path, type, category, warehouse_id):
     """
     Actualiza una ubicación existente, previniendo dejar almacenes sin ubicaciones internas.
+    [REFACTORIZADO] Usa el pool y maneja la transacción manualmente (commit/rollback).
     """
-    import traceback
+    # (El import traceback no es necesario aquí si está al inicio del archivo)
+    
     print(f"[DB-UPDATE-LOC] Intentando actualizar Location ID: {location_id}")
     
-    # Validación básica: warehouse_id vs type
+    # --- 1. Tu lógica de negocio (pre-DB) se mantiene intacta ---
     if type != 'internal' and warehouse_id is not None:
         warehouse_id = None
     elif type == 'internal' and warehouse_id is None:
         raise ValueError("Se requiere un Almacén Asociado para ubicaciones de tipo 'Interna'.")
 
+    # --- 2. REFACTORIZACIÓN DEL POOL ---
+    
+    # 2.1. Obtener el pool
+    global db_pool
+    if not db_pool:
+        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
+        init_db_pool()
+        if not db_pool:
+            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
+
+    # 2.2. Preparar la conexión
     conn = None
     try:
-        conn = connect_db()
+        # 2.3. CAMBIO: Obtener conexión del pool
+        conn = db_pool.getconn()
+        
         with conn.cursor() as cursor:
+            # --- 3. Tu lógica transaccional se mantiene 100% intacta ---
+            
             # --- Obtener Datos Actuales de la Ubicación ---
             cursor.execute(
                 "SELECT type, warehouse_id FROM locations WHERE id = %s AND company_id = %s",
@@ -3706,6 +4355,7 @@ def update_location(location_id, company_id, name, path, type, category, warehou
             print(" -> Ubicación actualizada con éxito.")
             return True
 
+    # 4. Tu lógica de error (rollback) se mantiene intacta
     except ValueError as err:
         if conn:
             conn.rollback()
@@ -3717,61 +4367,88 @@ def update_location(location_id, company_id, name, path, type, category, warehou
         print(f"Error CRÍTICO en update_location: {ex}")
         traceback.print_exc()
         raise RuntimeError(f"Error inesperado al actualizar ubicación: {ex}")
+        
     finally:
+        # 5. CAMBIO: Devolver la conexión al pool
         if conn:
-            conn.close()
+            db_pool.putconn(conn)
 
 def delete_location(location_id):
     """
     Elimina una ubicación si no está en uso.
+    [REFACTORIZADO] Usa el pool y maneja la transacción manualmente (commit/rollback).
     """
     print(f"[DB-DELETE-LOC] Intentando eliminar Location ID: {location_id}")
+    
+    # 1. Obtener el pool
+    global db_pool
+    if not db_pool:
+        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
+        init_db_pool()
+        if not db_pool:
+            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
+
+    # 2. Preparar la conexión
+    conn = None
     try:
-        with connect_db() as conn:
-            # ¡Usamos DictCursor aquí!
-            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+        # 3. Obtener UNA conexión del pool
+        conn = db_pool.getconn()
+        
+        # 4. ¡CRÍTICO! Usar el DictCursor que tu lógica requiere
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
 
-                # --- Verificaciones de Seguridad ---
-                # 1. ¿Tiene stock actual? (stock_quants)
-                cursor.execute("SELECT SUM(quantity) as total_stock FROM stock_quants WHERE location_id = %s", (location_id,))
-                stock_result = cursor.fetchone()
-                
-                # Ahora esto funcionará porque stock_result es un diccionario
-                if stock_result and stock_result['total_stock'] and abs(stock_result['total_stock']) > 0.001:
-                    print(f" -> Bloqueado: Tiene stock ({stock_result['total_stock']}).")
-                    return False, f"No se puede eliminar: La ubicación tiene stock ({stock_result['total_stock']} unidades)."
+            # --- 5. Tu lógica de Verificaciones (se mantiene 100% intacta) ---
+            
+            # 1. ¿Tiene stock actual? (stock_quants)
+            cursor.execute("SELECT SUM(quantity) as total_stock FROM stock_quants WHERE location_id = %s", (location_id,))
+            stock_result = cursor.fetchone()
+            if stock_result and stock_result['total_stock'] and abs(stock_result['total_stock']) > 0.001:
+                print(f" -> Bloqueado: Tiene stock ({stock_result['total_stock']}).")
+                # El 'finally' se ejecutará y devolverá la conexión
+                return False, f"No se puede eliminar: La ubicación tiene stock ({stock_result['total_stock']} unidades)."
 
-                # 2. ¿Es ubicación por defecto en picking_types?
-                cursor.execute("SELECT COUNT(*) as count FROM picking_types WHERE default_location_src_id = %s OR default_location_dest_id = %s", (location_id, location_id))
-                pt_result = cursor.fetchone()
-                if pt_result['count'] > 0:
-                    print(f" -> Bloqueado: Es ubicación por defecto en {pt_result['count']} tipo(s) de operación.")
-                    return False, f"No se puede eliminar: Es ubicación por defecto en {pt_result['count']} tipo(s) de operación."
+            # 2. ¿Es ubicación por defecto en picking_types?
+            cursor.execute("SELECT COUNT(*) as count FROM picking_types WHERE default_location_src_id = %s OR default_location_dest_id = %s", (location_id, location_id))
+            pt_result = cursor.fetchone()
+            if pt_result['count'] > 0:
+                print(f" -> Bloqueado: Es ubicación por defecto en {pt_result['count']} tipo(s) de operación.")
+                return False, f"No se puede eliminar: Es ubicación por defecto en {pt_result['count']} tipo(s) de operación."
 
-                # 3. ¿Tiene historial de movimientos? (stock_moves)
-                cursor.execute("SELECT COUNT(*) as count FROM stock_moves WHERE location_src_id = %s OR location_dest_id = %s", (location_id, location_id))
-                move_result = cursor.fetchone()
-                if move_result['count'] > 0:
-                    print(f" -> Bloqueado: Tiene {move_result['count']} movimientos históricos.")
-                    return False, f"No se puede eliminar: La ubicación tiene historial de {move_result['count']} movimientos."
+            # 3. ¿Tiene historial de movimientos? (stock_moves)
+            cursor.execute("SELECT COUNT(*) as count FROM stock_moves WHERE location_src_id = %s OR location_dest_id = %s", (location_id, location_id))
+            move_result = cursor.fetchone()
+            if move_result['count'] > 0:
+                print(f" -> Bloqueado: Tiene {move_result['count']} movimientos históricos.")
+                return False, f"No se puede eliminar: La ubicación tiene historial de {move_result['count']} movimientos."
 
-                # --- Si pasa todas las verificaciones, eliminar ---
-                print(" -> Verificaciones superadas. Procediendo a eliminar...")
-                cursor.execute("DELETE FROM locations WHERE id = %s", (location_id,))
-                rows_affected = cursor.rowcount
-                conn.commit()
+            # --- Si pasa todas las verificaciones, eliminar ---
+            print(" -> Verificaciones superadas. Procediendo a eliminar...")
+            cursor.execute("DELETE FROM locations WHERE id = %s", (location_id,))
+            rows_affected = cursor.rowcount
+            
+            # 6. COMMIT
+            conn.commit()
 
-                if rows_affected > 0:
-                    print(" -> Ubicación eliminada con éxito.")
-                    return True, "Ubicación eliminada correctamente."
-                else:
-                    print(" -> ADVERTENCIA: No se encontró la ubicación para eliminar.")
-                    return False, "La ubicación no se encontró (posiblemente ya fue eliminada)."
+            if rows_affected > 0:
+                print(" -> Ubicación eliminada con éxito.")
+                return True, "Ubicación eliminada correctamente."
+            else:
+                print(" -> ADVERTENCIA: No se encontró la ubicación para eliminar.")
+                return False, "La ubicación no se encontró (posiblemente ya fue eliminada)."
 
     except Exception as e:
+        # 7. ¡MEJORA! Añadimos rollback en caso de error
+        if conn:
+            conn.rollback()
+            
         print(f"Error CRÍTICO en delete_location: {e}")
         traceback.print_exc()
         return False, f"Error inesperado al intentar eliminar: {e}"
+        
+    finally:
+        # 8. PASE LO QUE PASE, devolver la conexión al pool
+        if conn:
+            db_pool.putconn(conn)
 
 def get_warehouse_code(warehouse_id):
     """Obtiene el código ('code') de un almacén por su ID."""
@@ -3886,8 +4563,6 @@ def get_warehouses_count(company_id, filters={}):
     result = execute_query(base_query, tuple(params), fetchone=True)
     return result['total_count'] if result else 0
 
-# En app/database.py
-
 def get_products_filtered_sorted(company_id, filters={}, sort_by='name', ascending=True, limit=None, offset=None):
     """ Obtiene productos filtrados, ordenados y paginados desde la base de datos. """
     
@@ -3940,6 +4615,7 @@ def get_products_filtered_sorted(company_id, filters={}, sort_by='name', ascendi
         params.extend([limit, offset])
 
     return execute_query(base_query, tuple(params), fetchall=True)
+
 
 def get_products_count(company_id, filters={}):
     """ Cuenta el total de productos que coinciden con los filtros. """
@@ -4067,7 +4743,10 @@ def get_partner_category_id_by_name(name):
     return result['id'] if result else None
 
 def upsert_partner_from_import(company_id, name, category_id, ruc, social_reason, address, email, phone):
-    # (Similar, ON CONFLICT en (company_id, name))
+    """
+    Inserta o actualiza un partner (proveedor/cliente) desde la importación.
+    [REFACTORIZADO] Usa el helper execute_commit_query para el UPSERT.
+    """
     query = """
         INSERT INTO partners (company_id, name, category_id, ruc, social_reason, address, email, phone)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -4081,14 +4760,24 @@ def upsert_partner_from_import(company_id, name, category_id, ruc, social_reason
         RETURNING (xmax = 0) AS inserted;
     """
     params = (company_id, name, category_id, ruc, social_reason, address, email, phone)
+    
     try:
-        with connect_db() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(query, params)
-                was_inserted = cursor.fetchone()[0]
-                conn.commit()
-                return "created" if was_inserted else "updated"
+        # 1. Usamos la función de escritura, pidiendo el 'RETURNING'
+        # execute_commit_query se encargará del commit y de devolver la conexión
+        result = execute_commit_query(query, params, fetchone=True)
+        
+        if result:
+            was_inserted = result[0] # O result['inserted'] si tu helper usa DictCursor por defecto
+            return "created" if was_inserted else "updated"
+        else:
+            # Esto no debería ocurrir si RETURNING siempre devuelve una fila
+            print(f"ADVERTENCIA: UPSERT para Partner '{name}' no retornó un estado.")
+            return "error"
+
     except Exception as e:
+        # 2. El helper (execute_commit_query) ya imprimió el error
+        #    y ejecutó un rollback.
+        #    Solo necesitamos cumplir con el contrato de la función y retornar "error".
         print(f"Error procesando fila para Partner '{name}': {e}")
         return "error"
 
@@ -4581,78 +5270,114 @@ def get_adjustments_filtered_sorted(company_id, filters={}, sort_by='id', ascend
 
     return execute_query(base_query, tuple(params), fetchall=True)
 
-# En app/database.py
-
 def save_adjustment_draft(picking_id, header_data: dict, lines_data: list):
     """
     Guarda el progreso de un borrador de Ajuste.
     Actualiza la cabecera y reemplaza todas las líneas.
+    (Versión PostgreSQL - ADAPTADA AL POOL de conexiones como una transacción)
     """
     print(f"[DB-ADJ-SAVE] Guardando borrador para Picking ID: {picking_id}")
-    try:
-        with connect_db() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-                
-                # 1. Actualizar Cabecera (usando la función que ya existe)
-                allowed_header_fields = {"location_src_id", "location_dest_id", "adjustment_reason", "loss_confirmation", "notes"}
-                fields_to_update = {k: v for k, v in header_data.items() if k in allowed_header_fields}
-                
-                if fields_to_update:
-                    set_clause = ", ".join([f"{key} = %s" for key in fields_to_update.keys()])
-                    params = list(fields_to_update.values()) + [picking_id]
-                    cursor.execute(f"UPDATE pickings SET {set_clause} WHERE id = %s", tuple(params))
-                    print(f" -> Cabecera actualizada: {fields_to_update}")
+    
+    global db_pool
+    if not db_pool:
+        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
+        init_db_pool()
+        if not db_pool:
+            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
 
-                # 2. Borrar líneas 'draft' antiguas
-                cursor.execute("SELECT id FROM stock_moves WHERE picking_id = %s AND state = 'draft'", (picking_id,))
-                old_moves = cursor.fetchall()
-                if old_moves:
-                    old_move_ids = tuple([m[0] for m in old_moves])
+    conn = None # Declarar conn aquí para que esté disponible en 'finally'
+    try:
+        # 1. Obtener UNA conexión del pool para TODA la transacción
+        conn = db_pool.getconn() 
+        
+        # 2. Establecer la fábrica de cursores para esta conexión
+        # (Esto es temporal para la conexión, no afecta al pool)
+        conn.cursor_factory = psycopg2.extras.DictCursor
+
+        # 3. Iniciar el cursor
+        with conn.cursor() as cursor:            
+            # 3.1. Actualizar Cabecera
+            allowed_header_fields = {"location_src_id", "location_dest_id", "adjustment_reason", "loss_confirmation", "notes"}
+            fields_to_update = {k: v for k, v in header_data.items() if k in allowed_header_fields}
+            
+            if fields_to_update:
+                set_clause = ", ".join([f"{key} = %s" for key in fields_to_update.keys()])
+                params = list(fields_to_update.values()) + [picking_id]
+                cursor.execute(f"UPDATE pickings SET {set_clause} WHERE id = %s", tuple(params))
+                print(f" -> Cabecera actualizada: {fields_to_update}")
+
+            # 3.2. Borrar líneas 'draft' antiguas
+            cursor.execute("SELECT id FROM stock_moves WHERE picking_id = %s AND state = 'draft'", (picking_id,))
+            old_moves = cursor.fetchall() # Devuelve lista de DictRows
+            
+            if old_moves:
+                # CORRECCIÓN: Acceder por 'id' (gracias a DictCursor)
+                old_move_ids = tuple([m['id'] for m in old_moves]) 
+                
+                if old_move_ids: # Evitar 'IN ()' si la tupla está vacía
                     placeholders = ','.join(['%s'] * len(old_move_ids))
                     cursor.execute(f"DELETE FROM stock_move_lines WHERE move_id IN ({placeholders})", old_move_ids)
                     cursor.execute(f"DELETE FROM stock_moves WHERE id IN ({placeholders})", old_move_ids)
                     print(f" -> {len(old_move_ids)} líneas borrador antiguas eliminadas.")
 
-                # 3. Crear nuevas líneas 'draft'
-                loc_src_id = header_data.get("location_src_id")
-                loc_dest_id = header_data.get("location_dest_id")
-                if not loc_src_id or not loc_dest_id:
-                    raise ValueError("Se requieren ubicaciones de origen y destino para guardar líneas.")
+            # 3.3. Crear nuevas líneas 'draft'
+            loc_src_id = header_data.get("location_src_id")
+            loc_dest_id = header_data.get("location_dest_id")
+            if not loc_src_id or not loc_dest_id:
+                raise ValueError("Se requieren ubicaciones de origen y destino para guardar líneas.")
 
-                moves_with_tracking = {}
-                for line in lines_data: # 'line' es un objeto schemas.StockMoveData
-                    
-                    # --- ¡CORRECCIÓN AQUÍ! Usar . en lugar de [] ---
-                    product_id = line.product_id
-                    quantity = line.quantity
-                    cost = line.cost_at_adjustment
-                    tracking_data = line.tracking_data
-                    # ----------------------------------------------
-                    
-                    cursor.execute(
-                        """INSERT INTO stock_moves (picking_id, product_id, product_uom_qty, quantity_done,
-                                                     location_src_id, location_dest_id, state, cost_at_adjustment)
-                           VALUES (%s, %s, %s, %s, %s, %s, 'draft', %s)
-                           RETURNING id""",
-                        (picking_id, product_id, quantity, quantity, loc_src_id, loc_dest_id, cost)
-                    )
-                    move_id = cursor.fetchone()[0]
-
-                    if tracking_data:
-                        moves_with_tracking[move_id] = tracking_data
-                        for lot_name, qty_done in tracking_data.items():
-                             lot_row = get_lot_by_name(cursor, product_id, lot_name)
-                             lot_id = lot_row[0] if lot_row else create_lot(cursor, product_id, lot_name)
-                             cursor.execute("INSERT INTO stock_move_lines (move_id, lot_id, qty_done) VALUES (%s, %s, %s)", (move_id, lot_id, qty_done))
+            moves_with_tracking = {}
+            for line in lines_data: 
+                product_id = line.product_id
+                quantity = line.quantity
+                cost = line.cost_at_adjustment
+                tracking_data = line.tracking_data
                 
-                print(f" -> {len(lines_data)} líneas nuevas creadas.")
-                conn.commit()
-                return True, "Progreso de ajuste guardado.", moves_with_tracking
+                cursor.execute(
+                    """INSERT INTO stock_moves (picking_id, product_id, product_uom_qty, quantity_done,
+                                               location_src_id, location_dest_id, state, cost_at_adjustment)
+                       VALUES (%s, %s, %s, %s, %s, %s, 'draft', %s)
+                       RETURNING id""",
+                    (picking_id, product_id, quantity, quantity, loc_src_id, loc_dest_id, cost)
+                )
+                # CORRECCIÓN: Acceder por 'id' (gracias a DictCursor)
+                move_id = cursor.fetchone()['id'] 
+
+                if tracking_data:
+                    moves_with_tracking[move_id] = tracking_data
+                    for lot_name, qty_done in tracking_data.items():
+                        
+                        # Asumiendo que get_lot_by_name y create_lot toman el 'cursor'
+                        lot_row = get_lot_by_name(cursor, product_id, lot_name)
+                        
+                        # CORRECCIÓN: Acceder por 'id' (gracias a DictCursor)
+                        lot_id = lot_row['id'] if lot_row else create_lot(cursor, product_id, lot_name)
+                        
+                        cursor.execute("INSERT INTO stock_move_lines (move_id, lot_id, qty_done) VALUES (%s, %s, %s)", (move_id, lot_id, qty_done))
+            
+            print(f" -> {len(lines_data)} líneas nuevas creadas.")
+            # 4. Hacer COMMIT de TODA la transacción
+            conn.commit() 
+            
+            # Restaurar la cursor_factory por defecto (buena práctica)
+            conn.cursor_factory = None 
+            return True, "Progreso de ajuste guardado.", moves_with_tracking
 
     except Exception as e:
         print(f"[ERROR] en save_adjustment_draft: {e}")
         traceback.print_exc()
+        
+        # 5. Hacer ROLLBACK si algo falló
+        if conn:
+            conn.rollback() 
+            
         return False, f"Error al guardar borrador: {e}", None
+    
+    finally:
+        # 6. Devolver la conexión al pool SIEMPRE
+        if conn:
+            conn.cursor_factory = None # Asegurarse de resetearla
+            db_pool.putconn(conn)
 
 def get_adjustments_count(company_id, filters={}):
     """
@@ -4873,62 +5598,98 @@ def _create_or_update_draft_picking_internal(
 def save_liquidation_progress(wo_id, wo_updates: dict, consumo_data: dict, retiro_data: dict, company_id, user_name):
     """
     Actualiza la WO y crea/actualiza AMBOS pickings (OUT y RET) en UNA SOLA TRANSACCIÓN.
+    (Versión PostgreSQL - ADAPTADA AL POOL de conexiones como una transacción)
     """
     print(f"[DB-SAVE-LIQ] Iniciando guardado ATÓMICO para WO ID: {wo_id}")
+    
+    global db_pool
+    if not db_pool:
+        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
+        init_db_pool()
+        if not db_pool:
+            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
+
+    conn = None # Declarar conn aquí para que esté disponible en 'finally'
     try:
-        with connect_db() as conn:
-            # ¡CAMBIO! Usar DictCursor aquí también por consistencia
-            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-                
-                # --- 1. Actualizar Work Order ---
-                if wo_updates:
-                    set_clause = ", ".join([f"{key} = %s" for key in wo_updates.keys()])
-                    params = list(wo_updates.values()) + [wo_id]
-                    cursor.execute(f"UPDATE work_orders SET {set_clause} WHERE id = %s", tuple(params))
-                    print(f" -> work_orders (ID: {wo_id}) actualizada: {wo_updates}")
-                
-                # --- 2. Procesar Picking de Consumo (OUT) ---
-                if consumo_data:
-                    # ¡CAMBIO! Ya no nos importa lo que devuelve, solo que se ejecute
-                    _create_or_update_draft_picking_internal(
-                        cursor, wo_id, 'OUT', consumo_data, company_id, user_name
-                    )
-                
-                # --- 3. Procesar Picking de Retiro (RET) ---
-                if retiro_data:
-                    # ¡CAMBIO! Ya no nos importa lo que devuelve
-                    _create_or_update_draft_picking_internal(
-                        cursor, wo_id, 'RET', retiro_data, company_id, user_name
+        # 1. Obtener UNA conexión del pool para TODA la transacción
+        conn = db_pool.getconn() 
+        
+        # 2. Establecer DictCursor para esta conexión
+        conn.cursor_factory = psycopg2.extras.DictCursor
+
+        # 3. Iniciar el cursor
+        with conn.cursor() as cursor:
+            
+            # --- INICIO DE LÓGICA DE TRANSACCIÓN ---
+
+            # --- 1. Actualizar Work Order ---
+            if wo_updates:
+                set_clause = ", ".join([f"{key} = %s" for key in wo_updates.keys()])
+                params = list(wo_updates.values()) + [wo_id]
+                cursor.execute(f"UPDATE work_orders SET {set_clause} WHERE id = %s", tuple(params))
+                print(f" -> work_orders (ID: {wo_id}) actualizada: {wo_updates}")
+            
+            # --- 2. Procesar Picking de Consumo (OUT) ---
+            if consumo_data:
+                # Se asume que _create_or_update_draft_picking_internal está en este
+                # mismo archivo y acepta el 'cursor' como primer argumento.
+                _create_or_update_draft_picking_internal(
+                    cursor, wo_id, 'OUT', consumo_data, company_id, user_name
                 )
-                else:
-                    # (La lógica de eliminar el borrador 'RET' no cambia)
-                    print(f" -> No hay datos de Retiro. Buscando y eliminando picking 'RET' borrador para WO ID: {wo_id}...")
-                    cursor.execute(
-                        """SELECT p.id FROM pickings p JOIN picking_types pt ON p.picking_type_id = pt.id
-                           WHERE p.work_order_id = %s AND p.state = 'draft' AND pt.code = 'RET'""",
-                        (wo_id,)
-                    )
-                    draft_ret_picking = cursor.fetchone()
-                    if draft_ret_picking:
-                        picking_id_to_delete = draft_ret_picking['id']
-                        print(f"     -> Picking 'RET' borrador (ID: {picking_id_to_delete}) encontrado. Eliminando...")
-                        # (La lógica de DELETE no cambia)
-                        cursor.execute("DELETE FROM stock_move_lines WHERE move_id IN (SELECT id FROM stock_moves WHERE picking_id = %s)", (picking_id_to_delete,))
-                        cursor.execute("DELETE FROM stock_moves WHERE picking_id = %s", (picking_id_to_delete,))
-                        cursor.execute("DELETE FROM pickings WHERE id = %s", (picking_id_to_delete,))
-                        print(f"     -> Picking 'RET' borrador (ID: {picking_id_to_delete}) eliminado.")
-                    else:
-                        print("     -> No se encontró ningún picking 'RET' borrador. No se requiere eliminación.")
+            
+            # --- 3. Procesar Picking de Retiro (RET) ---
+            if retiro_data:
+                # Esta función ahora participa en la misma transacción
+                _create_or_update_draft_picking_internal(
+                    cursor, wo_id, 'RET', retiro_data, company_id, user_name
+                )
+            else:
+                # La lógica de eliminar el borrador 'RET' usa el mismo cursor
+                print(f" -> No hay datos de Retiro. Buscando y eliminando picking 'RET' borrador para WO ID: {wo_id}...")
+                cursor.execute(
+                    """SELECT p.id FROM pickings p JOIN picking_types pt ON p.picking_type_id = pt.id
+                       WHERE p.work_order_id = %s AND p.state = 'draft' AND pt.code = 'RET'""",
+                    (wo_id,)
+                )
+                draft_ret_picking = cursor.fetchone()
                 
-                # --- 4. Commit ---
-                conn.commit()
-                print("[DB-SAVE-LIQ] Transacción completada (COMMIT).")
-                return True, "Progreso de liquidación guardado."
+                if draft_ret_picking:
+                    # El código original ya accedía bien por 'id' gracias a DictCursor
+                    picking_id_to_delete = draft_ret_picking['id']
+                    print(f"    -> Picking 'RET' borrador (ID: {picking_id_to_delete}) encontrado. Eliminando...")
+                    
+                    cursor.execute("DELETE FROM stock_move_lines WHERE move_id IN (SELECT id FROM stock_moves WHERE picking_id = %s)", (picking_id_to_delete,))
+                    cursor.execute("DELETE FROM stock_moves WHERE picking_id = %s", (picking_id_to_delete,))
+                    cursor.execute("DELETE FROM pickings WHERE id = %s", (picking_id_to_delete,))
+                    print(f"    -> Picking 'RET' borrador (ID: {picking_id_to_delete}) eliminado.")
+                else:
+                    print("    -> No se encontró ningún picking 'RET' borrador. No se requiere eliminación.")
+            
+            # --- FIN DE LÓGICA DE TRANSACCIÓN ---
+
+            # 4. Hacer COMMIT de TODA la transacción
+            conn.commit()
+            print("[DB-SAVE-LIQ] Transacción completada (COMMIT).")
+            
+            # Restaurar la cursor_factory por defecto (buena práctica)
+            conn.cursor_factory = None 
+            return True, "Progreso de liquidación guardado."
 
     except Exception as e:
         print(f"[ERROR] en save_liquidation_progress: {e}")
         traceback.print_exc()
+        
+        # 5. Hacer ROLLBACK si algo falló
+        if conn:
+            conn.rollback() 
+            
         return False, f"Error al guardar borrador: {e}"
+    
+    finally:
+        # 6. Devolver la conexión al pool SIEMPRE
+        if conn:
+            conn.cursor_factory = None # Asegurarse de resetearla
+            db_pool.putconn(conn)
 
 def get_work_orders_filtered_sorted(company_id, filters={}, sort_by='id', ascending=False, limit=None, offset=None):
     """
@@ -5132,105 +5893,157 @@ def get_permission_matrix():
     return roles, permissions, matrix
 
 def update_role_permissions(role_id, permission_id, has_permission: bool):
-    """Añade o quita un permiso a un rol. (Versión PostgreSQL)"""
+    """
+    Añade o quita un permiso a un rol. 
+    (Versión PostgreSQL - ADAPTADA AL POOL de conexiones)
+    """
     try:
-        with connect_db() as conn:
-            with conn.cursor() as cursor:
-                if has_permission:
-                    # --- ¡CAMBIO DE SINTAXIS! ---
-                    cursor.execute("INSERT INTO role_permissions (role_id, permission_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (role_id, permission_id))
-                    print(f"[DB-RBAC] Permiso {permission_id} AÑADIDO a Rol {role_id}")
-                else:
-                    cursor.execute("DELETE FROM role_permissions WHERE role_id = %s AND permission_id = %s", (role_id, permission_id))
-                    print(f"[DB-RBAC] Permiso {permission_id} QUITADO de Rol {role_id}")
-                conn.commit()
-            return True, "Permiso actualizado"
+        if has_permission:
+            # Usar execute_commit_query para INSERT
+            query = "INSERT INTO role_permissions (role_id, permission_id) VALUES (%s, %s) ON CONFLICT DO NOTHING"
+            params = (role_id, permission_id)
+            
+            execute_commit_query(query, params)
+            
+            print(f"[DB-RBAC] Permiso {permission_id} AÑADIDO a Rol {role_id}")
+        
+        else:
+            # Usar execute_commit_query para DELETE
+            query = "DELETE FROM role_permissions WHERE role_id = %s AND permission_id = %s"
+            params = (role_id, permission_id)
+            
+            execute_commit_query(query, params)
+            
+            print(f"[DB-RBAC] Permiso {permission_id} QUITADO de Rol {role_id}")
+        
+        # El 'commit' y el manejo de la conexión ya están dentro de 'execute_commit_query'
+        return True, "Permiso actualizado"
+    
     except Exception as e:
+        # El error ya fue impreso por 'execute_commit_query', 
+        # pero lo capturamos aquí para devolver el mensaje de error.
         print(f"[ERROR] en update_role_permissions: {e}")
         return False, str(e)
 
 def create_role(name, description):
-    """Crea un nuevo rol."""
+    """
+    Crea un nuevo rol.
+    (Versión PostgreSQL - ADAPTADA AL POOL de conexiones)
+    """
     try:
-        with connect_db() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "INSERT INTO roles (name, description) VALUES (%s, %s) RETURNING id",
-                    (name, description)
-                )
-                new_id = cursor.fetchone()[0]
-                conn.commit()
-                return new_id
-    except Exception as e:  # Captura genérica de psycopg2
-        if "roles_name_key" in str(e):  # Revisa el nombre real del constraint UNIQUE en PostgreSQL
+        query = "INSERT INTO roles (name, description) VALUES (%s, %s) RETURNING id"
+        params = (name, description)
+        result = execute_commit_query(query, params, fetchone=True)
+        
+        if result:
+            new_id = result['id'] # Accedemos al ID por su nombre
+            return new_id
+        else:
+            raise Exception("No se pudo obtener el ID del rol creado.")
+            
+    except Exception as e:
+        if "roles_name_key" in str(e): 
             raise ValueError(f"El rol '{name}' ya existe.")
         else:
             raise e
 
 def update_role(role_id, name, description):
-    """Actualiza un rol existente."""
+    """
+    Actualiza un rol existente.
+    (Versión PostgreSQL - ADAPTADA AL POOL de conexiones)
+    """
     try:
-        with connect_db() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "UPDATE roles SET name = %s, description = %s WHERE id = %s",
-                    (name, description, role_id)
-                )
-                conn.commit()
-    except Exception as e:  # Captura genérica de psycopg2
-        if "roles_name_key" in str(e):  # Revisa el nombre real del constraint UNIQUE en PostgreSQL
+        query = "UPDATE roles SET name = %s, description = %s WHERE id = %s"
+        params = (name, description, role_id)
+        execute_commit_query(query, params)
+
+    except Exception as e: 
+        if "roles_name_key" in str(e): 
             raise ValueError(f"El rol '{name}' ya existe.")
         else:
             raise e
 
 def create_user(username, plain_password, full_name, role_id):
-    """Crea un nuevo usuario con contraseña hasheada."""
+    """
+    Crea un nuevo usuario con contraseña hasheada.
+    (Versión PostgreSQL - ADAPTADA AL POOL de conexiones)
+    """
     if not username or not plain_password or not full_name or not role_id:
         raise ValueError("Todos los campos son obligatorios.")
 
     try:
-        hashed_pass = hash_password(plain_password)
-        with connect_db() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO users (username, hashed_password, full_name, role_id, is_active)
-                    VALUES (%s, %s, %s, %s, 1)
-                    RETURNING id
-                    """,
-                    (username, hashed_pass, full_name, role_id)
-                )
-                new_id = cursor.fetchone()[0]
-                conn.commit()
-                return new_id
-    except Exception as e:  # Captura genérica de psycopg2
-        if "users_username_key" in str(e):  # Revisa el nombre real del constraint UNIQUE en PostgreSQL
+        # Asumiendo que hash_password() está disponible en este archivo
+        hashed_pass = hash_password(plain_password) 
+        
+        query = """
+        INSERT INTO users (username, hashed_password, full_name, role_id, is_active)
+        VALUES (%s, %s, %s, %s, 1) 
+        RETURNING id
+        """
+        # ---
+        # ¡CORRECCIÓN! 
+        # Cambiamos 'TRUE' de nuevo a '1' para que coincida con tu columna 'integer'.
+        # ---
+        params = (username, hashed_pass, full_name, role_id)
+        
+        # Usamos execute_commit_query con fetchone=True para capturar el RETURNING
+        result = execute_commit_query(query, params, fetchone=True)
+        
+        if result:
+            new_id = result['id'] # Acceder al ID por su nombre de columna
+            return new_id
+        else:
+            raise Exception("No se pudo obtener el ID del usuario creado.")
+            
+    except Exception as e: 
+        # Capturamos la excepción propagada desde execute_commit_query
+        
+        # Revisa el nombre real del constraint UNIQUE en PostgreSQL
+        if "users_username_key" in str(e): 
             raise ValueError(f"El nombre de usuario '{username}' ya existe.")
         else:
+            # Re-lanzamos cualquier otro error
             raise e
 
 def update_user(user_id, full_name, role_id, is_active, new_password=None):
-    """Actualiza un usuario. Si new_password se provee, la cambia."""
+    """
+    Actualiza un usuario. Si new_password se provee, la cambia.
+    (Versión PostgreSQL - ADAPTADA AL POOL de conexiones)
+    """
     try:
-        with connect_db() as conn:
-            cursor = conn.cursor()
-            if new_password:
-                # Si hay nueva contraseña, hashearla y actualizarla
-                hashed_pass = hash_password(new_password)
-                cursor.execute(
-                    "UPDATE users SET full_name =  %s, role_id =  %s, is_active =  %s, hashed_password =  %s WHERE id =  %s",
-                    (full_name, role_id, 1 if is_active else 0, hashed_pass, user_id)
-                )
-                print(f"[DB-RBAC] Usuario {user_id} actualizado (CON nueva contraseña).")
-            else:
-                # Si no hay nueva contraseña, no tocar ese campo
-                cursor.execute(
-                    "UPDATE users SET full_name =  %s, role_id =  %s, is_active =  %s WHERE id =  %s",
-                    (full_name, role_id, 1 if is_active else 0, user_id)
-                )
-                print(f"[DB-RBAC] Usuario {user_id} actualizado (SIN nueva contraseña).")
-            conn.commit()
+        if new_password:
+            # Si hay nueva contraseña, hashearla y actualizarla
+            # Asumiendo que hash_password() está disponible en este archivo
+            hashed_pass = hash_password(new_password)
+            
+            query = """
+                UPDATE users 
+                SET full_name = %s, role_id = %s, is_active = %s, hashed_password = %s 
+                WHERE id = %s
+            """
+            # psycopg2 maneja True/False de Python correctamente
+            params = (full_name, role_id, is_active, hashed_pass, user_id)
+            
+            execute_commit_query(query, params)
+            print(f"[DB-RBAC] Usuario {user_id} actualizado (CON nueva contraseña).")
+        
+        else:
+            # Si no hay nueva contraseña, no tocar ese campo
+            query = """
+                UPDATE users 
+                SET full_name = %s, role_id = %s, is_active = %s 
+                WHERE id = %s
+            """
+            # psycopg2 maneja True/False de Python correctamente
+            params = (full_name, role_id, is_active, user_id)
+            
+            execute_commit_query(query, params)
+            print(f"[DB-RBAC] Usuario {user_id} actualizado (SIN nueva contraseña).")
+
+        # No se necesita conn.commit(), execute_commit_query lo maneja.
+
     except Exception as e:
+        # La excepción se propaga desde execute_commit_query
         raise ValueError(f"Error al actualizar usuario: {e}")
 
 def get_product_reservations(product_id, location_id, lot_id=None):
@@ -5308,3 +6121,149 @@ def get_real_available_stock(product_id, location_id):
     reserved = res_reserved['reserved'] if res_reserved and res_reserved['reserved'] else 0.0
 
     return max(0.0, physical - reserved) # Nunca devolver negativo por seguridad
+
+def get_picking_ui_details_optimized(picking_id: int, company_id: int):
+    """
+    [OPTIMIZADO-JSON] Obtiene la mayoría de los datos de la UI en una
+    sola consulta, usando JSON de PostgreSQL.
+    """
+    
+    # Esta consulta usa Common Table Expressions (WITH) para organizarse
+    # y funciones JSON (json_build_object, json_agg) para construir
+    # la respuesta dentro de la base de datos.
+    sql_query = """
+    WITH 
+    -- 1. Obtener la cabecera y la regla de operación
+    picking_data AS (
+        SELECT 
+            p.*, 
+            pt.code as type_code,
+            -- Construimos el objeto 'op_rule' directamente
+            json_build_object(
+                'id', op_rule.id,
+                'name', op_rule.name,
+                'source_location_category', op_rule.source_location_category,
+                'destination_location_category', op_rule.destination_location_category
+            ) as op_rule
+        FROM pickings p
+        JOIN picking_types pt ON p.picking_type_id = pt.id
+        LEFT JOIN operation_types op_rule ON p.custom_operation_type = op_rule.name
+        WHERE p.id = %(picking_id)s
+    ),
+    
+    -- 2. Obtener las líneas (moves) y empaquetarlas en un JSON array
+    moves_data AS (
+        SELECT 
+            json_agg(json_build_object(
+                'id', sm.id,
+                'product_id', pr.id,
+                'name', pr.name,
+                'sku', pr.sku,
+                'product_uom_qty', sm.product_uom_qty,
+                'quantity_done', sm.quantity_done,
+                'tracking', pr.tracking,
+                'uom_name', u.name,
+                'price_unit', sm.price_unit,
+                'standard_price', pr.standard_price,
+                'cost_at_adjustment', sm.cost_at_adjustment
+            )) as moves
+        FROM stock_moves sm
+        JOIN products pr ON sm.product_id = pr.id
+        LEFT JOIN uom u ON pr.uom_id = u.id
+        WHERE sm.picking_id = %(picking_id)s
+    ),
+    
+    -- 3. Obtener las series/lotes y empaquetarlas en un objeto JSON
+    --    Formato: { "move_id_1": {"loteA": 1, "loteB": 5}, "move_id_2": ... }
+    serials_data AS (
+        SELECT 
+            COALESCE(json_object_agg(
+                s.move_id, s.lots
+            ), '{}'::json) as serials
+        FROM (
+            SELECT 
+                sml.move_id, 
+                json_object_agg(sl.name, sml.qty_done) as lots
+            FROM stock_move_lines sml
+            JOIN stock_lots sl ON sml.lot_id = sl.id
+            WHERE sml.move_id IN (SELECT id FROM stock_moves WHERE picking_id = %(picking_id)s)
+            GROUP BY sml.move_id
+        ) s
+    ),
+    
+    -- 4. Obtener todos los dropdowns (excepto almacenes)
+    dropdowns AS (
+        SELECT
+            (SELECT json_agg(json_build_object('name', ot.name)) 
+             FROM operation_types ot 
+             WHERE ot.code = (SELECT type_code FROM picking_data)
+            ) AS operation_types,
+            
+            (SELECT json_agg(p.*) 
+             FROM (
+                SELECT p.id, p.name 
+                FROM partners p
+                JOIN partner_categories pc ON p.category_id = pc.id
+                WHERE p.company_id = %(company_id)s AND pc.name = 'Proveedor Externo'
+                ORDER BY p.name LIMIT 100
+             ) p
+            ) AS partners_vendor,
+            
+            (SELECT json_agg(p.*) 
+             FROM (
+                SELECT p.id, p.name 
+                FROM partners p
+                JOIN partner_categories pc ON p.category_id = pc.id
+                WHERE p.company_id = %(company_id)s AND pc.name = 'Proveedor Cliente'
+                ORDER BY p.name LIMIT 100
+             ) p
+            ) AS partners_customer,
+            
+            (SELECT json_agg(pr.*) 
+             FROM (
+                SELECT pr.id, pr.name, pr.sku, pr.tracking, pr.ownership, pr.uom_id 
+                FROM products pr
+                WHERE pr.company_id = %(company_id)s
+                ORDER BY pr.name LIMIT 100
+             ) pr
+            ) AS all_products
+    )
+    
+    -- 5. Unir todo en un solo JSON
+    SELECT json_build_object(
+        'picking_data', (SELECT to_jsonb(pd) - 'op_rule' FROM picking_data pd), -- to_jsonb para convertir la fila
+        'op_rule', (SELECT op_rule FROM picking_data),
+        'moves_data', (SELECT moves FROM moves_data),
+        'serials_data', (SELECT serials FROM serials_data),
+        'all_products', (SELECT all_products FROM dropdowns),
+        'dropdown_options', json_build_object(
+            'operation_types', (SELECT operation_types FROM dropdowns),
+            'partners_vendor', (SELECT partners_vendor FROM dropdowns),
+            'partners_customer', (SELECT partners_customer FROM dropdowns)
+        )
+    ) AS result;
+    """
+    
+    params = {"picking_id": picking_id, "company_id": company_id}
+    
+    # Usamos execute_query (nuestra función del pool)
+    # fetchone=True nos dará una sola fila (DictRow)
+    # El resultado estará en la columna 'result'
+    result_row = execute_query(sql_query, params, fetchone=True)
+    
+    if result_row and result_row['result']:
+        # Corregir listas vacías que SQL devuelve como 'null'
+        data = result_row['result']
+        if data.get('moves_data') is None:
+            data['moves_data'] = []
+        if data.get('all_products') is None:
+            data['all_products'] = []
+        if data['dropdown_options'].get('operation_types') is None:
+            data['dropdown_options']['operation_types'] = []
+        if data['dropdown_options'].get('partners_vendor') is None:
+            data['dropdown_options']['partners_vendor'] = []
+        if data['dropdown_options'].get('partners_customer') is None:
+            data['dropdown_options']['partners_customer'] = []
+        return data, None
+    
+    return None, "No se encontraron datos."

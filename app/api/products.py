@@ -351,3 +351,4 @@ async def import_products_csv(
         traceback.print_exc()
         # Aquí es donde se generaba el 500
         raise HTTPException(status_code=500, detail=f"Error crítico al procesar CSV: {e}")
+        
