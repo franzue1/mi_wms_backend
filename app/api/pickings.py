@@ -656,11 +656,15 @@ class StockMoveCreate(BaseModel):
 
 @router.post("/{picking_id}/moves", response_model=dict, status_code=201)
 async def add_stock_move(picking_id: int, move_data: StockMoveCreate, auth: AuthDependency):
-    """ Añade una nueva línea (stock_move) a un albarán 'draft'. """
+    """ 
+    Añade una nueva línea (stock_move) a un albarán 'draft'.
+    (OPTIMIZADO) Devuelve el objeto completo de la línea creada.
+    """
     if "operations.can_edit" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
     try:
-        new_move_id = db.add_stock_move_to_picking(
+        # Esta función ahora devuelve un DictRow completo
+        new_move_object = db.add_stock_move_to_picking(
             picking_id=picking_id,
             product_id=move_data.product_id,
             qty=move_data.qty,
@@ -669,7 +673,8 @@ async def add_stock_move(picking_id: int, move_data: StockMoveCreate, auth: Auth
             price_unit=move_data.price_unit,
             partner_id=move_data.partner_id
         )
-        return {"id": new_move_id}
+        # Convertimos el DictRow a un dict normal y lo devolvemos
+        return dict(new_move_object)
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al añadir línea: {e}")
@@ -689,14 +694,24 @@ async def delete_stock_move(move_id: int, auth: AuthDependency):
 class MoveQuantityUpdate(BaseModel):
     quantity: float
 
-@router.put("/moves/{move_id}/quantity", status_code=200)
+@router.put("/moves/{move_id}/quantity", response_model=dict, status_code=200)
 async def update_move_quantity(move_id: int, data: MoveQuantityUpdate, auth: AuthDependency):
-    """ Actualiza la cantidad de una línea 'draft'. """
+    """ 
+    Actualiza la cantidad de una línea 'draft'.
+    (OPTIMIZADO) Devuelve el objeto completo de la línea actualizada.
+    """
     if "operations.can_edit" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
     try:
-        db.update_move_quantity_done(move_id, data.quantity)
-        return {"message": "Cantidad actualizada."}
+        # Esta función ahora devuelve un DictRow completo
+        updated_move_object = db.update_move_quantity_done(move_id, data.quantity)
+        
+        if updated_move_object:
+            # Convertimos el DictRow a un dict normal y lo devolvemos
+            return dict(updated_move_object)
+        else:
+            raise HTTPException(status_code=404, detail="No se encontró la línea a actualizar.")
+            
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al actualizar cantidad: {e}")

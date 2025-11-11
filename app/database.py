@@ -1724,22 +1724,43 @@ def get_picking_details(picking_id):
     
     return p_info, moves
 
-
 def add_stock_move_to_picking(picking_id, product_id, qty, loc_src_id, loc_dest_id, price_unit=0, partner_id=None):
     """
-    (MIGRADO) Añade una línea de stock_move usando el pool de conexiones.
+    (OPTIMIZADO) Añade una línea y devuelve el objeto completo
+    (con JOIN a productos/uom) que la UI necesita.
     """
-    query = """INSERT INTO stock_moves (picking_id, product_id, product_uom_qty, quantity_done, location_src_id, location_dest_id, price_unit, partner_id) 
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id"""
+    
+    # Usamos una Cláusula WITH (CTE) para insertar y luego seleccionar
+    # los datos unidos en una sola transacción.
+    query = """
+    WITH new_move AS (
+        INSERT INTO stock_moves (
+            picking_id, product_id, product_uom_qty, quantity_done, 
+            location_src_id, location_dest_id, price_unit, partner_id
+        ) 
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s) 
+        RETURNING * -- Devuelve la fila completa de stock_moves
+    )
+    SELECT 
+        sm.id, pr.name, pr.sku, sm.product_uom_qty, 
+        sm.quantity_done, pr.tracking, pr.id as product_id,
+        u.name as uom_name,
+        sm.price_unit,
+        pr.standard_price,
+        sm.cost_at_adjustment
+    FROM new_move sm
+    JOIN products pr ON sm.product_id = pr.id
+    LEFT JOIN uom u ON pr.uom_id = u.id;
+    """
     params = (picking_id, product_id, qty, qty, loc_src_id, loc_dest_id, price_unit, partner_id)
     
-    # Usamos el helper de escritura que hace commit y devuelve el ID
-    new_id_row = execute_commit_query(query, params, fetchone=True)
+    # Usamos fetchone=True para obtener el objeto completo
+    new_move_object = execute_commit_query(query, params, fetchone=True)
     
-    if new_id_row and new_id_row[0]:
-        return new_id_row[0]
+    if new_move_object:
+        return new_move_object  # Devolvemos el DictRow completo
     else:
-        raise Exception("No se pudo crear la línea de stock, no se devolvió ID.")
+        raise Exception("No se pudo crear la línea de stock, no se devolvió objeto.")
 
 def get_warehouses(company_id):
     """
@@ -2065,14 +2086,35 @@ def get_picking_type_details(type_id): return execute_query("SELECT * FROM picki
 
 def update_move_quantity_done(move_id, quantity_done):
     """
-    (MIGRADO) Actualiza la cantidad de un move usando el pool de conexiones.
+    (OPTIMIZADO) Actualiza la cantidad de un move y devuelve
+    el objeto completo (con JOIN a productos/uom) que la UI necesita.
     """
-    query = "UPDATE stock_moves SET product_uom_qty = %s, quantity_done = %s WHERE id = %s"
+    
+    # Usamos un CTE para actualizar y luego seleccionar
+    query = """
+    WITH updated_move AS (
+        UPDATE stock_moves 
+        SET product_uom_qty = %s, quantity_done = %s 
+        WHERE id = %s
+        RETURNING * -- Devuelve la fila actualizada de stock_moves
+    )
+    SELECT 
+        sm.id, pr.name, pr.sku, sm.product_uom_qty, 
+        sm.quantity_done, pr.tracking, pr.id as product_id,
+        u.name as uom_name,
+        sm.price_unit,
+        pr.standard_price,
+        sm.cost_at_adjustment
+    FROM updated_move sm
+    JOIN products pr ON sm.product_id = pr.id
+    LEFT JOIN uom u ON pr.uom_id = u.id;
+    """
     params = (quantity_done, quantity_done, move_id)
     
-    # Usamos el helper de escritura (sin fetchone)
-    execute_commit_query(query, params)
-    return True # Asumimos éxito si no hay excepción
+    # Usamos fetchone=True para obtener el objeto completo
+    updated_move_object = execute_commit_query(query, params, fetchone=True)
+    
+    return updated_move_object # Devolvemos el DictRow completo
 def get_warehouse_categories():
     return execute_query("SELECT id, name FROM warehouse_categories ORDER BY name", fetchall=True)
 
@@ -6219,13 +6261,14 @@ def get_picking_ui_details_optimized(picking_id: int, company_id: int):
              ) p
             ) AS partners_customer,
             
-            (SELECT json_agg(pr.*) 
+            (SELECT json_agg(p_data) 
              FROM (
-                SELECT pr.id, pr.name, pr.sku, pr.tracking, pr.ownership, pr.uom_id 
+                SELECT pr.id, pr.name, pr.sku, pr.tracking, pr.ownership, pr.uom_id, pr.standard_price, u.name as uom_name
                 FROM products pr
+                LEFT JOIN uom u ON pr.uom_id = u.id
                 WHERE pr.company_id = %(company_id)s
                 ORDER BY pr.name LIMIT 100
-             ) pr
+             ) p_data
             ) AS all_products
     )
     
@@ -6267,3 +6310,4 @@ def get_picking_ui_details_optimized(picking_id: int, company_id: int):
         return data, None
     
     return None, "No se encontraron datos."
+
