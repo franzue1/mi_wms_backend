@@ -1040,6 +1040,7 @@ def get_work_orders(company_id):
 
 def get_work_order_details(wo_id): return execute_query("SELECT * FROM work_orders WHERE id =  %s", (wo_id,), fetchone=True)
 
+
 def create_work_order(company_id, ot_number, customer, address, service, job_type):
     """
     Crea una nueva Orden de Trabajo (Work Order) usando el pool de conexiones.
@@ -1075,6 +1076,7 @@ def create_work_order(company_id, ot_number, customer, address, service, job_typ
             print(f"Error DB: {e}")
             traceback.print_exc()
             raise e
+
 
 def get_picking_type_by_code(warehouse_id, code): return execute_query("SELECT id, default_location_src_id, default_location_dest_id FROM picking_types WHERE warehouse_id =  %s AND code =  %s", (warehouse_id, code), fetchone=True)
 
@@ -5459,8 +5461,6 @@ def get_adjustments_count(company_id, filters={}):
     result = execute_query(base_query, tuple(params), fetchone=True)
     return result['total_count'] if result else 0
 
-# En database.py
-
 def _create_or_update_draft_picking_internal(
     cursor: psycopg2.extensions.cursor, 
     wo_id: int, 
@@ -5487,7 +5487,6 @@ def _create_or_update_draft_picking_internal(
 
     if not warehouse_id:
         raise ValueError(f"Se requiere un warehouse_id para el picking {picking_code}.")
-
     # --- 1. Buscar si ya existe el borrador ---
     cursor.execute(
         """SELECT p.id, pt.default_location_src_id, pt.default_location_dest_id
@@ -5501,7 +5500,6 @@ def _create_or_update_draft_picking_internal(
     # Variables para determinar las ubicaciones finales a usar en el picking
     final_loc_src_id = None
     final_loc_dest_id = None
-
     # --- 2. Obtener configuración del tipo de operación (NECESARIO SIEMPRE para defaults) ---
     cursor.execute(
         "SELECT id, default_location_src_id, default_location_dest_id FROM picking_types WHERE warehouse_id = %s AND code = %s",
@@ -5514,11 +5512,9 @@ def _create_or_update_draft_picking_internal(
         # Podrías intentar buscar uno genérico si tu lógica lo permite, o fallar.
         # Por ahora, fallamos con un mensaje claro.
         raise ValueError(f"No está configurado el tipo de operación '{picking_code}' para el almacén ID {warehouse_id}.")
-
     picking_type_id = picking_type[0]
     default_src_id = picking_type[1]
     default_dest_id = picking_type[2]
-
     # --- 3. Determinar ubicaciones finales ---
     if picking_code == 'OUT':
         # Para OUT: Origen es la seleccionada por usuario (override), Destino es el default (Cliente)
@@ -5528,19 +5524,15 @@ def _create_or_update_draft_picking_internal(
         # Para RET: Origen es el default (Cliente), Destino es el default (Averiados/Principal)
         final_loc_src_id = default_src_id
         final_loc_dest_id = default_dest_id
-
     # Validar que tenemos ubicaciones
     if not final_loc_src_id or not final_loc_dest_id:
          raise ValueError(f"Configuración incompleta para '{picking_code}' en almacén {warehouse_id}. Faltan ubicaciones por defecto.")
-
     if draft_picking:
         # --- ACTUALIZAR EXISTENTE ---
         picking_id = draft_picking[0]
         print(f" -> Picking {picking_code} borrador encontrado (ID: {picking_id}). Actualizando...")
-        
         # Si no hay líneas nuevas y es un RET, podríamos optar por borrarlo si existía.
         # Por ahora, simplemente lo actualizamos.
-        
         cursor.execute(
             """UPDATE pickings
                SET warehouse_id = %s, location_src_id = %s, location_dest_id = %s, 
@@ -5550,7 +5542,6 @@ def _create_or_update_draft_picking_internal(
              date_attended, service_act_number, user_name, picking_id)
         )
     else:
-        # --- CREAR NUEVO ---
         if not lines_data and picking_code == 'RET':
             print(f" -> No hay picking {picking_code} previo ni líneas nuevas. Omitiendo creación.")
             return None, {}
@@ -5560,7 +5551,6 @@ def _create_or_update_draft_picking_internal(
         cursor.execute("SELECT wt.code, pt.code FROM picking_types pt JOIN warehouses wt ON pt.warehouse_id = wt.id WHERE pt.id = %s", (picking_type_id,))
         codes = cursor.fetchone()
         prefix = f"{codes[0]}/{codes[1]}/"
-        
         cursor.execute("SELECT COUNT(*) FROM pickings WHERE name LIKE %s", (f"{prefix}%",))
         count = cursor.fetchone()[0]
         picking_name = f"{prefix}{str(count + 1).zfill(5)}"
@@ -5637,6 +5627,7 @@ def _create_or_update_draft_picking_internal(
     print(f" -> {moves_created} líneas nuevas creadas para picking {picking_code} (ID: {picking_id}).")
     return picking_id, moves_with_tracking
 
+
 def save_liquidation_progress(wo_id, wo_updates: dict, consumo_data: dict, retiro_data: dict, company_id, user_name):
     """
     Actualiza la WO y crea/actualiza AMBOS pickings (OUT y RET) en UNA SOLA TRANSACCIÓN.
@@ -5655,22 +5646,16 @@ def save_liquidation_progress(wo_id, wo_updates: dict, consumo_data: dict, retir
     try:
         # 1. Obtener UNA conexión del pool para TODA la transacción
         conn = db_pool.getconn() 
-        
         # 2. Establecer DictCursor para esta conexión
         conn.cursor_factory = psycopg2.extras.DictCursor
-
         # 3. Iniciar el cursor
         with conn.cursor() as cursor:
-            
-            # --- INICIO DE LÓGICA DE TRANSACCIÓN ---
-
             # --- 1. Actualizar Work Order ---
             if wo_updates:
                 set_clause = ", ".join([f"{key} = %s" for key in wo_updates.keys()])
                 params = list(wo_updates.values()) + [wo_id]
                 cursor.execute(f"UPDATE work_orders SET {set_clause} WHERE id = %s", tuple(params))
                 print(f" -> work_orders (ID: {wo_id}) actualizada: {wo_updates}")
-            
             # --- 2. Procesar Picking de Consumo (OUT) ---
             if consumo_data:
                 # Se asume que _create_or_update_draft_picking_internal está en este
@@ -5678,7 +5663,6 @@ def save_liquidation_progress(wo_id, wo_updates: dict, consumo_data: dict, retir
                 _create_or_update_draft_picking_internal(
                     cursor, wo_id, 'OUT', consumo_data, company_id, user_name
                 )
-            
             # --- 3. Procesar Picking de Retiro (RET) ---
             if retiro_data:
                 # Esta función ahora participa en la misma transacción
@@ -5706,27 +5690,19 @@ def save_liquidation_progress(wo_id, wo_updates: dict, consumo_data: dict, retir
                     print(f"    -> Picking 'RET' borrador (ID: {picking_id_to_delete}) eliminado.")
                 else:
                     print("    -> No se encontró ningún picking 'RET' borrador. No se requiere eliminación.")
-            
-            # --- FIN DE LÓGICA DE TRANSACCIÓN ---
-
             # 4. Hacer COMMIT de TODA la transacción
             conn.commit()
             print("[DB-SAVE-LIQ] Transacción completada (COMMIT).")
-            
             # Restaurar la cursor_factory por defecto (buena práctica)
             conn.cursor_factory = None 
             return True, "Progreso de liquidación guardado."
-
     except Exception as e:
         print(f"[ERROR] en save_liquidation_progress: {e}")
         traceback.print_exc()
-        
         # 5. Hacer ROLLBACK si algo falló
         if conn:
             conn.rollback() 
-            
         return False, f"Error al guardar borrador: {e}"
-    
     finally:
         # 6. Devolver la conexión al pool SIEMPRE
         if conn:
