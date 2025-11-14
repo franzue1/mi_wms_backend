@@ -81,10 +81,17 @@ async def get_pickings_count(
         raise HTTPException(status_code=500, detail=f"Error al contar pickings: {e}")
 
 @router.get("/{picking_id}", response_model=schemas.PickingResponse)
-async def get_picking_details(picking_id: int, auth: AuthDependency):
+async def get_picking_details(
+    picking_id: int, 
+    auth: AuthDependency, 
+    company_id: int = Query(...)  # <-- 1. Requerir company_id desde la URL
+):
     if "operations.can_view" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
-    picking_header, picking_moves_raw = db.get_picking_details(picking_id)
+    
+    # 2. Pasar picking_id Y company_id a la función de base de datos
+    picking_header, picking_moves_raw = db.get_picking_details(picking_id, company_id) 
+
     if not picking_header:
         raise HTTPException(status_code=404, detail="Albarán no encontrado")
     response_data = dict(picking_header)
@@ -564,8 +571,16 @@ async def create_draft_picking(data: PickingCreateRequest, auth: AuthDependency)
             company_id=data.company_id,
             responsible_user=data.responsible_user
         )
-        # Devolvemos el picking recién creado
-        return await get_picking_details(new_picking_id, auth)
+        # Devolvemos el picking recién creado, llamando a la BD directamente
+        picking_header, picking_moves_raw = db.get_picking_details(new_picking_id, data.company_id)
+        
+        if not picking_header:
+            raise HTTPException(status_code=404, detail="Albarán creado pero no encontrado")
+        
+        response_data = dict(picking_header)
+        response_data["moves"] = [dict(move) for move in picking_moves_raw]
+        return response_data
+
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al crear albarán: {e}")
@@ -620,32 +635,30 @@ class PickingHeaderUpdate(BaseModel):
     purchase_order: Optional[str] = None
     custom_operation_type: Optional[str] = None
     partner_id: Optional[int] = None
+    adjustment_reason: Optional[str] = None
+    loss_confirmation: Optional[str] = None
+    notes: Optional[str] = None
 
 @router.put("/{picking_id}/header", status_code=200)
 async def update_picking_header(picking_id: int, data: PickingHeaderUpdate, auth: AuthDependency):
-    """ Actualiza campos específicos de la cabecera de un albarán. """
-    if "operations.can_edit" not in auth.permissions:
+    """ 
+    [CORREGIDO] Actualiza campos específicos de la cabecera de un albarán.
+    Ahora incluye campos de Ajuste.
+    """
+    if "operations.can_edit" not in auth.permissions and "adjustments.can_edit" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
     try:
-# --- ¡CORREGIDO! ---
+        update_data = data.dict(exclude_unset=True)
         await asyncio.to_thread(
             db.update_picking_header,
             pid=picking_id,
-            src_id=data.location_src_id,
-            dest_id=data.location_dest_id,
-            ref=data.partner_ref,
-            date_transfer=data.date_transfer,
-            purchase_order=data.purchase_order,
-            custom_op_type=data.custom_operation_type,
-            partner_id=data.partner_id
+            updates=update_data # Pasamos el diccionario de actualizaciones
         )
-        # --- FIN CORRECCIÓN! ---
-        
         return {"message": "Cabecera actualizada."}
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al actualizar cabecera: {e}")
-
+    
 class StockMoveCreate(BaseModel):
     product_id: int
     qty: float
@@ -655,21 +668,26 @@ class StockMoveCreate(BaseModel):
     partner_id: Optional[int] = None
 
 @router.post("/{picking_id}/moves", response_model=dict, status_code=201)
-async def add_stock_move(picking_id: int, move_data: StockMoveCreate, auth: AuthDependency):
+async def add_stock_move(
+    picking_id: int, 
+    move_data: StockMoveCreate, 
+    auth: AuthDependency,
+    company_id: int = Query(...) # <-- 1. REQUERIR company_id
+):
     """ 
     Añade una nueva línea (stock_move) a un albarán 'draft'.
-    (OPTIMIZADO) Devuelve el objeto completo de la línea creada.
+    ...
     """
     if "operations.can_edit" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
     try:
-        # Esta función ahora devuelve un DictRow completo
         new_move_object = db.add_stock_move_to_picking(
             picking_id=picking_id,
             product_id=move_data.product_id,
             qty=move_data.qty,
             loc_src_id=move_data.loc_src_id,
             loc_dest_id=move_data.loc_dest_id,
+            company_id=company_id, # <-- 2. PASAR company_id
             price_unit=move_data.price_unit,
             partner_id=move_data.partner_id
         )
@@ -695,17 +713,24 @@ class MoveQuantityUpdate(BaseModel):
     quantity: float
 
 @router.put("/moves/{move_id}/quantity", response_model=dict, status_code=200)
-async def update_move_quantity(move_id: int, data: MoveQuantityUpdate, auth: AuthDependency):
+async def update_move_quantity(
+    move_id: int, 
+    data: MoveQuantityUpdate, 
+    auth: AuthDependency,
+    company_id: int = Query(...) # <-- 1. REQUERIR company_id
+):
     """ 
     Actualiza la cantidad de una línea 'draft'.
-    (OPTIMIZADO) Devuelve el objeto completo de la línea actualizada.
+    ...
     """
     if "operations.can_edit" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
     try:
-        # Esta función ahora devuelve un DictRow completo
-        updated_move_object = db.update_move_quantity_done(move_id, data.quantity)
-        
+        updated_move_object = db.update_move_quantity_done(
+            move_id, 
+            data.quantity, 
+            company_id # <-- 2. PASAR company_id
+        )
         if updated_move_object:
             # Convertimos el DictRow a un dict normal y lo devolvemos
             return dict(updated_move_object)

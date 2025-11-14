@@ -188,11 +188,9 @@ class PickingResponse(BaseModel):
     partner_id: Optional[int] = None
     partner_ref: Optional[str] = None
     purchase_order: Optional[str] = None
-    
-    # --- ¡AÑADE ESTA LÍNEA AQUÍ! ---
     date_transfer: Optional[date] = None
-    # ---------------------------------
-    
+    service_act_number: Optional[str] = None
+    attention_date: Optional[date] = None
     # Lista de líneas de movimiento
     moves: List[StockMoveResponse] = []
 
@@ -475,3 +473,36 @@ class StockDetailResponse(BaseModel):
     class Config:
         from_attributes = True # Para que funcione con los objetos de la BD
 
+class LiquidationDropdowns(BaseModel):
+    """
+    Schemas para los dropdowns de la vista de liquidación.
+    (Versión mejorada y movida al final del archivo)
+    """
+    warehouses: List[WarehouseSimple] = []
+    locations: List[LocationResponse] = []
+    all_products: List[ProductResponse] = []
+
+    class Config:
+        from_attributes = True
+
+class LiquidationDetailsResponse(BaseModel):
+    """
+    El JSON 'combo' completo para la vista de detalle de liquidación.
+    """
+    wo_data: WorkOrderResponse
+    picking_consumo: Optional[PickingResponse] = None
+    moves_consumo: List[StockMoveResponse] = []
+    serials_consumo: Dict[int, Dict[str, float]] = {}
+    
+    picking_retiro: Optional[PickingResponse] = None
+    moves_retiro: List[StockMoveResponse] = []
+    serials_retiro: Dict[int, Dict[str, float]] = {}
+    
+    dropdowns: LiquidationDropdowns
+    
+    class Config:
+        from_attributes = True
+
+class StockCheckRequest(BaseModel):
+    location_id: int
+    product_ids: List[int]

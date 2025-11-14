@@ -2,7 +2,7 @@
 import psycopg2
 import psycopg2.extras # Para acceder a los datos como diccionario
 import psycopg2.extensions
-import psycopg2.pool # <-- 1. IMPORTAR EL POOL
+import psycopg2.pool
 import os
 from datetime import datetime, date, timedelta
 import traceback
@@ -64,6 +64,7 @@ def init_db_pool():
         print(f"!!! ERROR CRÍTICO AL CREAR EL POOL DE BD !!!\n{e}")
         traceback.print_exc()
         raise
+
 
 def execute_query(query, params=(), fetchone=False, fetchall=False):
     """
@@ -162,10 +163,31 @@ def create_schema(conn):
 
     # --- Tablas Principales (sin FKs) ---
     cursor.execute("CREATE TABLE IF NOT EXISTS companies (id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL);")
-    cursor.execute("CREATE TABLE IF NOT EXISTS product_categories (id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL);")
-    cursor.execute("CREATE TABLE IF NOT EXISTS uom (id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL);")
-    cursor.execute("CREATE TABLE IF NOT EXISTS warehouse_categories (id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL);")
-    cursor.execute("CREATE TABLE IF NOT EXISTS partner_categories (id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL);")
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS product_categories (
+            id SERIAL PRIMARY KEY,
+            company_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            UNIQUE (company_id, name)
+        );
+    """)
+    cursor.execute("CREATE TABLE IF NOT EXISTS uom (id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL);") # <-- UOM SE QUEDA IGUAL (GLOBAL)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS warehouse_categories (
+            id SERIAL PRIMARY KEY,
+            company_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            UNIQUE (company_id, name)
+        );
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS partner_categories (
+            id SERIAL PRIMARY KEY,
+            company_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            UNIQUE (company_id, name)
+        );
+    """)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS operation_types (
             id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL, code TEXT NOT NULL, description TEXT,
@@ -270,6 +292,15 @@ def create_schema(conn):
     # --- ¡NUEVO! Añadir Claves Foráneas (FOREIGN KEY) ---
     # (Esto se hace al final y es seguro ejecutarlo múltiples veces)
     print(" -> Verificando/Añadiendo Claves Foráneas (FKs)...")
+    try:
+        cursor.execute("ALTER TABLE product_categories ADD CONSTRAINT fk_company FOREIGN KEY (company_id) REFERENCES companies(id);")
+    except psycopg2.Error: pass
+    try:
+        cursor.execute("ALTER TABLE warehouse_categories ADD CONSTRAINT fk_company FOREIGN KEY (company_id) REFERENCES companies(id);")
+    except psycopg2.Error: pass
+    try:
+        cursor.execute("ALTER TABLE partner_categories ADD CONSTRAINT fk_company FOREIGN KEY (company_id) REFERENCES companies(id);")
+    except psycopg2.Error: pass
     try:
         cursor.execute("ALTER TABLE products ADD CONSTRAINT fk_category FOREIGN KEY (category_id) REFERENCES product_categories(id);")
     except psycopg2.Error: pass # Ignorar si ya existe
@@ -403,19 +434,19 @@ def create_schema(conn):
     conn.commit()
 
 def create_initial_data(conn):
-    cursor = conn.cursor()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor) # Usar DictCursor
     print(" -> Creando datos iniciales (versión PostgreSQL)...")
 
     # --- 1. Empresa ---
     cursor.execute("INSERT INTO companies (name) VALUES (%s) ON CONFLICT (name) DO NOTHING RETURNING id", ("Mi Empresa Principal",))
     default_company_id_row = cursor.fetchone()
     if default_company_id_row:
-        default_company_id = default_company_id_row[0]
+        default_company_id = default_company_id_row['id']
     else:
         cursor.execute("SELECT id FROM companies WHERE name = %s", ("Mi Empresa Principal",))
         default_company_id_row = cursor.fetchone()
         if not default_company_id_row: raise Exception("No se pudo crear o encontrar la compañía principal.")
-        default_company_id = default_company_id_row[0]
+        default_company_id = default_company_id_row['id']
 
     # --- 2. Ubicaciones Virtuales ---
     locations_data = [
@@ -426,7 +457,7 @@ def create_initial_data(conn):
     ]
     cursor.executemany("INSERT INTO locations (company_id, name, path, type, category) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (path) DO NOTHING", locations_data)
 
-    # --- 3. Tipos de Operación ---
+    # --- 3. Tipos de Operación (Estos son globales, no llevan company_id) ---
     op_types = [
         ("Compra Nacional", "IN", "Entrada de mercancía de proveedor.", "vendor", "internal"),
         ("Consignación Recibida", "IN", "Entrada de mercancía propiedad de cliente.", "customer", "internal"),
@@ -441,49 +472,70 @@ def create_initial_data(conn):
     ]
     cursor.executemany("INSERT INTO operation_types (name, code, description, source_location_category, destination_location_category) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (name) DO NOTHING", op_types)
 
-    # --- 4. Categorías de Almacén ---
-    wh_categories = [("ALMACEN PRINCIPAL",), ("CONTRATISTA",)]
-    cursor.executemany("INSERT INTO warehouse_categories (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", wh_categories)
+    # --- ¡INICIO DE LA CORRECCIÓN! ---
+    
+    # --- 4. Categorías de Almacén (Ahora con company_id) ---
+    wh_categories = [
+        (default_company_id, "ALMACEN PRINCIPAL"),
+        (default_company_id, "CONTRATISTA")
+    ]
+    cursor.executemany(
+        "INSERT INTO warehouse_categories (company_id, name) VALUES (%s, %s) ON CONFLICT (company_id, name) DO NOTHING", 
+        wh_categories
+    )
 
-    # --- 5. Categorías de Partner ---
-    partner_categories = [("Proveedor Externo",), ("Proveedor Cliente",)]
-    cursor.executemany("INSERT INTO partner_categories (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", partner_categories)
+    # --- 5. Categorías de Partner (Ahora con company_id) ---
+    partner_categories = [
+        (default_company_id, "Proveedor Externo"),
+        (default_company_id, "Proveedor Cliente")
+    ]
+    cursor.executemany(
+        "INSERT INTO partner_categories (company_id, name) VALUES (%s, %s) ON CONFLICT (company_id, name) DO NOTHING", 
+        partner_categories
+    )
     conn.commit() # Hacemos commit aquí para que las siguientes SELECT funcionen
 
     # --- 6. Proveedores por defecto (con verificación) ---
-    cursor.execute("SELECT id FROM partner_categories WHERE name = %s", ("Proveedor Cliente",))
+    cursor.execute("SELECT id FROM partner_categories WHERE name = %s AND company_id = %s", ("Proveedor Cliente", default_company_id))
     cat_cliente_row = cursor.fetchone()
     if not cat_cliente_row: raise Exception("No se encontró la categoría 'Proveedor Cliente'")
-    cat_cliente_id = cat_cliente_row[0]
+    cat_cliente_id = cat_cliente_row['id']
 
-    cursor.execute("SELECT id FROM partner_categories WHERE name = %s", ("Proveedor Externo",))
+    cursor.execute("SELECT id FROM partner_categories WHERE name = %s AND company_id = %s", ("Proveedor Externo", default_company_id))
     cat_externo_row = cursor.fetchone()
     if not cat_externo_row: raise Exception("No se encontró la categoría 'Proveedor Externo'")
-    cat_externo_id = cat_externo_row[0]
+    cat_externo_id = cat_externo_row['id']
     
     cursor.execute("INSERT INTO partners (company_id, name, category_id) VALUES (%s, %s, %s) ON CONFLICT (company_id, name) DO NOTHING", (default_company_id, "Cliente Varios", cat_cliente_id))
     cursor.execute("INSERT INTO partners (company_id, name, category_id) VALUES (%s, %s, %s) ON CONFLICT (company_id, name) DO NOTHING", (default_company_id, "Proveedor Varios", cat_externo_id))
 
     # --- 7. Datos Maestros (Productos, etc.) ---
-    cursor.execute("INSERT INTO product_categories (name) VALUES (%s) ON CONFLICT (name) DO NOTHING RETURNING id", ('General',))
+    
+    # --- Categoría de Producto (Ahora con company_id) ---
+    cursor.execute(
+        "INSERT INTO product_categories (company_id, name) VALUES (%s, %s) ON CONFLICT (company_id, name) DO NOTHING RETURNING id", 
+        (default_company_id, 'General')
+    )
     general_cat_id_row = cursor.fetchone()
     if general_cat_id_row:
-        general_cat_id = general_cat_id_row[0]
+        general_cat_id = general_cat_id_row['id']
     else:
-        cursor.execute("SELECT id FROM product_categories WHERE name = %s", ('General',))
+        cursor.execute("SELECT id FROM product_categories WHERE name = %s AND company_id = %s", ('General', default_company_id))
         general_cat_id_row = cursor.fetchone()
         if not general_cat_id_row: raise Exception("No se pudo crear o encontrar la categoría 'General'")
-        general_cat_id = general_cat_id_row[0]
+        general_cat_id = general_cat_id_row['id']
+
+    # --- FIN DE LA CORRECCIÓN ---
 
     cursor.execute("INSERT INTO uom (name) VALUES (%s) ON CONFLICT (name) DO NOTHING RETURNING id", ('Unidades',))
     uom_unidades_id_row = cursor.fetchone()
     if uom_unidades_id_row:
-        uom_unidades_id = uom_unidades_id_row[0]
+        uom_unidades_id = uom_unidades_id_row['id']
     else:
         cursor.execute("SELECT id FROM uom WHERE name = %s", ('Unidades',))
         uom_unidades_id_row = cursor.fetchone()
         if not uom_unidades_id_row: raise Exception("No se pudo crear o encontrar la UdM 'Unidades'")
-        uom_unidades_id = uom_unidades_id_row[0]
+        uom_unidades_id = uom_unidades_id_row['id']
 
     products_to_create = [
         (default_company_id, "Producto de Prueba", "PRUEBA001", general_cat_id, "none", uom_unidades_id, 'owned', 0),
@@ -497,22 +549,21 @@ def create_initial_data(conn):
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (sku) DO NOTHING
     """, products_to_create)
     
-    # --- 8. Creamos los ALMACENES por defecto (AJUSTADO) ---
-    cursor.execute("SELECT id, name FROM warehouse_categories")
+    # --- 8. Creamos los ALMACENES por defecto ---
+    cursor.execute("SELECT id, name FROM warehouse_categories WHERE company_id = %s", (default_company_id,))
     all_wh_categories_actual = cursor.fetchall()
     used_codes = set() 
 
-    principal_cat = next((cat for cat in all_wh_categories_actual if cat[1] == "ALMACEN PRINCIPAL"), None)
+    principal_cat = next((cat for cat in all_wh_categories_actual if cat['name'] == "ALMACEN PRINCIPAL"), None)
     if principal_cat:
-        # ¡CAMBIO! Pasamos 'cursor' en lugar de 'conn'
-        create_warehouse_with_data(cursor, "Almacén Lima", "LIMA", default_company_id, principal_cat[0], for_existing=False) 
+        create_warehouse_with_data(cursor, "Almacén Lima", "LIMA", default_company_id, principal_cat['id'], for_existing=False) 
         used_codes.add("LIMA") 
 
     for category in all_wh_categories_actual:
-        if category[1] == "ALMACEN PRINCIPAL": continue 
+        if category['name'] == "ALMACEN PRINCIPAL": continue 
 
-        cat_id = category[0]
-        cat_name = category[1]
+        cat_id = category['id']
+        cat_name = category['name']
         warehouse_name = f"Almacén {cat_name.title()}"
         base_code = cat_name[:3].upper()
         warehouse_code = base_code
@@ -521,40 +572,45 @@ def create_initial_data(conn):
             warehouse_code = f"{base_code[:2]}{counter}"
             counter += 1
         used_codes.add(warehouse_code)
-        # ¡CAMBIO! Llamamos a _create_warehouse_with_cursor
         _create_warehouse_with_cursor(cursor, warehouse_name, warehouse_code, cat_id, default_company_id, "", "", "", "", "", "activo")
 
-    # --- 9. Creamos el TIPO DE OPERACIÓN de Ajuste (AJUSTADO) ---
-    cursor.execute("SELECT id FROM locations WHERE category='AJUSTE' LIMIT 1")
+    # --- 9. Creamos el TIPO DE OPERACIÓN de Ajuste ---
+    cursor.execute("SELECT id FROM locations WHERE category='AJUSTE' AND company_id = %s LIMIT 1", (default_company_id,))
     adj_loc = cursor.fetchone()
     if adj_loc:
-        adj_loc_id = adj_loc[0]
+        adj_loc_id = adj_loc['id']
         
-        cursor.execute("SELECT id FROM warehouses WHERE category_id = (SELECT id FROM warehouse_categories WHERE name='ALMACEN PRINCIPAL') LIMIT 1")
-        default_wh_id_row = cursor.fetchone()
-        default_wh_id = default_wh_id_row[0] if default_wh_id_row else 1 # Fallback al primer almacén
+        cursor.execute("SELECT id FROM warehouse_categories WHERE name='ALMACEN PRINCIPAL' AND company_id = %s LIMIT 1", (default_company_id,))
+        wh_cat_id_row = cursor.fetchone()
         
-        # ¡CAMBIO! %s y ON CONFLICT
-        cursor.execute("""
-            INSERT INTO picking_types (company_id, name, code, warehouse_id, default_location_src_id, default_location_dest_id) 
-            VALUES (%s, %s, 'ADJ', %s, %s, %s) ON CONFLICT (name) DO NOTHING
-        """, (default_company_id, "Ajustes de Inventario", default_wh_id, adj_loc_id, adj_loc_id))
+        if wh_cat_id_row:
+            cursor.execute("SELECT id FROM warehouses WHERE category_id = %s AND company_id = %s LIMIT 1", (wh_cat_id_row['id'], default_company_id))
+            default_wh_id_row = cursor.fetchone()
+            default_wh_id = default_wh_id_row['id'] if default_wh_id_row else 1
+            
+            cursor.execute("""
+                INSERT INTO picking_types (company_id, name, code, warehouse_id, default_location_src_id, default_location_dest_id) 
+                VALUES (%s, %s, 'ADJ', %s, %s, %s) ON CONFLICT (name) DO NOTHING
+            """, (default_company_id, "Ajustes de Inventario", default_wh_id, adj_loc_id, adj_loc_id))
+        else:
+            print("[WARN] No se encontró categoría 'ALMACEN PRINCIPAL'. No se creó el tipo de operación ADJ.")
     else:
         print("[WARN] No se encontró ubicación de ajuste (category='AJUSTE'). No se creó el tipo de operación ADJ.")
 
-    # --- 9. Crear datos de RBAC (con verificación) ---
+    # --- 9. Crear datos de RBAC (sin cambios) ---
     print(" -> Creando datos iniciales de RBAC (Usuarios, Roles, Permisos)...")
     try:
         cursor.execute("INSERT INTO roles (name, description) VALUES (%s, %s) ON CONFLICT (name) DO NOTHING RETURNING id", ("Administrador", "Acceso total al sistema"))
         admin_role_id_row = cursor.fetchone()
         if admin_role_id_row:
-            admin_role_id = admin_role_id_row[0]
+            admin_role_id = admin_role_id_row['id']
         else:
             cursor.execute("SELECT id FROM roles WHERE name = %s", ("Administrador",))
             admin_role_id_row = cursor.fetchone()
             if not admin_role_id_row: raise Exception("No se pudo crear o encontrar el rol 'Administrador'")
-            admin_role_id = admin_role_id_row[0]
+            admin_role_id = admin_role_id_row['id']
         
+        # ... (resto de tu código RBAC sin cambios) ...
         cursor.execute("INSERT INTO roles (name, description) VALUES (%s, %s) ON CONFLICT (name) DO NOTHING", ("Liquidador", "Puede gestionar liquidaciones"))
         cursor.execute("INSERT INTO roles (name, description) VALUES (%s, %s) ON CONFLICT (name) DO NOTHING", ("Asistente de Almacén", "Puede gestionar operaciones de almacén"))
 
@@ -590,12 +646,12 @@ def create_initial_data(conn):
             cursor.execute("INSERT INTO permissions (key, description) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING RETURNING id", (key, desc))
             perm_id_row = cursor.fetchone()
             if perm_id_row:
-                perm_id = perm_id_row[0]
+                perm_id = perm_id_row['id']
             else:
                 cursor.execute("SELECT id FROM permissions WHERE key = %s", (key,))
                 perm_id_row = cursor.fetchone()
                 if not perm_id_row: raise Exception(f"No se pudo crear o encontrar el permiso '{key}'")
-                perm_id = perm_id_row[0]
+                perm_id = perm_id_row['id']
             permission_ids[key] = perm_id
 
         admin_permissions_to_insert = [(admin_role_id, perm_id) for perm_id in permission_ids.values()]
@@ -610,7 +666,6 @@ def create_initial_data(conn):
     conn.commit()
     print("Datos iniciales de PostgreSQL creados/verificados.")
 
-
 def hash_password(password):
     """Genera un hash SHA-256 para la contraseña."""
     return hashlib.sha256(password.encode('utf-8')).hexdigest()
@@ -619,82 +674,56 @@ def check_password(hashed_password, plain_password):
     """Verifica si la contraseña coincide con el hash."""
     return hashed_password == hash_password(plain_password)
 
-def get_product_categories(): return execute_query("SELECT id, name FROM product_categories ORDER BY name", fetchall=True)
-
-def create_product_category(name):
-    """
-    Crea una nueva categoría de producto en la base de datos.
-    """
-    query = """
-        INSERT INTO product_categories (name) 
-        VALUES (%s) 
-        RETURNING id
-    """
-    params = (name,)
-    
+def get_product_categories(company_id: int):
+    """Obtiene categorías de producto FILTRADAS POR COMPAÑÍA."""
+    return execute_query(
+        "SELECT id, name FROM product_categories WHERE company_id = %s ORDER BY name", 
+        (company_id,), 
+        fetchall=True
+    )
+def create_product_category(name: str, company_id: int):
+    """Crea una categoría de producto PARA UNA COMPAÑÍA."""
     try:
-        # ¡Aquí la usamos!
-        result = execute_commit_query(query, params, fetchone=True)
-        
-        if result:
-            return result['id'] # O result[0] dependiendo de tu cursor
-        else:
-            raise Exception("No se pudo crear la categoría o no se retornó el ID.")
-            
+        new_item = execute_commit_query(
+            "INSERT INTO product_categories (name, company_id) VALUES (%s, %s) RETURNING id, name",
+            (name, company_id),
+            fetchone=True
+        )
+        return new_item
     except Exception as e:
-        print(f"Error específico al intentar crear la categoría '{name}'")
+        if "product_categories_company_id_name_key" in str(e): # Error de duplicado
+            raise ValueError(f"La categoría '{name}' ya existe para esta compañía.")
         raise e
 
-def update_product_category(cat_id, name):
-    """
-    Actualiza el nombre de una categoría de producto usando el pool de conexiones.
-    """
-    query = "UPDATE product_categories SET name = %s WHERE id = %s"
-    params = (name, cat_id)
-    
+def update_product_category(category_id: int, name: str, company_id: int):
+    """Actualiza una categoría de producto, verificando la compañía."""
     try:
-        # 1. Usamos la función centralizada de escritura.
-        # No necesitamos 'fetchone=True' porque un UPDATE simple no retorna nada.
-        execute_commit_query(query, params)
-        
-    except Exception as e: 
-        # 2. Mantenemos la lógica de error personalizada.
-        # execute_commit_query re-lanza la excepción, así que podemos
-        # capturarla aquí para darle un formato amigable.
-        
-        if "product_categories_name_key" in str(e): 
-            raise ValueError(f"La categoría de producto '{name}' ya existe.")
-        else:
-            # Re-lanzar cualquier otro error de BD
-            raise e
-    
-def delete_product_category(cat_id):
-    """
-    Elimina una categoría de producto usando el pool de conexiones.
-    Maneja errores de integridad referencial (foreign key).
-    """
-    query = "DELETE FROM product_categories WHERE id = %s"
-    params = (cat_id,)
-    
-    try:
-        # 1. Usamos la función centralizada de escritura
-        # No se necesita fetchone=True para un DELETE
-        execute_commit_query(query, params)
-        
-        # 2. Si execute_commit_query no lanzó error, fue exitoso
-        return True, "Categoría de producto eliminada."
-        
+        updated_item = execute_commit_query(
+            "UPDATE product_categories SET name = %s WHERE id = %s AND company_id = %s RETURNING id, name",
+            (name, category_id, company_id),
+            fetchone=True
+        )
+        if not updated_item:
+            raise ValueError("Categoría no encontrada o no pertenece a esta compañía.")
+        return updated_item
     except Exception as e:
-        # 3. execute_commit_query re-lanza el error de la BD,
-        #    así que podemos inspeccionarlo aquí.
-        
-        # Detectar error de llave foránea
-        if "violates foreign key constraint" in str(e):
-            return False, "No se puede eliminar: Esta categoría está asignada a uno o más productos."
-        
-        # Cualquier otro error
-        print(f"[DB-ERROR] delete_product_category: {e}")
-        return False, f"Error al eliminar: {e}"
+        if "product_categories_company_id_name_key" in str(e):
+            raise ValueError(f"El nombre '{name}' ya existe (duplicado).")
+        raise e
+    
+def delete_product_category(category_id: int, company_id: int):
+    """Elimina una categoría de producto, verificando la compañía."""
+    try:
+        execute_commit_query(
+            "DELETE FROM product_categories WHERE id = %s AND company_id = %s",
+            (category_id, company_id)
+        )
+        return True, "Categoría eliminada."
+    except Exception as e:
+        # (Si falla por FK, e.g. un producto la usa, aquí se captura)
+        if "foreign key constraint" in str(e):
+            return False, "Error: Esta categoría ya está siendo usada por productos."
+        return False, f"Error inesperado: {e}"
 
 def delete_product(product_id):
     """
@@ -1337,12 +1366,10 @@ def check_stock_for_picking(picking_id):
 
 def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_tracking):
     """
-    (VERSIÓN CORREGIDA) Prepara todos los movimientos y luego los ejecuta.
-    Maneja correctamente las cantidades negativas de 'ADJ'.
+    (CORREGIDO) Prepara y ejecuta movimientos.
+    Distingue entre Operaciones (IN/OUT) y Ajustes/Transferencias (ADJ/INT).
     """
     
-    # --- ¡CORRECCIÓN 1! ---
-    # Obtenemos el albarán Y su 'type_code' al inicio
     cursor.execute("SELECT p.*, pt.code as type_code FROM pickings p JOIN picking_types pt ON p.picking_type_id = pt.id WHERE p.id = %s", (picking_id,))
     picking = cursor.fetchone()
     
@@ -1352,13 +1379,24 @@ def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_track
     cursor.execute("SELECT sm.*, p.tracking FROM stock_moves sm JOIN products p ON sm.product_id = p.id WHERE sm.picking_id = %s", (picking_id,))
     all_moves = cursor.fetchall()
 
-    # Obtener IDs de ubicaciones virtuales (lógica sin cambios)
-    cursor.execute("SELECT id FROM locations WHERE category = 'PROVEEDOR'")
-    vendor_loc_id = cursor.fetchone()['id']
-    cursor.execute("SELECT id FROM locations WHERE category = 'CLIENTE'")
-    customer_loc_id = cursor.fetchone()['id']
-    cursor.execute("SELECT id FROM locations WHERE category = 'CONTRATA CLIENTE'")
-    contractor_customer_loc_id = cursor.fetchone()['id']
+    # --- Obtener IDs de ubicaciones virtuales (Solo para IN/OUT) ---
+    vendor_loc_id = None
+    customer_loc_id = None
+    contractor_customer_loc_id = None
+    
+    # Solo cargamos las ubicaciones virtuales si las necesitamos
+    if picking['type_code'] == 'IN' or picking['type_code'] == 'OUT':
+        cursor.execute("SELECT id FROM locations WHERE category = 'PROVEEDOR'")
+        vendor_loc_id_row = cursor.fetchone()
+        vendor_loc_id = vendor_loc_id_row['id'] if vendor_loc_id_row else None
+        
+        cursor.execute("SELECT id FROM locations WHERE category = 'CLIENTE'")
+        customer_loc_id_row = cursor.fetchone()
+        customer_loc_id = customer_loc_id_row['id'] if customer_loc_id_row else None
+
+        cursor.execute("SELECT id FROM locations WHERE category = 'CONTRATA CLIENTE'")
+        contractor_customer_loc_id_row = cursor.fetchone()
+        contractor_customer_loc_id = contractor_customer_loc_id_row['id'] if contractor_customer_loc_id_row else None
     
     processed_moves = []
     for move in all_moves:
@@ -1366,28 +1404,47 @@ def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_track
         source_loc_id = move_dict['location_src_id']
         dest_loc_id = move_dict['location_dest_id']
         
-        # Lógica de reemplazo de ubicaciones (sin cambios)
-        if picking['type_code'] == 'IN':
-            source_loc_id = vendor_loc_id
-        elif picking['type_code'] == 'OUT':
-            op_rule = get_operation_type_details(picking['custom_operation_type'])
-            if op_rule:
-                if op_rule['destination_location_category'] == 'CLIENTE': dest_loc_id = customer_loc_id
-                elif op_rule['destination_location_category'] == 'PROVEEDOR': dest_loc_id = vendor_loc_id
-                elif op_rule['destination_location_category'] == 'CONTRATA CLIENTE': dest_loc_id = contractor_customer_loc_id
+        # --- ¡INICIO DE LA CORRECCIÓN! ---
+        # Esta lógica de reemplazo ahora SOLO se aplica a IN y OUT.
+        # ADJ (Ajustes) e INT (Transferencias) usarán las IDs
+        # exactas que tienen guardadas.
         
+        if picking['type_code'] == 'IN':
+            if not vendor_loc_id: raise Exception("Configuración de Ubicación Virtual 'PROVEEDOR' no encontrada.")
+            source_loc_id = vendor_loc_id # Sobrescribir origen
+            
+        elif picking['type_code'] == 'OUT':
+            op_rule = get_operation_type_details_by_name(picking['custom_operation_type']) # ¡Usar la función con caché!
+            if op_rule:
+                if op_rule['destination_location_category'] == 'CLIENTE':
+                    if not customer_loc_id: raise Exception("Configuración de Ubicación Virtual 'CLIENTE' no encontrada.")
+                    dest_loc_id = customer_loc_id # Sobrescribir destino
+                elif op_rule['destination_location_category'] == 'PROVEEDOR':
+                    if not vendor_loc_id: raise Exception("Configuración de Ubicación Virtual 'PROVEEDOR' no encontrada.")
+                    dest_loc_id = vendor_loc_id # Sobrescribir destino
+                elif op_rule['destination_location_category'] == 'CONTRATA CLIENTE':
+                    if not contractor_customer_loc_id: raise Exception("Configuración de Ubicación Virtual 'CONTRATA CLIENTE' no encontrada.")
+                    dest_loc_id = contractor_customer_loc_id # Sobrescribir destino
+            else:
+                # Fallback si no hay regla (ej. un 'OUT' antiguo)
+                if not customer_loc_id: raise Exception("Configuración de Ubicación Virtual 'CLIENTE' no encontrada.")
+                dest_loc_id = customer_loc_id
+        
+        # (Para 'ADJ' e 'INT', las variables source_loc_id y dest_loc_id
+        # permanecen sin cambios, tal como las seleccionó el usuario).
+        # --- FIN DE LA CORRECCIÓN ---
+
         move_dict['final_source_id'] = source_loc_id
         move_dict['final_dest_id'] = dest_loc_id
         processed_moves.append(move_dict)
 
-    # Aquí es donde estaba el error. Ahora pasamos el 'picking_type_code'
-    # que obtuvimos al inicio.
+    # --- Pre-Validación de Stock (Sin cambios) ---
     success, message = _check_stock_with_cursor(cursor, picking_id, picking['type_code'])
     if not success:
         print(f"[DEBUG-STOCK] PRE-VALIDACIÓN FALLIDA: {message}")
         return False, message
 
-    # (El resto de esta función (Fase 2) no necesita cambios)
+    # --- Fase 2: Ejecución de Movimientos (Sin cambios) ---
     print(f"[DEBUG-STOCK] FASE 2: Ejecutando movimientos de stock...")
     processed_serials_in_transaction = set()
 
@@ -1395,6 +1452,9 @@ def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_track
         product_id = move['product_id']; qty_done = move['quantity_done']
         final_source_id = move['final_source_id']; final_dest_id = move['final_dest_id']
         product_tracking = move['tracking']
+        
+        # ¡Este log ahora mostrará los IDs correctos para tu ajuste!
+        # (Ej: ... de loc_id=5 a loc_id=3)
         print(f"     - Moviendo Producto ID {product_id}: {qty_done} uds. de loc_id={final_source_id} a loc_id={final_dest_id}")
 
         if move['tracking'] == 'none':
@@ -1413,7 +1473,7 @@ def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_track
                 processed_serials_in_transaction.add(serial_key)
                 
                 lot_row = get_lot_by_name(cursor, product_id, lot_name)
-                lot_id = lot_row[0] if lot_row else create_lot(cursor, product_id, lot_name)
+                lot_id = lot_row['id'] if lot_row else create_lot(cursor, product_id, lot_name) # Asumiendo DictRow
                 
                 if picking['type_code'] == 'IN' and product_tracking == 'serial':
                     cursor.execute(
@@ -1428,15 +1488,17 @@ def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_track
                         return False, f"Error: La serie única '{lot_name}' ya existe con stock en el inventario."
 
                 if picking['type_code'] == 'ADJ' and qty_done < 0:
-                    update_stock_quant(cursor, product_id, final_source_id, -qty, lot_id)
-                    update_stock_quant(cursor, product_id, final_dest_id, qty, lot_id) 
+                    # Ajuste negativo (ej. -1): Suma a Scrap (destino), Resta de Averiados (origen)
+                    update_stock_quant(cursor, product_id, final_source_id, qty_done, lot_id) # Resta -1
+                    update_stock_quant(cursor, product_id, final_dest_id, -qty_done, lot_id) # Suma 1
                 else:
-                    update_stock_quant(cursor, product_id, final_source_id, -qty, lot_id)
-                    update_stock_quant(cursor, product_id, final_dest_id, qty, lot_id) 
+                    # Ajuste positivo o movimiento normal
+                    update_stock_quant(cursor, product_id, final_source_id, -qty, lot_id) # Resta
+                    update_stock_quant(cursor, product_id, final_dest_id, qty, lot_id) # Suma
                 
                 cursor.execute("INSERT INTO stock_move_lines (move_id, lot_id, qty_done) VALUES (%s, %s, %s)", (move['id'], lot_id, qty))
 
-    # Actualizar estados (sin cambios)
+    # --- Actualizar estados (Sin cambios) ---
     cursor.execute("UPDATE stock_moves SET state = 'done' WHERE picking_id = %s", (picking_id,))
     date_done_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cursor.execute("UPDATE pickings SET state = 'done', date_done = %s WHERE id = %s", (date_done_str, picking_id))
@@ -1700,14 +1762,15 @@ def upsert_product_from_import(company_id, sku, name, category_id, uom_id, track
         if conn:
             db_pool.putconn(conn)
 
-def get_picking_details(picking_id):
+def get_picking_details(picking_id, company_id): # <-- 1. ACEPTAR company_id
     query = """
         SELECT p.*, pt.code as type_code 
         FROM pickings p 
         JOIN picking_types pt ON p.picking_type_id = pt.id 
-        WHERE p.id =  %s
+        WHERE p.id = %(picking_id)s -- <-- 2. Usar placeholder con nombre
     """
-    p_info = execute_query(query, (picking_id,), fetchone=True)
+    # 3. Pasar un diccionario
+    p_info = execute_query(query, {"picking_id": picking_id}, fetchone=True) 
 
     moves_query = """
             SELECT 
@@ -1718,29 +1781,35 @@ def get_picking_details(picking_id):
                 pr.standard_price,
                 sm.cost_at_adjustment
             FROM stock_moves sm 
-            JOIN products pr ON sm.product_id = pr.id
+            JOIN products pr ON (sm.product_id = pr.id AND pr.company_id = %(company_id)s) -- (Este ya estaba bien)
             LEFT JOIN uom u ON pr.uom_id = u.id
-            WHERE sm.picking_id =  %s
+            WHERE sm.picking_id = %(picking_id)s -- <-- 4. Usar placeholder con nombre
         """
-    moves = execute_query(moves_query, (picking_id,), fetchall=True)
+    # 5. Pasar un diccionario con AMBOS valores
+    moves = execute_query(moves_query, {"picking_id": picking_id, "company_id": company_id}, fetchall=True)
     
     return p_info, moves
 
-def add_stock_move_to_picking(picking_id, product_id, qty, loc_src_id, loc_dest_id, price_unit=0, partner_id=None):
+def add_stock_move_to_picking(
+    picking_id, product_id, qty, loc_src_id, loc_dest_id, company_id, # <-- 1. ACEPTAR company_id
+    price_unit=0, partner_id=None
+):
     """
     (OPTIMIZADO) Añade una línea y devuelve el objeto completo
     (con JOIN a productos/uom) que la UI necesita.
     """
     
-    # Usamos una Cláusula WITH (CTE) para insertar y luego seleccionar
-    # los datos unidos en una sola transacción.
+    # 2. TODA la consulta usa placeholders nombrados (%(...))
     query = """
     WITH new_move AS (
         INSERT INTO stock_moves (
             picking_id, product_id, product_uom_qty, quantity_done, 
             location_src_id, location_dest_id, price_unit, partner_id
         ) 
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s) 
+        VALUES (
+            %(picking_id)s, %(product_id)s, %(qty)s, %(qty)s, 
+            %(loc_src_id)s, %(loc_dest_id)s, %(price_unit)s, %(partner_id)s
+        ) 
         RETURNING * -- Devuelve la fila completa de stock_moves
     )
     SELECT 
@@ -1751,16 +1820,26 @@ def add_stock_move_to_picking(picking_id, product_id, qty, loc_src_id, loc_dest_
         pr.standard_price,
         sm.cost_at_adjustment
     FROM new_move sm
-    JOIN products pr ON sm.product_id = pr.id
+    JOIN products pr ON (sm.product_id = pr.id AND pr.company_id = %(company_id)s) -- <-- 3. El company_id ahora funciona
     LEFT JOIN uom u ON pr.uom_id = u.id;
     """
-    params = (picking_id, product_id, qty, qty, loc_src_id, loc_dest_id, price_unit, partner_id)
     
-    # Usamos fetchone=True para obtener el objeto completo
+    # 4. Pasar los parámetros como un DICCIONARIO
+    params = {
+        "picking_id": picking_id,
+        "product_id": product_id,
+        "qty": qty,
+        "loc_src_id": loc_src_id,
+        "loc_dest_id": loc_dest_id,
+        "company_id": company_id,
+        "price_unit": price_unit,
+        "partner_id": partner_id
+    }
+    
     new_move_object = execute_commit_query(query, params, fetchone=True)
     
     if new_move_object:
-        return new_move_object  # Devolvemos el DictRow completo
+        return new_move_object
     else:
         raise Exception("No se pudo crear la línea de stock, no se devolvió objeto.")
 
@@ -2050,54 +2129,70 @@ def get_next_picking_name(picking_type_id):
     return f"{prefix}{str(count + 1).zfill(5)}"
 def get_all_locations(): return execute_query("SELECT id, path FROM locations ORDER BY path", fetchall=True)
 
-def update_picking_header(pid, src_id, dest_id, ref, date_transfer, purchase_order, custom_op_type=None, partner_id=None):
+def update_picking_header(pid: int, updates: dict):
     """
-    [CORREGIDO] Actualiza la cabecera de un albarán usando el pool de conexiones.
-    (Versión Migrada)
+    [OPTIMIZADO] Actualiza dinámicamente los campos de la cabecera de un picking.
+    'updates' es un diccionario.
     """
-    print(f"[DEBUG-DB] 10. DATOS RECIBIDOS EN LA FUNCIÓN DE BASE DE DATOS 'update_picking_header':")
-    print(f"     - pid: {pid}, src_id: {src_id}, dest_id: {dest_id}, partner_id: {partner_id}")
-    print(f"     - ref: '{ref}', date_transfer: '{date_transfer}', purchase_order: '{purchase_order}', custom_op_type: '{custom_op_type}'")
-    
-    query = """UPDATE pickings SET 
-                   location_src_id = %s, 
-                   location_dest_id = %s, 
-                   partner_ref = %s, 
-                   date_transfer = %s, 
-                   purchase_order = %s, 
-                   custom_operation_type = %s, 
-                   partner_id = %s 
-               WHERE id = %s"""
-    params = (src_id, dest_id, ref, date_transfer, purchase_order, custom_op_type, partner_id, pid)
+    if not updates:
+        print(f" -> [DB-WARN] update_picking_header llamado sin actualizaciones para PID: {pid}")
+        return # No hay nada que hacer
 
-    try:
-        # --- ¡CAMBIO CLAVE! ---
-        # Usamos la nueva función que hace commit y usa el pool
-        execute_commit_query(query, params)
-        # --- FIN DEL CAMBIO ---
-        
-        print(f" -> Cabecera {pid} actualizada con TipoOp: {custom_op_type}")
-        return True # Devolver True en éxito
-        
-    except Exception as e:
-        # El error ya fue impreso por execute_commit_query
-        print(f"!!! ERROR en update_picking_header (capturado en la función wrapper): {e}")
-        return False # Devolver False en caso de fallo
+    # Lista de campos permitidos para actualizar
+    ALLOWED_FIELDS = [
+        'location_src_id', 'location_dest_id', 'partner_ref', 'date_transfer',
+        'purchase_order', 'custom_operation_type', 'partner_id',
+        'adjustment_reason', 'loss_confirmation', 'notes', 'responsible_user'
+    ]
+
+    # Filtrar el diccionario 'updates' para incluir solo campos permitidos
+    # y que no sean 'None' (aunque 'None' es válido para resetear)
+    fields_to_update = {}
+    for key, value in updates.items():
+        if key in ALLOWED_FIELDS:
+            # Convertir objetos 'date' a string ISO si es necesario
+            if isinstance(value, date):
+                fields_to_update[key] = value.isoformat()
+            else:
+                fields_to_update[key] = value
+    
+    if not fields_to_update:
+         print(f" -> [DB-WARN] update_picking_header: No hay campos válidos para actualizar para PID: {pid}")
+         return
+
+    # Construir la consulta SQL dinámicamente
+    set_clause_parts = []
+    params = []
+    for key, value in fields_to_update.items():
+        set_clause_parts.append(f"{key} = %s")
+        params.append(value)
+    
+    # Añadir el 'pid' al final para la cláusula WHERE
+    params.append(pid)
+    
+    set_clause = ", ".join(set_clause_parts)
+    
+    query = f"UPDATE pickings SET {set_clause} WHERE id = %s"
+    
+    print(f" -> [DB] Actualizando Picking ID: {pid}. Campos: {list(fields_to_update.keys())}")
+    
+    # execute_commit_query maneja la conexión, cursor y commit
+    execute_commit_query(query, tuple(params))
 
 def get_picking_type_details(type_id): return execute_query("SELECT * FROM picking_types WHERE id =  %s", (type_id,), fetchone=True)
 
-def update_move_quantity_done(move_id, quantity_done):
+def update_move_quantity_done(move_id, quantity_done, company_id): # <-- 1. ACEPTAR company_id
     """
     (OPTIMIZADO) Actualiza la cantidad de un move y devuelve
     el objeto completo (con JOIN a productos/uom) que la UI necesita.
     """
     
-    # Usamos un CTE para actualizar y luego seleccionar
+    # 2. TODA la consulta usa placeholders nombrados (%(...))
     query = """
     WITH updated_move AS (
         UPDATE stock_moves 
-        SET product_uom_qty = %s, quantity_done = %s 
-        WHERE id = %s
+        SET product_uom_qty = %(quantity)s, quantity_done = %(quantity)s 
+        WHERE id = %(move_id)s
         RETURNING * -- Devuelve la fila actualizada de stock_moves
     )
     SELECT 
@@ -2108,99 +2203,72 @@ def update_move_quantity_done(move_id, quantity_done):
         pr.standard_price,
         sm.cost_at_adjustment
     FROM updated_move sm
-    JOIN products pr ON sm.product_id = pr.id
+    JOIN products pr ON (sm.product_id = pr.id AND pr.company_id = %(company_id)s) -- <-- 3. El company_id ahora funciona
     LEFT JOIN uom u ON pr.uom_id = u.id;
     """
-    params = (quantity_done, quantity_done, move_id)
+    # 4. Pasar los parámetros como un DICCIONARIO
+    params = {
+        "quantity": quantity_done,
+        "move_id": move_id,
+        "company_id": company_id
+    }
     
-    # Usamos fetchone=True para obtener el objeto completo
     updated_move_object = execute_commit_query(query, params, fetchone=True)
     
     return updated_move_object # Devolvemos el DictRow completo
-def get_warehouse_categories():
-    return execute_query("SELECT id, name FROM warehouse_categories ORDER BY name", fetchall=True)
 
+def get_warehouse_categories(company_id: int):
+    """Obtiene categorías de almacén FILTRADAS POR COMPAÑÍA."""
+    return execute_query(
+        "SELECT id, name FROM warehouse_categories WHERE company_id = %s ORDER BY name",
+        (company_id,),
+        fetchall=True
+    )
 def get_warehouse_category_details(cat_id):
     return execute_query("SELECT * FROM warehouse_categories WHERE id =  %s", (cat_id,), fetchone=True)
 
-def create_warehouse_category(name):
-    """
-    Crea una nueva categoría de almacén usando el pool de conexiones.
-    Maneja la restricción de nombre único.
-    """
-    query = "INSERT INTO warehouse_categories (name) VALUES (%s) RETURNING id"
-    params = (name,)
-    
+def create_warehouse_category(name: str, company_id: int):
+    """Crea una categoría de almacén PARA UNA COMPAÑÍA."""
     try:
-        # 1. Llamamos a la función de escritura, pidiendo que retorne el resultado
-        result = execute_commit_query(query, params, fetchone=True)
-        
-        if result:
-            new_id = result[0] # O result['id']
-            return new_id
-        else:
-            raise Exception("No se pudo crear la categoría o no se retornó el ID.")
-
-    except Exception as e: 
-        # 2. La lógica para detectar el error de duplicado sigue
-        #    funcionando porque execute_commit_query re-lanza el error.
-        
-        # Ajusta al nombre real del constraint
-        if "warehouse_categories_name_key" in str(e): 
-            raise ValueError(f"La categoría de almacén '{name}' ya existe.")
-        else:
-            # Re-lanzar cualquier otro error de BD
-            raise e
-
-def update_warehouse_category(cat_id, name):
-    """
-    Actualiza el nombre de una categoría de almacén usando el pool de conexiones.
-    Maneja la restricción de nombre único.
-    """
-    query = "UPDATE warehouse_categories SET name = %s WHERE id = %s"
-    params = (name, cat_id)
-    
-    try:
-        # 1. Llamamos a la función de escritura centralizada.
-        # No necesitamos fetchone=True para un UPDATE.
-        execute_commit_query(query, params)
-        
-    except Exception as e: 
-        # 2. La excepción de la BD es re-lanzada por execute_commit_query,
-        #    así que la capturamos aquí para manejarla.
-        
-        if "warehouse_categories_name_key" in str(e): # Nombre del constraint único
-            raise ValueError(f"La categoría de almacén '{name}' ya existe.")
-        else:
-            # Re-lanzar cualquier otro error de BD
-            raise e
-
-def delete_warehouse_category(cat_id):
-    """
-    Elimina una categoría de almacén usando el pool de conexiones.
-    Maneja errores de integridad referencial (foreign key).
-    """
-    query = "DELETE FROM warehouse_categories WHERE id = %s"
-    params = (cat_id,)
-    
-    try:
-        # 1. Usamos la función centralizada de escritura
-        execute_commit_query(query, params)
-        
-        # 2. Si no hubo error, la eliminación fue exitosa
-        return True, "Categoría de almacén eliminada."
-        
+        new_item = execute_commit_query(
+            "INSERT INTO warehouse_categories (name, company_id) VALUES (%s, %s) RETURNING id, name",
+            (name, company_id),
+            fetchone=True
+        )
+        return new_item
     except Exception as e:
-        # 3. execute_commit_query re-lanza el error de la BD,
-        #    así que podemos inspeccionarlo aquí.
-        
-        # Detectar error de llave foránea
-        if "violates foreign key constraint" in str(e):
-            return False, "No se puede eliminar: Esta categoría está en uso por uno o más almacenes."
-        
-        # Cualquier otro error
-        print(f"[DB-ERROR] delete_warehouse_category: {e}")
-        return False, f"Error al eliminar: {e}"
+        if "warehouse_categories_company_id_name_key" in str(e):
+            raise ValueError(f"La categoría '{name}' ya existe para esta compañía.")
+        raise e
+
+def update_warehouse_category(category_id: int, name: str, company_id: int):
+    """Actualiza una categoría de almacén, verificando la compañía."""
+    try:
+        updated_item = execute_commit_query(
+            "UPDATE warehouse_categories SET name = %s WHERE id = %s AND company_id = %s RETURNING id, name",
+            (name, category_id, company_id),
+            fetchone=True
+        )
+        if not updated_item:
+            raise ValueError("Categoría no encontrada o no pertenece a esta compañía.")
+        return updated_item
+    except Exception as e:
+        if "warehouse_categories_company_id_name_key" in str(e):
+            raise ValueError(f"El nombre '{name}' ya existe (duplicado).")
+        raise e
+
+def delete_warehouse_category(category_id: int, company_id: int):
+    """Elimina una categoría de almacén, verificando la compañía."""
+    try:
+        execute_commit_query(
+            "DELETE FROM warehouse_categories WHERE id = %s AND company_id = %s",
+            (category_id, company_id)
+        )
+        return True, "Categoría eliminada."
+    except Exception as e:
+        if "foreign key constraint" in str(e):
+            return False, "Error: Esta categoría ya está siendo usada por almacenes."
+        return False, f"Error inesperado: {e}"
 
 def inactivate_warehouse(warehouse_id):
     """
@@ -2345,8 +2413,52 @@ def validate_warehouse_names(names_to_check):
     return non_existent_names
 
 # --- CRUD PARA CATEGORÍAS DE PROVEEDOR ---
-def get_partner_categories():
-    return execute_query("SELECT id, name FROM partner_categories ORDER BY name", fetchall=True)
+def get_partner_categories(company_id: int):
+    return execute_query(
+        "SELECT id, name FROM partner_categories WHERE company_id = %s ORDER BY name",
+        (company_id,),
+        fetchall=True
+    )
+
+def create_partner_category(name: str, company_id: int):
+    try:
+        new_item = execute_commit_query(
+            "INSERT INTO partner_categories (name, company_id) VALUES (%s, %s) RETURNING id, name",
+            (name, company_id),
+            fetchone=True
+        )
+        return new_item
+    except Exception as e:
+        if "partner_categories_company_id_name_key" in str(e):
+            raise ValueError(f"La categoría '{name}' ya existe para esta compañía.")
+        raise e
+
+def update_partner_category(category_id: int, name: str, company_id: int):
+    try:
+        updated_item = execute_commit_query(
+            "UPDATE partner_categories SET name = %s WHERE id = %s AND company_id = %s RETURNING id, name",
+            (name, category_id, company_id),
+            fetchone=True
+        )
+        if not updated_item:
+            raise ValueError("Categoría no encontrada o no pertenece a esta compañía.")
+        return updated_item
+    except Exception as e:
+        if "partner_categories_company_id_name_key" in str(e):
+            raise ValueError(f"El nombre '{name}' ya existe (duplicado).")
+        raise e
+
+def delete_partner_category(category_id: int, company_id: int):
+    try:
+        execute_commit_query(
+            "DELETE FROM partner_categories WHERE id = %s AND company_id = %s",
+            (category_id, company_id)
+        )
+        return True, "Categoría eliminada."
+    except Exception as e:
+        if "foreign key constraint" in str(e):
+            return False, "Error: Esta categoría ya está siendo usada por socios."
+        return False, f"Error inesperado: {e}"
 
 def get_partner_details_by_id(partner_id: int):
     """
@@ -3131,9 +3243,7 @@ def get_inventory_aging(company_id, tracked_only=True):
     (Versión PostgreSQL)
     """
     buckets = {'0-30 días': 0, '31-60 días': 0, '61-90 días': 0, '+90 días': 0, 'Sin Fecha': 0}
-    
     tracking_filter_sql = "AND p.tracking != 'none'" if tracked_only else ""
-
     # (La consulta CTE es similar, pero la lógica CASE usa resta de fechas)
     query = f"""
         WITH LotCreationDate AS (
@@ -3229,6 +3339,7 @@ def get_inventory_aging_details(company_id, filters={}):
 
     base_query += " ORDER BY aging_days DESC"
     return execute_query(base_query, tuple(params), fetchall=True)
+
 
 def get_product_kardex(company_id, product_id, date_from=None, date_to=None, warehouse_id=None):
     """
@@ -3569,7 +3680,6 @@ def get_stock_coverage_report(company_id, history_days=90, product_filter=None):
     """
     return execute_query(query, tuple(params), fetchall=True)
 
-
 def get_inventory_value_kpis(company_id):
     """
     Calcula el valor total del inventario usando un método estándar y robusto.
@@ -3619,8 +3729,6 @@ def get_inventory_value_kpis(company_id):
     
     kpis['total'] = kpis['pri'] + kpis['tec']
     return kpis
-
-# EN database.py (AÑADE ESTA NUEVA FUNCIÓN)
 
 def get_stock_for_multiple_products(location_id, product_ids: list):
     """
@@ -4110,11 +4218,15 @@ def save_move_lines_for_move(move_id, tracking_data: dict):
         if conn:
             db_pool.putconn(conn) # Devolver la conexión al pool
 
+@functools.lru_cache
 def get_operation_type_details_by_name(name):
     """
     Busca los detalles de una regla de operación por su nombre.
     CORREGIDO: Usa TRIM para ignorar espacios en blanco al inicio/final.
+    ¡AHORA CON CACHÉ!
     """
+    # Este log SÓLO aparecerá cuando la BD es consultada (la 1ra vez)
+    print(f"*** [CACHE-MISS] Consultando BD para Regla: {name} ***")
     return execute_query("SELECT * FROM operation_types WHERE TRIM(name) = TRIM(%s)", (name,), fetchone=True)
 
 def get_partner_id_by_name(name, company_id):
@@ -4607,24 +4719,34 @@ def get_warehouses_count(company_id, filters={}):
     result = execute_query(base_query, tuple(params), fetchone=True)
     return result['total_count'] if result else 0
 
+# (En app/database.py)
+
 def get_products_filtered_sorted(company_id, filters={}, sort_by='name', ascending=True, limit=None, offset=None):
-    """ Obtiene productos filtrados, ordenados y paginados desde la base de datos. """
+    """ 
+    Obtiene productos filtrados, ordenados y paginados.
+    [CORREGIDO] Asegura que se seleccionen todos los campos requeridos por el schema ProductResponse.
+    """
     
-    # --- Consulta Principal Corregida (Selecciona todos los campos del schema) ---
+    # --- ¡INICIO DE LA CORRECCIÓN! ---
+    # Aseguramos que 'p.type' y 'p.company_id' estén en el SELECT
     base_query = """
     SELECT 
         p.id, p.company_id, p.name, p.sku, 
         p.category_id, pc.name as category_name, 
         p.uom_id, u.name as uom_name,
-        p.tracking, p.ownership, p.standard_price, p.type
+        p.tracking, p.ownership, p.standard_price, 
+        p.type  -- Este campo era requerido por el schema
     FROM products p
     LEFT JOIN product_categories pc ON p.category_id = pc.id
     LEFT JOIN uom u ON p.uom_id = u.id
     WHERE p.company_id = %s
     """
+    # --- FIN DE LA CORRECCIÓN ---
+    
     params = [company_id]
     where_clauses = []
 
+    # (El resto de tu lógica de filtros es correcta)
     column_map = {
         'name': "p.name", 'sku': "p.sku", 'category_name': "pc.name",
         'uom_name': "u.name", 'tracking': "p.tracking", 'ownership': "p.ownership"
@@ -4636,7 +4758,7 @@ def get_products_filtered_sorted(company_id, filters={}, sort_by='name', ascendi
         if not sql_column: continue
 
         if key in ['name', 'sku']:
-            where_clauses.append(f"{sql_column} ILIKE %s") # Usar ILIKE para PostgreSQL
+            where_clauses.append(f"{sql_column} ILIKE %s") 
             params.append(f"%{value}%")
         else: 
             where_clauses.append(f"{sql_column} = %s")
@@ -4659,7 +4781,6 @@ def get_products_filtered_sorted(company_id, filters={}, sort_by='name', ascendi
         params.extend([limit, offset])
 
     return execute_query(base_query, tuple(params), fetchall=True)
-
 
 def get_products_count(company_id, filters={}):
     """ Cuenta el total de productos que coinciden con los filtros. """
@@ -4965,7 +5086,6 @@ def get_pickings_count(picking_type_code, company_id, filters={}):
     return result['total_count'] if result else 0
 
 def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id', ascending=False, limit=None, offset=None):
-    # (La lógica de sort_map no cambia)
     sort_map = {
         'name': "p.name", 'purchase_order': "p.purchase_order",
         'src_path_display': "src_path_display", 'dest_path_display': "dest_path_display",
@@ -4980,7 +5100,6 @@ def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id'
     query_params = [picking_type_code, company_id]
     where_clauses = []
 
-    # (Lógica de filtros con %s e ILIKE)
     for key, value in filters.items():
          if value:
             if key in ["date_transfer_from", "date_transfer_to"]:
@@ -4990,28 +5109,41 @@ def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id'
                     where_clauses.append(f"p.date_transfer {operator} %s")
                     query_params.append(db_date)
                 except ValueError: pass
-            elif key == 'state':
+            
+            # Comprobar la clave 'p.state' (antes 'state')
+            elif key == 'p.state':
                 where_clauses.append("p.state = %s")
                 query_params.append(value)
-            elif key in ["partner_ref", "custom_operation_type", "name", "purchase_order", "responsible_user"]:
-                where_clauses.append(f"p.{key} ILIKE %s")
+            
+            # Comprobar claves 'p.name', 'p.purchase_order', etc.
+            elif key in ["p.partner_ref", "p.custom_operation_type", "p.name", "p.purchase_order", "p.responsible_user"]:
+                # La SQL ya no necesita añadir 'p.' porque la clave ya lo tiene
+                where_clauses.append(f"{key} ILIKE %s")
                 query_params.append(f"%{value}%")
-            elif key == 'src_path':
+            
+            # Comprobar 'src_path_display' (antes 'src_path')
+            elif key == 'src_path_display':
                 where_clauses.append("src_path_display ILIKE %s")
                 query_params.append(f"%{value}%")
-            elif key == 'dest_path':
+            
+            # Comprobar 'dest_path_display' (antes 'dest_path')
+            elif key == 'dest_path_display':
                  where_clauses.append("dest_path_display ILIKE %s")
                  query_params.append(f"%{value}%")
-            elif key == 'warehouse_src_name':
+            
+            # Comprobar 'w_src.name' (antes 'warehouse_src_name')
+            elif key == 'w_src.name':
                  where_clauses.append("w_src.name ILIKE %s")
                  query_params.append(f"%{value}%")
-            elif key == 'warehouse_dest_name':
+            
+            # Comprobar 'w_dest.name' (antes 'warehouse_dest_name')
+            elif key == 'w_dest.name':
                  where_clauses.append("w_dest.name ILIKE %s")
                  query_params.append(f"%{value}%")
 
     where_string = " AND " + " AND ".join(where_clauses) if where_clauses else ""
 
-    # (Query principal con TO_CHAR para fechas)
+    # (La consulta principal SQL no cambia, es correcta)
     query = f"""
     SELECT
         p.id, p.name, p.state, p.purchase_order, p.partner_ref, p.custom_operation_type, p.responsible_user,
@@ -5039,6 +5171,15 @@ def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id'
         query_params.extend([limit, offset])
 
     return execute_query(query, tuple(query_params), fetchall=True)
+
+def get_companies():
+    """
+    Obtiene una lista simple de todas las compañías (ID y Nombre)
+    para el dropdown de multi-compañía.
+    """
+    print(" -> [DB] Obteniendo lista de todas las compañías...")
+    # Usamos la función del pool que ya existe
+    return execute_query("SELECT id, name FROM companies ORDER BY name", fetchall=True)
 
 def get_location_name_details(location_id):
     """
@@ -5274,7 +5415,6 @@ def get_adjustments_filtered_sorted(company_id, filters={}, sort_by='id', ascend
     }
     order_by_column = sort_map.get(sort_by, "p.id")
     direction = "ASC" if ascending else "DESC"
-
     base_query = """
     SELECT 
         p.id, p.company_id, p.name, p.state, TO_CHAR(p.scheduled_date, 'YYYY-MM-DD') as date,
@@ -5286,7 +5426,6 @@ def get_adjustments_filtered_sorted(company_id, filters={}, sort_by='id', ascend
     LEFT JOIN locations l_dest ON p.location_dest_id = l_dest.id
     WHERE p.company_id = %s AND pt.code = 'ADJ'
     """
-    
     params = [company_id]
     where_clauses = []
     # ... (resto de la lógica de filtros no cambia) ...
@@ -5304,14 +5443,12 @@ def get_adjustments_filtered_sorted(company_id, filters={}, sort_by='id', ascend
         else:
             where_clauses.append(f"{sql_column} ILIKE %s")
             params.append(f"%{value}%")
-            
     if where_clauses:
         base_query += " AND " + " AND ".join(where_clauses)
     base_query += f" ORDER BY {order_by_column} {direction}"
     if limit is not None and offset is not None:
         base_query += " LIMIT %s OFFSET %s"
         params.extend([limit, offset])
-
     return execute_query(base_query, tuple(params), fetchall=True)
 
 def save_adjustment_draft(picking_id, header_data: dict, lines_data: list):
@@ -5477,8 +5614,6 @@ def _create_or_update_draft_picking_internal(
     print(f"[DB-INTERNAL] Procesando picking borrador {picking_code} para WO ID: {wo_id}")
     
     warehouse_id = picking_data['warehouse_id']
-    # Para 'OUT', usamos la ubicación específica seleccionada por el usuario.
-    # Para 'RET', usamos None por ahora y dejamos que el sistema decida basedo en el tipo de operación.
     location_src_id_override = picking_data.get('location_src_id') if picking_code == 'OUT' else None
     
     date_attended = picking_data['date_attended_db']
@@ -5487,7 +5622,9 @@ def _create_or_update_draft_picking_internal(
 
     if not warehouse_id:
         raise ValueError(f"Se requiere un warehouse_id para el picking {picking_code}.")
+
     # --- 1. Buscar si ya existe el borrador ---
+    # ... (código sin cambios)
     cursor.execute(
         """SELECT p.id, pt.default_location_src_id, pt.default_location_dest_id
            FROM pickings p JOIN picking_types pt ON p.picking_type_id = pt.id
@@ -5497,42 +5634,39 @@ def _create_or_update_draft_picking_internal(
     draft_picking = cursor.fetchone()
 
     picking_id = None
-    # Variables para determinar las ubicaciones finales a usar en el picking
     final_loc_src_id = None
     final_loc_dest_id = None
+
     # --- 2. Obtener configuración del tipo de operación (NECESARIO SIEMPRE para defaults) ---
+    # ... (código sin cambios)
     cursor.execute(
         "SELECT id, default_location_src_id, default_location_dest_id FROM picking_types WHERE warehouse_id = %s AND code = %s",
         (warehouse_id, picking_code)
     )
     picking_type = cursor.fetchone()
     if not picking_type: 
-        # Fallback de emergencia si no existe el tipo de operación específico para este almacén
-        print(f"[WARN] No se encontró picking_type '{picking_code}' para WH {warehouse_id}. Buscando genérico...")
-        # Podrías intentar buscar uno genérico si tu lógica lo permite, o fallar.
-        # Por ahora, fallamos con un mensaje claro.
         raise ValueError(f"No está configurado el tipo de operación '{picking_code}' para el almacén ID {warehouse_id}.")
+
     picking_type_id = picking_type[0]
     default_src_id = picking_type[1]
     default_dest_id = picking_type[2]
+
     # --- 3. Determinar ubicaciones finales ---
+    # ... (código sin cambios)
     if picking_code == 'OUT':
-        # Para OUT: Origen es la seleccionada por usuario (override), Destino es el default (Cliente)
         final_loc_src_id = location_src_id_override or default_src_id
         final_loc_dest_id = default_dest_id
     elif picking_code == 'RET':
-        # Para RET: Origen es el default (Cliente), Destino es el default (Averiados/Principal)
         final_loc_src_id = default_src_id
         final_loc_dest_id = default_dest_id
-    # Validar que tenemos ubicaciones
     if not final_loc_src_id or not final_loc_dest_id:
-         raise ValueError(f"Configuración incompleta para '{picking_code}' en almacén {warehouse_id}. Faltan ubicaciones por defecto.")
+        raise ValueError(f"Configuración incompleta para '{picking_code}' en almacén {warehouse_id}. Faltan ubicaciones por defecto.")
+
     if draft_picking:
         # --- ACTUALIZAR EXISTENTE ---
+        # ... (código sin cambios)
         picking_id = draft_picking[0]
         print(f" -> Picking {picking_code} borrador encontrado (ID: {picking_id}). Actualizando...")
-        # Si no hay líneas nuevas y es un RET, podríamos optar por borrarlo si existía.
-        # Por ahora, simplemente lo actualizamos.
         cursor.execute(
             """UPDATE pickings
                SET warehouse_id = %s, location_src_id = %s, location_dest_id = %s, 
@@ -5542,23 +5676,24 @@ def _create_or_update_draft_picking_internal(
              date_attended, service_act_number, user_name, picking_id)
         )
     else:
+        # --- CREAR NUEVO ---
         if not lines_data and picking_code == 'RET':
             print(f" -> No hay picking {picking_code} previo ni líneas nuevas. Omitiendo creación.")
             return None, {}
         
         print(f" -> Creando nuevo picking {picking_code} borrador...")
-        # Obtener prefijo para el nombre
         cursor.execute("SELECT wt.code, pt.code FROM picking_types pt JOIN warehouses wt ON pt.warehouse_id = wt.id WHERE pt.id = %s", (picking_type_id,))
         codes = cursor.fetchone()
         prefix = f"{codes[0]}/{codes[1]}/"
+        
         cursor.execute("SELECT COUNT(*) FROM pickings WHERE name LIKE %s", (f"{prefix}%",))
         count = cursor.fetchone()[0]
         picking_name = f"{prefix}{str(count + 1).zfill(5)}"
 
         cursor.execute(
             """INSERT INTO pickings (company_id, name, picking_type_id, warehouse_id, location_src_id, location_dest_id,
-                                      state, work_order_id, custom_operation_type,
-                                      service_act_number, attention_date, responsible_user)
+                                     state, work_order_id, custom_operation_type,
+                                     service_act_number, attention_date, responsible_user)
                VALUES (%s, %s, %s, %s, %s, %s, 'draft', %s, %s, %s, %s, %s)
                RETURNING id""",
             (company_id, picking_name, picking_type_id, warehouse_id, final_loc_src_id, final_loc_dest_id,
@@ -5569,8 +5704,7 @@ def _create_or_update_draft_picking_internal(
         print(f" -> Nuevo picking {picking_code} creado (ID: {picking_id}).")
 
     # --- 4. Gestionar Movimientos (Líneas) ---
-    
-    # 4.1. Borrar líneas anteriores
+    # 4.1. Borrar líneas anteriores (sin cambios)
     cursor.execute("SELECT id FROM stock_moves WHERE picking_id = %s AND state = 'draft'", (picking_id,))
     old_moves = cursor.fetchall()
     if old_moves:
@@ -5583,14 +5717,28 @@ def _create_or_update_draft_picking_internal(
     # 4.2. Insertar nuevas líneas
     partner_id_to_set = None
     if picking_code == 'OUT':
-        # Para OUT, intentamos asignar un partner genérico al movimiento si no tiene uno específico
         cursor.execute("SELECT id FROM partners WHERE name = 'Cliente Varios' AND company_id = %s", (company_id,))
         res = cursor.fetchone()
         if res: partner_id_to_set = res[0]
 
     moves_created = 0
     moves_with_tracking = {}
-    
+    # Antes de insertar, validamos que TODOS los productos existan
+    product_ids_to_check = [line['product_id'] for line in lines_data if line.get('product_id')]
+    print(f"[DEBUG-TRAMPA-PUT] IDs recibidos de Flet: {product_ids_to_check}")
+    if product_ids_to_check:
+        placeholders_check = ','.join(['%s'] * len(product_ids_to_check))
+        cursor.execute(
+            f"SELECT id FROM products WHERE company_id = %s AND id IN ({placeholders_check})", 
+            (company_id,) + tuple(product_ids_to_check)
+        )
+        found_products = {row['id'] for row in cursor.fetchall()}
+        
+        missing_ids = set(product_ids_to_check) - found_products
+        if missing_ids:
+            # ¡Este es el error que te estaba colapsando!
+            raise ValueError(f"Error de datos: Los siguientes ID de producto no existen o no pertenecen a esta compañía: {list(missing_ids)}")
+
     for line in lines_data:
         product_id = line['product_id']
         quantity = line['quantity']
@@ -5607,22 +5755,21 @@ def _create_or_update_draft_picking_internal(
         moves_created += 1
 
         if tracking_data:
+            # ... (código de 'if tracking_data' sin cambios) ...
             moves_with_tracking[move_id] = tracking_data
             for serial_name, qty in tracking_data.items():
-                 # Buscar o crear el lote/serie
-                 cursor.execute("SELECT id FROM stock_lots WHERE product_id = %s AND name = %s", (product_id, serial_name))
-                 lot_res = cursor.fetchone()
-                 if lot_res:
-                     lot_id = lot_res[0]
-                 else:
-                     cursor.execute("INSERT INTO stock_lots (name, product_id) VALUES (%s, %s) RETURNING id", (serial_name, product_id))
-                     lot_id = cursor.fetchone()[0]
-                 
-                 # Insertar la línea de detalle
-                 cursor.execute(
-                     "INSERT INTO stock_move_lines (move_id, lot_id, qty_done) VALUES (%s, %s, %s)",
-                     (move_id, lot_id, qty)
-                 )
+                cursor.execute("SELECT id FROM stock_lots WHERE product_id = %s AND name = %s", (product_id, serial_name))
+                lot_res = cursor.fetchone()
+                if lot_res:
+                    lot_id = lot_res[0]
+                else:
+                    cursor.execute("INSERT INTO stock_lots (name, product_id) VALUES (%s, %s) RETURNING id", (serial_name, product_id))
+                    lot_id = cursor.fetchone()[0]
+                
+                cursor.execute(
+                    "INSERT INTO stock_move_lines (move_id, lot_id, qty_done) VALUES (%s, %s, %s)",
+                    (move_id, lot_id, qty)
+                )
 
     print(f" -> {moves_created} líneas nuevas creadas para picking {picking_code} (ID: {picking_id}).")
     return picking_id, moves_with_tracking
@@ -5708,6 +5855,7 @@ def save_liquidation_progress(wo_id, wo_updates: dict, consumo_data: dict, retir
         if conn:
             conn.cursor_factory = None # Asegurarse de resetearla
             db_pool.putconn(conn)
+
 
 def get_work_orders_filtered_sorted(company_id, filters={}, sort_by='id', ascending=False, limit=None, offset=None):
     """
@@ -6142,13 +6290,10 @@ def get_real_available_stock(product_id, location_id):
 
 def get_picking_ui_details_optimized(picking_id: int, company_id: int):
     """
-    [OPTIMIZADO-JSON] Obtiene la mayoría de los datos de la UI en una
-    sola consulta, usando JSON de PostgreSQL.
+    [OPTIMIZADO-JSON-CORREGIDO] Obtiene la mayoría de los datos de la UI
+    en una sola consulta, filtrando correctamente por compañía.
     """
     
-    # Esta consulta usa Common Table Expressions (WITH) para organizarse
-    # y funciones JSON (json_build_object, json_agg) para construir
-    # la respuesta dentro de la base de datos.
     sql_query = """
     WITH 
     -- 1. Obtener la cabecera y la regla de operación
@@ -6156,7 +6301,6 @@ def get_picking_ui_details_optimized(picking_id: int, company_id: int):
         SELECT 
             p.*, 
             pt.code as type_code,
-            -- Construimos el objeto 'op_rule' directamente
             json_build_object(
                 'id', op_rule.id,
                 'name', op_rule.name,
@@ -6166,7 +6310,7 @@ def get_picking_ui_details_optimized(picking_id: int, company_id: int):
         FROM pickings p
         JOIN picking_types pt ON p.picking_type_id = pt.id
         LEFT JOIN operation_types op_rule ON p.custom_operation_type = op_rule.name
-        WHERE p.id = %(picking_id)s
+        WHERE p.id = %(picking_id)s AND p.company_id = %(company_id)s -- Asegurar que el picking pertenezca a la Cia.
     ),
     
     -- 2. Obtener las líneas (moves) y empaquetarlas en un JSON array
@@ -6183,16 +6327,20 @@ def get_picking_ui_details_optimized(picking_id: int, company_id: int):
                 'uom_name', u.name,
                 'price_unit', sm.price_unit,
                 'standard_price', pr.standard_price,
-                'cost_at_adjustment', sm.cost_at_adjustment
+                'cost_at_adjustment', sm.cost_at_adjustment,
+                
+                -- --- ¡CAMPOS CORREGIDOS! (Para Liquidaciones) ---
+                'service_act_number', (SELECT service_act_number FROM picking_data),
+                'attention_date', (SELECT attention_date FROM picking_data)
+                
             )) as moves
         FROM stock_moves sm
-        JOIN products pr ON sm.product_id = pr.id
+        JOIN products pr ON (sm.product_id = pr.id AND pr.company_id = %(company_id)s)
         LEFT JOIN uom u ON pr.uom_id = u.id
         WHERE sm.picking_id = %(picking_id)s
     ),
     
-    -- 3. Obtener las series/lotes y empaquetarlas en un objeto JSON
-    --    Formato: { "move_id_1": {"loteA": 1, "loteB": 5}, "move_id_2": ... }
+    -- 3. Obtener las series/lotes
     serials_data AS (
         SELECT 
             COALESCE(json_object_agg(
@@ -6242,7 +6390,11 @@ def get_picking_ui_details_optimized(picking_id: int, company_id: int):
                 SELECT pr.id, pr.name, pr.sku, pr.tracking, pr.ownership, pr.uom_id, pr.standard_price, u.name as uom_name
                 FROM products pr
                 LEFT JOIN uom u ON pr.uom_id = u.id
+                
+                -- --- ¡FILTRO DE COMPAÑÍA AÑADIDO! ---
                 WHERE pr.company_id = %(company_id)s
+                -- --- FIN DE LA CORRECCIÓN ---
+                
                 ORDER BY pr.name LIMIT 100
              ) p_data
             ) AS all_products
@@ -6250,7 +6402,7 @@ def get_picking_ui_details_optimized(picking_id: int, company_id: int):
     
     -- 5. Unir todo en un solo JSON
     SELECT json_build_object(
-        'picking_data', (SELECT to_jsonb(pd) - 'op_rule' FROM picking_data pd), -- to_jsonb para convertir la fila
+        'picking_data', (SELECT to_jsonb(pd) - 'op_rule' FROM picking_data pd),
         'op_rule', (SELECT op_rule FROM picking_data),
         'moves_data', (SELECT moves FROM moves_data),
         'serials_data', (SELECT serials FROM serials_data),
@@ -6265,25 +6417,313 @@ def get_picking_ui_details_optimized(picking_id: int, company_id: int):
     
     params = {"picking_id": picking_id, "company_id": company_id}
     
-    # Usamos execute_query (nuestra función del pool)
-    # fetchone=True nos dará una sola fila (DictRow)
-    # El resultado estará en la columna 'result'
     result_row = execute_query(sql_query, params, fetchone=True)
     
     if result_row and result_row['result']:
         # Corregir listas vacías que SQL devuelve como 'null'
         data = result_row['result']
-        if data.get('moves_data') is None:
-            data['moves_data'] = []
-        if data.get('all_products') is None:
-            data['all_products'] = []
-        if data['dropdown_options'].get('operation_types') is None:
-            data['dropdown_options']['operation_types'] = []
-        if data['dropdown_options'].get('partners_vendor') is None:
-            data['dropdown_options']['partners_vendor'] = []
-        if data['dropdown_options'].get('partners_customer') is None:
-            data['dropdown_options']['partners_customer'] = []
+        
+        # ¡Validar que el picking exista y pertenezca a la compañía!
+        if data.get('picking_data') is None:
+             return None, "Albarán no encontrado o no pertenece a esta compañía."
+
+        if data.get('moves_data') is None: data['moves_data'] = []
+        if data.get('all_products') is None: data['all_products'] = []
+        if data['dropdown_options'].get('operation_types') is None: data['dropdown_options']['operation_types'] = []
+        if data['dropdown_options'].get('partners_vendor') is None: data['dropdown_options']['partners_vendor'] = []
+        if data['dropdown_options'].get('partners_customer') is None: data['dropdown_options']['partners_customer'] = []
         return data, None
     
     return None, "No se encontraron datos."
 
+def get_liquidation_details_combo(wo_id: int, company_id: int):
+    """
+    [COMBO-CORREGIDO] Obtiene TODOS los datos para la UI de detalle de Liquidación,
+    asegurando que se seleccionen todos los campos del picking.
+    """
+    print(f"[DB-COMBO-LIQ] Obteniendo datos para WO ID: {wo_id}")
+    
+    sql_query = """
+    WITH 
+    -- --- ¡INICIO DE LA CORRECCIÓN! ---
+    -- Seleccionamos p.* para obtener TODOS los campos (incluyendo name, company_id, etc.)
+    picking_info AS (
+        SELECT 
+            p.*, 
+            pt.code as type_code
+        FROM pickings p
+        JOIN picking_types pt ON p.picking_type_id = pt.id
+        WHERE p.work_order_id = %(wo_id)s AND p.state IN ('draft', 'done')
+        AND p.company_id = %(company_id)s
+        AND pt.code = 'OUT'
+        LIMIT 1
+    ),
+    picking_info_ret AS (
+        SELECT 
+            p.*, 
+            pt.code as type_code
+        FROM pickings p
+        JOIN picking_types pt ON p.picking_type_id = pt.id
+        WHERE p.work_order_id = %(wo_id)s AND p.state IN ('draft', 'done')
+        AND p.company_id = %(company_id)s
+        AND pt.code = 'RET'
+        LIMIT 1
+    ),
+    -- --- FIN DE LA CORRECCIÓN ---
+    
+    moves_consumo AS (
+        SELECT json_agg(json_build_object(
+            'id', sm.id, 'product_id', pr.id, 'name', pr.name, 'sku', pr.sku,
+            'product_uom_qty', sm.product_uom_qty, 'quantity_done', sm.quantity_done,
+            'tracking', pr.tracking, 'uom_name', u.name,
+            'price_unit', sm.price_unit, 'standard_price', pr.standard_price,
+            'cost_at_adjustment', sm.cost_at_adjustment
+        )) as moves
+        FROM stock_moves sm
+        JOIN products pr ON (sm.product_id = pr.id AND pr.company_id = %(company_id)s)
+        LEFT JOIN uom u ON pr.uom_id = u.id
+        WHERE sm.picking_id = (SELECT id FROM picking_info)
+    ),
+    moves_retiro AS (
+        SELECT json_agg(json_build_object(
+            'id', sm.id, 'product_id', pr.id, 'name', pr.name, 'sku', pr.sku,
+            'product_uom_qty', sm.product_uom_qty, 'quantity_done', sm.quantity_done,
+            'tracking', pr.tracking, 'uom_name', u.name,
+            'price_unit', sm.price_unit, 'standard_price', pr.standard_price,
+            'cost_at_adjustment', sm.cost_at_adjustment
+        )) as moves
+        FROM stock_moves sm
+        JOIN products pr ON (sm.product_id = pr.id AND pr.company_id = %(company_id)s)
+        LEFT JOIN uom u ON pr.uom_id = u.id
+        WHERE sm.picking_id = (SELECT id FROM picking_info_ret)
+    ),
+    serials_consumo AS (
+        SELECT COALESCE(json_object_agg(s.move_id, s.lots), '{}'::json) as serials
+        FROM (
+            SELECT sml.move_id, json_object_agg(sl.name, sml.qty_done) as lots
+            FROM stock_move_lines sml
+            JOIN stock_lots sl ON sml.lot_id = sl.id
+            WHERE sml.move_id IN (SELECT id FROM stock_moves WHERE picking_id = (SELECT id FROM picking_info))
+            GROUP BY sml.move_id
+        ) s
+    ),
+    serials_retiro AS (
+        SELECT COALESCE(json_object_agg(s.move_id, s.lots), '{}'::json) as serials
+        FROM (
+            SELECT sml.move_id, json_object_agg(sl.name, sml.qty_done) as lots
+            FROM stock_move_lines sml
+            JOIN stock_lots sl ON sml.lot_id = sl.id
+            WHERE sml.move_id IN (SELECT id FROM stock_moves WHERE picking_id = (SELECT id FROM picking_info_ret))
+            GROUP BY sml.move_id
+        ) s
+    ),
+    dropdowns AS (
+        SELECT
+            (SELECT json_agg(wh_data) 
+             FROM (
+                SELECT w.id, w.name, w.code 
+                FROM warehouses w
+                WHERE w.company_id = %(company_id)s AND w.status = 'activo' ORDER BY w.name
+             ) wh_data
+            ) AS warehouses,
+            
+            (SELECT json_agg(loc_data)
+             FROM (
+                 SELECT l.id, l.name, l.path, l.company_id, l.type 
+                 FROM locations l 
+                 WHERE l.warehouse_id = (SELECT warehouse_id FROM picking_info)
+                 ORDER BY l.path
+             ) loc_data
+            ) AS locations,
+            
+            (SELECT json_agg(p_data) 
+             FROM (
+                SELECT 
+                    pr.id, pr.name, pr.sku, pr.tracking, pr.ownership, 
+                    pr.uom_id, pr.standard_price, u.name as uom_name,
+                    pr.company_id, pr.type, pc.name as category_name
+                FROM products pr
+                LEFT JOIN uom u ON pr.uom_id = u.id
+                LEFT JOIN product_categories pc ON pr.category_id = pc.id
+                WHERE pr.company_id = %(company_id)s
+                ORDER BY pr.name
+             ) p_data
+            ) AS all_products
+    )
+    -- 5. Unir todo
+    SELECT json_build_object(
+        'wo_data', (SELECT to_jsonb(wo.*) FROM work_orders wo WHERE wo.id = %(wo_id)s AND wo.company_id = %(company_id)s),
+        'picking_consumo', (SELECT to_jsonb(pi.*) FROM picking_info pi),
+        'moves_consumo', (SELECT moves FROM moves_consumo),
+        'serials_consumo', (SELECT serials FROM serials_consumo),
+        'picking_retiro', (SELECT to_jsonb(pir.*) FROM picking_info_ret pir),
+        'moves_retiro', (SELECT moves FROM moves_retiro),
+        'serials_retiro', (SELECT serials FROM serials_retiro),
+        'dropdowns', (SELECT to_jsonb(d.*) FROM dropdowns d)
+    ) AS result;
+    """
+    
+    params = {"wo_id": wo_id, "company_id": company_id}
+    
+    try:
+        result_row = execute_query(sql_query, params, fetchone=True)
+        
+        if result_row and result_row['result']:
+            data = result_row['result']
+            print(f"[DEBUG-TRAMPA-GET] moves_consumo: {data.get('moves_consumo')}")
+            if data.get('wo_data') is None:
+                 return None, f"OT (ID: {wo_id}) no encontrada o no pertenece a esta compañía ({company_id})."
+
+            if data.get('moves_consumo') is None: data['moves_consumo'] = []
+            if data.get('moves_retiro') is None: data['moves_retiro'] = []
+            if data.get('dropdowns') is None: data['dropdowns'] = {}
+            if data.get('dropdowns', {}).get('all_products') is None: data['dropdowns']['all_products'] = []
+            if data.get('dropdowns', {}).get('warehouses') is None: data['dropdowns']['warehouses'] = []
+            if data.get('dropdowns', {}).get('locations') is None: data['dropdowns']['locations'] = []
+                
+            return data, None
+        
+        return None, "No se encontraron datos."
+
+    except Exception as e:
+        traceback.print_exc()
+        return None, f"Error interno de base de datos al cargar combo de liquidación: {e}"
+
+
+def create_company(name: str):
+    """
+    [MODIFICADO] Crea una nueva compañía Y sus categorías/socios por defecto,
+    todo en una sola transacción atómica.
+    """
+    print(f" -> [DB] Iniciando transacción para crear compañía: {name}")
+
+    # 1. Obtener el pool (procedimiento estándar)
+    global db_pool
+    if not db_pool:
+        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
+        init_db_pool()
+        if not db_pool:
+            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
+    conn = None
+    try:
+        # 2. Obtener UNA conexión del pool para toda la transacción
+        conn = db_pool.getconn()
+        conn.cursor_factory = psycopg2.extras.DictCursor
+
+        with conn.cursor() as cursor:
+            
+            # 3. Insertar la Compañía
+            query_company = "INSERT INTO companies (name) VALUES (%s) RETURNING *"
+            cursor.execute(query_company, (name,))
+            new_company = cursor.fetchone()
+            if not new_company:
+                raise Exception("No se pudo crear la compañía.")
+            new_company_id = new_company['id']
+            print(f"  -> Compañía ID {new_company_id} ('{name}') creada.")
+
+            # 4. Insertar Categorías de Almacén por defecto
+            wh_categories = [
+                (new_company_id, "ALMACEN PRINCIPAL"),
+                (new_company_id, "CONTRATISTA")
+            ]
+            cursor.executemany(
+                "INSERT INTO warehouse_categories (company_id, name) VALUES (%s, %s) ON CONFLICT (company_id, name) DO NOTHING", 
+                wh_categories
+            )
+            print("  -> Categorías de Almacén por defecto creadas.")
+
+            # 5. Insertar Categorías de Socio por defecto
+            partner_categories = [
+                (new_company_id, "Proveedor Externo"),
+                (new_company_id, "Proveedor Cliente")
+            ]
+            cursor.executemany(
+                "INSERT INTO partner_categories (company_id, name) VALUES (%s, %s) ON CONFLICT (company_id, name) DO NOTHING", 
+                partner_categories
+            )
+            print("  -> Categorías de Socio por defecto creadas.")
+
+            # 6. Insertar Categoría 'General' de Producto
+            cursor.execute(
+                "INSERT INTO product_categories (company_id, name) VALUES (%s, %s) ON CONFLICT (company_id, name) DO NOTHING RETURNING id", 
+                (new_company_id, 'General')
+            )
+            print("  -> Categoría 'General' de Producto creada.")
+
+            # 7. Insertar Socios 'Varios' por defecto (requiere los IDs del paso 5)
+            cursor.execute("SELECT id FROM partner_categories WHERE name = %s AND company_id = %s", ("Proveedor Cliente", new_company_id))
+            cat_cliente_row = cursor.fetchone()
+            cat_cliente_id = cat_cliente_row['id'] if cat_cliente_row else None
+
+            cursor.execute("SELECT id FROM partner_categories WHERE name = %s AND company_id = %s", ("Proveedor Externo", new_company_id))
+            cat_externo_row = cursor.fetchone()
+            cat_externo_id = cat_externo_row['id'] if cat_externo_row else None
+
+            if not cat_cliente_id or not cat_externo_id:
+                 raise Exception("No se pudieron encontrar las categorías de socio recién creadas.")
+
+            cursor.execute("INSERT INTO partners (company_id, name, category_id) VALUES (%s, %s, %s) ON CONFLICT (company_id, name) DO NOTHING", (new_company_id, "Cliente Varios", cat_cliente_id))
+            cursor.execute("INSERT INTO partners (company_id, name, category_id) VALUES (%s, %s, %s) ON CONFLICT (company_id, name) DO NOTHING", (new_company_id, "Proveedor Varios", cat_externo_id))
+            print("  -> Socios 'Varios' por defecto creados.")
+            
+            # --- FIN DE LA TRANSACCIÓN ---
+
+            # 8. Si todo salió bien, hacer Commit
+            conn.commit()
+            print(f" -> [DB] Transacción completada (COMMIT). Compañía '{name}' está lista.")
+            
+            # Devolver el objeto 'company' que obtuvimos en el paso 3
+            return new_company
+
+    except Exception as e:
+        # 9. Si algo falla, hacer Rollback
+        if conn:
+            conn.rollback()
+        print(f"[ERROR] Falló la creación de la compañía (ROLLBACK ejecutado): {e}")
+        
+        # Manejar error de duplicado (el más común)
+        if "companies_name_key" in str(e):
+            raise ValueError(f"La compañía '{name}' ya existe.")
+        
+        # Re-lanzar el error para que la API lo capture
+        raise e 
+    
+    finally:
+        # 10. Pase lo que pase, devolver la conexión al pool
+        if conn:
+            db_pool.putconn(conn)
+
+def update_company(company_id: int, name: str):
+    """
+    Actualiza el nombre de una compañía y devuelve el registro actualizado.
+    """
+    print(f" -> [DB] Actualizando compañía ID: {company_id}")
+    query = "UPDATE companies SET name = %s WHERE id = %s RETURNING *"
+    
+    try:
+        updated_company = execute_commit_query(query, (name, company_id), fetchone=True)
+        return updated_company
+    except Exception as e:
+        if "companies_name_key" in str(e):
+            raise ValueError(f"El nombre '{name}' ya existe (duplicado).")
+        raise e
+
+def delete_company(company_id: int):
+    """
+    Elimina una compañía.
+    PRECAUCIÓN: Esto fallará si la compañía tiene datos asociados
+    (productos, almacenes, etc.) debido a las Foreign Keys.
+    """
+    print(f" -> [DB] Intentando eliminar compañía ID: {company_id}")
+    
+    # Comprobación de seguridad (simple): ¿Tiene productos?
+    check_query = "SELECT 1 FROM products WHERE company_id = %s LIMIT 1"
+    has_data = execute_query(check_query, (company_id,), fetchone=True)
+    if has_data:
+        raise ValueError("No se puede eliminar: La compañía ya tiene productos asociados.")
+    
+    # (Puedes añadir más comprobaciones para almacenes, socios, etc. aquí)
+    
+    execute_commit_query("DELETE FROM companies WHERE id = %s", (company_id,))
+    return True
+        

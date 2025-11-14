@@ -1,6 +1,6 @@
 # app/api/reports.py
 from fastapi import APIRouter, Depends, HTTPException, status, Query
-from typing import List, Annotated, Optional
+from typing import List, Annotated, Optional, Dict
 from app import database as db
 from app import schemas, security
 from app.security import TokenData
@@ -8,6 +8,7 @@ from datetime import date, datetime # Asegúrate de que datetime esté importado
 import traceback # Importa traceback
 import csv
 import io
+import asyncio
 from fastapi.responses import StreamingResponse
 from decimal import Decimal, ROUND_HALF_UP, getcontext
 getcontext().prec = 28
@@ -494,3 +495,24 @@ async def export_stock_detail_csv(
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al exportar detalle: {e}")
+
+@router.post("/stock-for-products", response_model=Dict[int, float])
+async def get_stock_for_products_list(
+    auth: AuthDependency,
+    request_data: schemas.StockCheckRequest
+):
+    """
+    [NUEVO] Obtiene el stock físico (quants) para una lista de IDs de
+    productos en una ubicación específica.
+    """
+    try:
+        # Usamos to_thread porque la función de BD es síncrona
+        stock_map = await asyncio.to_thread(
+            db.get_stock_for_multiple_products,
+            request_data.location_id,
+            request_data.product_ids
+        )
+        return stock_map
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error al consultar stock múltiple: {e}")

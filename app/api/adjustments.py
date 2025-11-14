@@ -1,108 +1,83 @@
 # app/api/adjustments.py
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from typing import List, Annotated
 from app import database as db
 from app import schemas, security
 from app.security import TokenData
+import traceback
+import asyncio
 
 router = APIRouter()
 AuthDependency = Annotated[TokenData, Depends(security.get_current_user_data)]
 
+# --- Helper para parsear filtros de Ajuste ---
+def _parse_adjustment_filters(request: Request) -> dict:
+    """Lee los query params y los convierte en un dict de filtros."""
+    filters = {}
+    
+    # Lista de claves de filtro que SÍ aceptamos (de tu database.py)
+    KNOWN_FILTER_KEYS = {
+        'name', 'state', 'responsible_user',
+        'adjustment_reason', 'src_path', 'dest_path'
+    }
+    
+    RESERVED_KEYS = {'company_id', 'skip', 'limit', 'sort_by', 'ascending', 'token'}
+
+    for key, value in request.query_params.items():
+        if key not in RESERVED_KEYS and key in KNOWN_FILTER_KEYS and value:
+            filters[key] = value
+    
+    return filters
+
+# --- Endpoint de Lista de Ajustes (con paginación) ---
 @router.get("/", response_model=List[schemas.AdjustmentListResponse])
 async def get_all_adjustments(
     auth: AuthDependency,
-    company_id: int = 1,
+    company_id: int, 
+    request: Request,
     skip: int = 0,
-    limit: int = 25
+    limit: int = 50,
+    sort_by: str = 'id',
+    ascending: bool = False
 ):
-    """ Obtiene la lista de Ajustes de Inventario. """
+    """ Obtiene la lista paginada de Ajustes de Inventario. """
     if "adjustments.can_view" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
         
-    adjustments_raw = db.get_adjustments_filtered_sorted(
-        company_id, filters={}, sort_by='id', ascending=False, limit=limit, offset=skip
-    )
-    return [dict(adj) for adj in adjustments_raw]
-
-@router.post("/", response_model=schemas.PickingResponse, status_code=status.HTTP_201_CREATED)
-async def create_adjustment(auth: AuthDependency, company_id: int = 1):
-    """ Crea un nuevo borrador de ajuste de inventario. """
-    if "adjustments.can_create" not in auth.permissions:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
-    
     try:
-        new_picking_id = db.create_draft_adjustment(company_id, auth.username)
-        if not new_picking_id:
-            raise ValueError("No se pudo crear el borrador (verifique config de picking_types y locations 'ADJ')")
+        filters = _parse_adjustment_filters(request)
         
-        # Devolvemos el picking completo (cabecera y líneas vacías)
-        picking_header, picking_moves = db.get_picking_details(new_picking_id)
-        response_data = dict(picking_header)
-        response_data["moves"] = [dict(move) for move in picking_moves]
-        return response_data
+        adj_raw = await asyncio.to_thread(
+            db.get_adjustments_filtered_sorted,
+            company_id=company_id, 
+            filters=filters,
+            sort_by=sort_by, 
+            ascending=ascending, 
+            limit=limit, 
+            offset=skip
+        )
+        return [dict(adj) for adj in adj_raw]
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error al obtener ajustes: {e}")
 
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-
-@router.get("/{adjustment_id}", response_model=schemas.PickingResponse)
-async def get_adjustment_details(adjustment_id: int, auth: AuthDependency):
-    """ Obtiene la cabecera y líneas de un ajuste (que es un picking). """
+# --- Endpoint de Conteo de Ajustes ---
+@router.get("/count", response_model=int)
+async def get_adjustments_count(
+    auth: AuthDependency,
+    company_id: int,
+    request: Request
+):
+    """ Obtiene el CONTEO TOTAL de Ajustes de Inventario. """
     if "adjustments.can_view" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
-    
-    picking_header, picking_moves = db.get_picking_details(adjustment_id)
-    if not picking_header:
-        raise HTTPException(status_code=404, detail="Ajuste no encontrado")
         
-    response_data = dict(picking_header)
-    response_data["moves"] = [dict(move) for move in picking_moves]
-    return response_data
-
-@router.put("/{adjustment_id}", status_code=status.HTTP_200_OK)
-async def save_adjustment(
-    adjustment_id: int,
-    data: schemas.AdjustmentSaveRequest,
-    auth: AuthDependency
-):
-    """ Guarda el progreso (cabecera y líneas) de un ajuste en borrador. """
-    if "adjustments.can_edit" not in auth.permissions:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
-        
-    success, msg, _ = db.save_adjustment_draft(adjustment_id, data.header_data, data.lines_data)
-    if not success:
-        raise HTTPException(status_code=400, detail=msg)
-    return {"message": msg}
-
-@router.post("/{adjustment_id}/mark-ready", status_code=status.HTTP_200_OK)
-async def mark_adjustment_ready(adjustment_id: int, auth: AuthDependency):
-    """ Pasa un ajuste a 'listo' (valida stock FÍSICO). """
-    if "adjustments.can_edit" not in auth.permissions:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
-
-    success, message = db.check_stock_for_picking(adjustment_id)
-    if not success:
-        raise HTTPException(status_code=400, detail=message)
-    
-    rows_affected = db.mark_picking_as_ready(adjustment_id)
-    if rows_affected == 0:
-        raise HTTPException(status_code=400, detail="No se pudo actualizar (quizás no estaba en 'draft')")
-
-    return {"message": "Ajuste marcado como 'listo'."}
-
-@router.post("/{adjustment_id}/validate", status_code=status.HTTP_200_OK)
-async def validate_adjustment(
-    adjustment_id: int, 
-    tracking_data: schemas.ValidateRequest,
-    auth: AuthDependency
-):
-    """ Valida un ajuste ('listo' -> 'hecho') y mueve el stock físico. """
-    if "adjustments.can_validate" not in auth.permissions:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
-
-    success, message = db.process_picking_validation(
-        adjustment_id, 
-        tracking_data.moves_with_tracking
-    )
-    if not success:
-        raise HTTPException(status_code=400, detail=message)
-    return {"message": message}
+    try:
+        filters = _parse_adjustment_filters(request)
+        count = await asyncio.to_thread(
+            db.get_adjustments_count, company_id, filters=filters
+        )
+        return count
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error al contar ajustes: {e}")
