@@ -211,7 +211,7 @@ async def export_partners_csv(
 @router.post("/import/csv", response_model=dict)
 async def import_partners_csv(
     auth: AuthDependency,
-    company_id: int = 1,
+    company_id: int = Query(...), # <-- 1. Haz que el company_id sea REQUERIDO
     file: UploadFile = File(...)
 ):
     """ Importa socios (partners) desde un archivo CSV. """
@@ -238,12 +238,11 @@ async def import_partners_csv(
             raise ValueError(f"Faltan columnas obligatorias: {', '.join(sorted(list(missing)))}")
 
         # Validar categorías
-        all_db_categories = {cat['name'] for cat in db.get_partner_categories()}
+        all_db_categories = {cat['name'] for cat in db.get_partner_categories(company_id)}
         invalid_categories = {row.get('category_name','').strip() for row in rows if row.get('category_name','').strip() and row.get('category_name','').strip() not in all_db_categories}
         if invalid_categories:
-            raise ValueError(f"Las siguientes categorías no existen: {', '.join(sorted(list(invalid_categories)))}")
-
-        cat_map = {cat['name']: cat['id'] for cat in db.get_partner_categories()}
+            raise ValueError(f"Las siguientes categorías no existen: {', '.join(sorted(list(invalid_categories)))}")        
+        cat_map = {cat['name']: cat['id'] for cat in db.get_partner_categories(company_id)}
 
         created, updated = 0, 0
         error_list = []

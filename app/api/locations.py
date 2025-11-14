@@ -7,9 +7,9 @@ from app import database as db
 from app import schemas, security
 from app.security import TokenData
 import traceback
-import io # <-- AÑADIR
-import csv # <-- AÑADIR
-from fastapi.responses import StreamingResponse # <-- AÑADIR
+import io
+import csv
+from fastapi.responses import StreamingResponse
 
 router = APIRouter()
 AuthDependency = Annotated[TokenData, Depends(security.get_current_user_data)]
@@ -263,7 +263,7 @@ async def import_locations_csv(
             "Producción (Virtual)": "production", "Tránsito (Virtual)": "transit",
         }
         # Cargar almacenes para validación
-        warehouses_db = db.get_warehouses_simple_list(company_id)
+        warehouses_db = db.get_warehouses_simple(company_id)
         warehouse_map = {wh['name']: wh['id'] for wh in warehouses_db}
 
         created, updated = 0, 0

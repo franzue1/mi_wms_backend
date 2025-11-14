@@ -2657,6 +2657,13 @@ def get_location_path(location_id):
     loc = execute_query("SELECT path FROM locations WHERE id =  %s", (location_id,), fetchone=True)
     return loc['path'] if loc else ""
 
+def get_location_by_path(company_id, path):
+    """
+    Busca una ubicación por su path exacto y company_id.
+    """
+    query = "SELECT * FROM locations WHERE path = %s AND company_id = %s"
+    return execute_query(query, (path, company_id), fetchone=True)
+
 def get_serials_for_picking(picking_id):
     """
     Recupera todas las series/lotes usados en un albarán específico

@@ -259,8 +259,8 @@ async def export_warehouses_csv(
 @router.post("/import/csv", response_model=dict)
 async def import_warehouses_csv(
     auth: AuthDependency,
-    company_id: int = 1,
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    company_id: int = Query(...)
 ):
     """ Importa almacenes desde un archivo CSV. """
     if "warehouses.can_crud" not in auth.permissions:
@@ -285,12 +285,12 @@ async def import_warehouses_csv(
             raise ValueError(f"Faltan columnas: {', '.join(sorted(list(missing)))}")
 
         # Validar categorías (BD Call)
-        all_db_categories = {cat['name'] for cat in db.get_warehouse_categories()}
+        all_db_categories = {cat['name'] for cat in db.get_warehouse_categories(company_id)}
         invalid_categories = {row.get('category_name', '').strip() for row in rows if row.get('category_name', '').strip() and row.get('category_name', '').strip() not in all_db_categories}
         if invalid_categories:
             raise ValueError(f"Categorías no existen: {', '.join(invalid_categories)}")
         
-        cat_map = {cat['name']: cat['id'] for cat in db.get_warehouse_categories()}
+        cat_map = {cat['name']: cat['id'] for cat in db.get_warehouse_categories(company_id)}
 
         created, updated = 0, 0
         error_list = []

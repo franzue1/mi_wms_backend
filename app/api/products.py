@@ -234,8 +234,8 @@ async def export_products_csv(
 @router.post("/import/csv", response_model=dict)
 async def import_products_csv(
     auth: AuthDependency,
-    company_id: int = 1,
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    company_id: int = Query(...)
 ):
     """
     Importa productos desde un archivo CSV.
@@ -268,7 +268,7 @@ async def import_products_csv(
             raise ValueError(f"Faltan las columnas requeridas: {', '.join(sorted(list(missing)))}")
 
         # --- 3. Validar Categorías y UdM (Fase 2) ---
-        all_db_categories = {cat['name'] for cat in db.get_product_categories()}
+        all_db_categories = {cat['name'] for cat in db.get_product_categories(company_id)}
         all_db_uoms = {uom['name'] for uom in db.get_uoms()}
         
         invalid_categories = {row.get('category_name', '').strip() for row in rows if row.get('category_name', '').strip() and row.get('category_name', '').strip() not in all_db_categories}
