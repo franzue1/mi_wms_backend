@@ -19,7 +19,7 @@ AuthDependency = Annotated[TokenData, Depends(security.get_current_user_data)]
 @router.get("/dashboard-kpis", response_model=schemas.DashboardResponse)
 async def get_dashboard_kpis(
     auth: AuthDependency,
-    company_id: int = 1
+    company_id: int = Query(...)
 ):
     """ Obtiene TODOS los KPIs y datos de gráficos para el Dashboard. """
     if "nav.dashboard.view" not in auth.permissions:
@@ -56,7 +56,7 @@ async def get_dashboard_kpis(
 @router.get("/stock-summary", response_model=List[schemas.StockReportResponse])
 async def get_stock_summary_report(
     auth: AuthDependency,
-    company_id: int = 1,
+    company_id: int = Query(...),
     warehouse_id: Optional[int] = None,
     sku: Optional[str] = None,
     product_name: Optional[str] = None,
@@ -78,7 +78,7 @@ async def get_stock_summary_report(
 @router.get("/aging", response_model=List[schemas.AgingDetailResponse])
 async def get_aging_report(
     auth: AuthDependency,
-    company_id: int = 1,
+    company_id: int = Query(...),
     product_filter: Optional[str] = Query(None, alias="product"),
     warehouse_id: Optional[int] = Query(None),
     bucket: Optional[str] = Query(None)
@@ -99,7 +99,7 @@ async def get_aging_report(
 @router.get("/coverage", response_model=List[schemas.CoverageReportResponse])
 async def get_coverage_report(
     auth: AuthDependency,
-    company_id: int = 1,
+    company_id: int = Query(...),
     history_days: int = 90,
     product_filter: Optional[str] = Query(None)
 ):
@@ -136,7 +136,7 @@ async def get_kardex_summary(
     auth: AuthDependency,
     date_from: date, # FastAPI convierte "YYYY-MM-DD" en un objeto date
     date_to: date,
-    company_id: int = 1,
+    company_id: int = Query(...),
     product_filter: Optional[str] = Query(None),
     warehouse_id: Optional[str] = Query(None) # Puede ser 'all' o un ID
 ):
@@ -163,7 +163,7 @@ async def get_kardex_detail(
     product_id: int,
     date_from: date,
     date_to: date,
-    company_id: int = 1,
+    company_id: int = Query(...),
     warehouse_id: Optional[str] = Query(None) # Puede ser 'all' o un ID
 ):
     """ Obtiene el detalle de movimientos de Kardex para un producto. """
@@ -296,7 +296,7 @@ async def export_kardex_detail_csv(
     auth: AuthDependency,
     date_from: date, # Recibe 'YYYY-MM-DD'
     date_to: date,
-    company_id: int = 1,
+    company_id: int = Query(...),
     product_filter: Optional[str] = Query(None),
     warehouse_id: Optional[str] = Query(None),
     date_from_display: str = Query(...) # Recibe 'DD/MM/YYYY' para el 'SALDO INICIAL'
@@ -353,7 +353,7 @@ async def export_kardex_detail_csv(
 @router.get("/stock-detail", response_model=List[schemas.StockDetailResponse])
 async def get_stock_detail_report(
     auth: AuthDependency,
-    company_id: int = 1,
+    company_id: int = Query(...),
     # Filtros
     warehouse_id: Optional[int] = None,
     sku: Optional[str] = None,
@@ -421,7 +421,7 @@ def _generate_csv_response(data: List[dict], headers_map: dict, filename: str) -
 @router.get("/stock-summary/export/csv", response_class=StreamingResponse)
 async def export_stock_summary_csv(
     auth: AuthDependency,
-    company_id: int = 1,
+    company_id: int = Query(...),
     # Reutilizamos los mismos filtros que el reporte
     warehouse_id: Optional[int] = None,
     sku: Optional[str] = None,
@@ -458,7 +458,7 @@ async def export_stock_summary_csv(
 @router.get("/stock-detail/export/csv", response_class=StreamingResponse)
 async def export_stock_detail_csv(
     auth: AuthDependency,
-    company_id: int = 1,
+    company_id: int = Query(...),
     # Reutilizamos los mismos filtros
     warehouse_id: Optional[int] = None,
     sku: Optional[str] = None,

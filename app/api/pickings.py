@@ -36,7 +36,7 @@ def _build_picking_filters(type_code: str, filters_in: dict):
 
 @router.get("/", response_model=List[dict])
 async def get_all_pickings(
-    auth: AuthDependency, type_code: str, company_id: int = 1, skip: int = 0, limit: int = 25,
+    auth: AuthDependency, type_code: str, company_id: int = Query(...), skip: int = 0, limit: int = 25,
     sort_by: Optional[str] = Query(None), ascending: bool = Query(False),
     name: Optional[str] = Query(None), purchase_order: Optional[str] = Query(None),
     src_path: Optional[str] = Query(None), dest_path: Optional[str] = Query(None),
@@ -61,7 +61,7 @@ async def get_all_pickings(
 
 @router.get("/count", response_model=int)
 async def get_pickings_count(
-    auth: AuthDependency, type_code: str, company_id: int = 1,
+    auth: AuthDependency, type_code: str, company_id: int = Query(...),
     name: Optional[str] = Query(None), purchase_order: Optional[str] = Query(None),
     src_path: Optional[str] = Query(None), dest_path: Optional[str] = Query(None),
     warehouse_src_name: Optional[str] = Query(None), warehouse_dest_name: Optional[str] = Query(None),
@@ -99,7 +99,7 @@ async def get_picking_details(
     return response_data
 
 @router.get("/{picking_id}/ui-details", response_model=dict)
-async def get_picking_ui_details(picking_id: int, auth: AuthDependency, company_id: int = 1):
+async def get_picking_ui_details(picking_id: int, auth: AuthDependency, company_id: int = Query(...)):
     """
     [COMBO-OPTIMIZADO-JSON] Obtiene la mayoría de los datos en una
     sola consulta a la BD y luego obtiene los almacenes dinámicos.
@@ -190,7 +190,7 @@ class PickingCreateRequest(BaseModel):
 @router.get("/export/csv", response_class=StreamingResponse)
 async def export_pickings_csv(
     auth: AuthDependency,
-    company_id: int = 1,
+    company_id: int = Query(...),
     export_type: str = Query("headers", enum=["headers", "full"])
 ):
     """
@@ -252,7 +252,7 @@ async def export_pickings_csv(
 async def import_pickings_csv(
     auth: AuthDependency,
     import_type: str = Query(..., enum=["headers", "full"]),
-    company_id: int = 1,
+    company_id: int = Query(...),
     file: UploadFile = File(...)
 ):
     """
@@ -284,7 +284,6 @@ async def import_pickings_csv(
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error al leer el archivo: {e}")
-
 
     all_errors = []
     validated_data = []
@@ -426,8 +425,6 @@ async def import_pickings_csv(
                             else:
                                 dest_loc_id = dest_loc_details['id']
                                 if wh_id_for_pt is None: wh_id_for_pt = dest_loc_details['warehouse_id']
-                    # --- ¡FIN DE CORRECCIÓN! ---
-
 
                     if not group_errors:
                         picking_type_id = db.find_picking_type_id(company_id, op_code, wh_id_for_pt)
@@ -801,10 +798,9 @@ async def get_operation_rule(auth: AuthDependency, name: str):
 @router.get("/helpers/warehouses-by-category", response_model=List[dict])
 async def get_warehouses_by_category(
     auth: AuthDependency, 
-    categories: Optional[List[str]] = Query(None)  # <-- 1. Hazlo Opcional
+    categories: Optional[List[str]] = Query(None),  # <-- 1. Hazlo Opcional
+    company_id: int = Query(...),
 ):
-    company_id = 1 # TODO: Obtener de la sesión/token
-    
     # 2. Añade esta comprobación:
     if not categories:
         return [] # Devuelve una lista vacía si no se proporcionan categorías
@@ -818,11 +814,13 @@ async def get_locations_by_warehouse(auth: AuthDependency, warehouse_id: int):
     return [dict(row) for row in data]
 
 @router.get("/helpers/partners-by-category", response_model=List[dict])
-async def get_partners_by_category(auth: AuthDependency, category_name: str):
-    company_id = 1 # TODO: Obtener de la sesión/token
+async def get_partners_by_category(
+    auth: AuthDependency, 
+    category_name: str,
+    company_id: int = Query(...)
+):
     data = db.get_partners(company_id, category_name)
     return [dict(row) for row in data]
-
 @router.get("/helpers/picking-type-details", response_model=dict)
 async def get_picking_type_details(auth: AuthDependency, pt_id: int):
     data = await asyncio.to_thread(db.get_picking_type_details, pt_id) # <-- ¡CORREGIDO!
@@ -832,13 +830,16 @@ async def get_picking_type_details(auth: AuthDependency, pt_id: int):
 
 @router.get("/helpers/location-details", response_model=dict)
 async def get_location_details(auth: AuthDependency, loc_id: int):
-    data = db.get_location_name_details(loc_id)
+    
+    # Envuelve la llamada síncrona en 'to_thread'
+    data = await asyncio.to_thread(db.get_location_name_details, loc_id)
+    
     if not data:
         raise HTTPException(status_code=404, detail="Ubicación no encontrada")
     return dict(data)
 
 @router.get("/helpers/picking-types-summary", response_model=List[dict])
-async def get_picking_types_summary(auth: AuthDependency, company_id: int = 1):
+async def get_picking_types_summary(auth: AuthDependency, company_id: int = Query(...)):
     """
     Obtiene una lista simple de todos los tipos de albarán (para las pestañas).
     """
@@ -849,7 +850,7 @@ async def get_picking_types_summary(auth: AuthDependency, company_id: int = 1):
 async def get_op_type_change_data(
     auth: AuthDependency,
     op_type_name: str,
-    company_id: int = 1
+    company_id: int = Query(...)
 ):
     """
     [COMBO-V2-OPTIMIZADO] Obtiene solo los datos de REGLA y DROPDOWNS
@@ -919,6 +920,3 @@ async def get_op_type_change_data(
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error en op-type-change-data: {e}")
-    
-
-    

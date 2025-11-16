@@ -17,7 +17,7 @@ AuthDependency = Annotated[TokenData, Depends(security.get_current_user_data)]
 @router.get("/", response_model=List[schemas.WarehouseResponse])
 async def get_all_warehouses(
     auth: AuthDependency,
-    company_id: int = 1,
+    company_id: int = Query(...),
     skip: int = 0,
     limit: int = 100,
     
@@ -58,7 +58,7 @@ async def get_all_warehouses(
 @router.get("/count", response_model=int)
 async def get_warehouses_count(
     auth: AuthDependency,
-    company_id: int = 1,
+    company_id: int = Query(...),
     
     # MISMOS PARÁMETROS DE FILTRO QUE ARRIBA
     name: Optional[str] = Query(None),
@@ -87,7 +87,7 @@ async def get_warehouses_count(
 @router.get("/simple", response_model=List[schemas.WarehouseSimple])
 async def get_warehouses_simple_list(
     auth: AuthDependency,
-    company_id: int = 1
+    company_id: int = Query(...),
 ):
     """
     Devuelve una lista simple de almacenes (id, name, code)
@@ -117,7 +117,7 @@ async def get_warehouse(warehouse_id: int, auth: AuthDependency):
 async def create_warehouse(
     warehouse: schemas.WarehouseCreate,
     auth: AuthDependency,
-    company_id: int = 1 # Fijo por ahora
+    company_id: int = Query(...)
 ):
     """ Crea un nuevo almacén y sus ubicaciones/operaciones por defecto. """
     if "warehouses.can_crud" not in auth.permissions:
@@ -151,6 +151,7 @@ async def create_warehouse(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error interno: {e}")
+
 
 @router.put("/{warehouse_id}", response_model=schemas.WarehouseResponse)
 async def update_warehouse(
@@ -207,7 +208,8 @@ async def inactivate_warehouse(warehouse_id: int, auth: AuthDependency):
 @router.get("/export/csv", response_class=StreamingResponse)
 async def export_warehouses_csv(
     auth: AuthDependency,
-    company_id: int = 1,
+    company_id: int = Query(...),
+    
 
     # Reutilizamos los filtros de la vista principal
     sort_by: Optional[str] = Query(None),
@@ -255,6 +257,7 @@ async def export_warehouses_csv(
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al generar CSV: {e}")
+
 
 @router.post("/import/csv", response_model=dict)
 async def import_warehouses_csv(

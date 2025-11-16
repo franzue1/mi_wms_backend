@@ -1069,7 +1069,6 @@ def get_work_orders(company_id):
 
 def get_work_order_details(wo_id): return execute_query("SELECT * FROM work_orders WHERE id =  %s", (wo_id,), fetchone=True)
 
-
 def create_work_order(company_id, ot_number, customer, address, service, job_type):
     """
     Crea una nueva Orden de Trabajo (Work Order) usando el pool de conexiones.
@@ -1106,6 +1105,73 @@ def create_work_order(company_id, ot_number, customer, address, service, job_typ
             traceback.print_exc()
             raise e
 
+def get_work_orders_for_export(company_id, filters={}):
+    """
+    Obtiene TODAS las OTs para exportar (sin paginación).
+    (Basado en get_work_orders_filtered_sorted)
+    """
+    sort_map = {
+        'id': "wo.id", 'ot_number': "wo.ot_number", 'service_type': "wo.service_type",
+        'job_type': "wo.job_type", 'customer_name': "wo.customer_name", 'address': "wo.address",
+        'phase': "wo.phase", 'warehouse_name': "warehouse_name",
+        'location_src_path': "location_src_path", 'service_act_number': "service_act_number",
+        'attention_date_str': "attention_date_sortable",
+        'date_registered': "wo.date_registered"
+    }
+    order_by_column = "wo.id" # Default sort para exportación
+    direction = "DESC"
+
+    base_query = """
+    FROM work_orders wo
+    LEFT JOIN pickings p_draft ON wo.id = p_draft.work_order_id AND p_draft.state = 'draft' AND p_draft.picking_type_id IN (SELECT id FROM picking_types WHERE code = 'OUT')
+    LEFT JOIN warehouses w_draft ON p_draft.warehouse_id = w_draft.id
+    LEFT JOIN locations l_draft ON p_draft.location_src_id = l_draft.id
+    LEFT JOIN pickings p_done ON wo.id = p_done.work_order_id AND p_done.state = 'done' AND p_done.picking_type_id IN (SELECT id FROM picking_types WHERE code = 'OUT')
+    LEFT JOIN warehouses w_done ON p_done.warehouse_id = w_done.id
+    LEFT JOIN locations l_done ON p_done.location_src_id = l_done.id
+    """
+    
+    select_clause = """
+    SELECT
+        wo.id, wo.company_id, wo.ot_number, wo.customer_name, wo.address,
+        wo.service_type, wo.job_type, wo.phase, wo.date_registered,
+        COALESCE(w_draft.name, w_done.name, 'N/A') as warehouse_name,
+        COALESCE(l_draft.path, l_done.path, '-') as location_src_path,
+        COALESCE(p_draft.service_act_number, p_done.service_act_number, '') as service_act_number,
+        COALESCE(
+            TO_CHAR(p_draft.attention_date, 'DD/MM/YYYY'),
+            TO_CHAR(p_done.attention_date, 'DD/MM/YYYY'),
+            ''
+        ) as attention_date_str,
+        COALESCE(p_draft.attention_date, p_done.attention_date, '1970-01-01') as attention_date_sortable
+    """
+
+    params = [company_id]
+    where_clauses = ["wo.company_id = %s"]
+    filter_map = {
+        'id': "wo.id", 'ot_number': "wo.ot_number", 'service_type': "wo.service_type",
+        'job_type': "wo.job_type", 'customer_name': "wo.customer_name",
+        'address': "wo.address", 'phase': "wo.phase",
+        'warehouse_name': "warehouse_name", 'location_src_path': "location_src_path",
+        'service_act_number': "service_act_number"
+    }
+
+    for key, value in filters.items():
+        db_column = filter_map.get(key)
+        if db_column and value:
+            if key == 'phase' or key == 'id':
+                where_clauses.append(f"{db_column} = %s")
+                params.append(value)
+            else:
+                where_clauses.append(f"{db_column} ILIKE %s")
+                params.append(f"%{value}%")
+
+    where_string = " WHERE " + " AND ".join(where_clauses)
+    
+    # NO 'LIMIT' OR 'OFFSET'
+    final_query = f"{select_clause} {base_query} {where_string} ORDER BY {order_by_column} {direction}"
+
+    return execute_query(final_query, tuple(params), fetchall=True)
 
 def get_picking_type_by_code(warehouse_id, code): return execute_query("SELECT id, default_location_src_id, default_location_dest_id FROM picking_types WHERE warehouse_id =  %s AND code =  %s", (warehouse_id, code), fetchone=True)
 
@@ -5988,6 +6054,7 @@ def get_work_orders_count(company_id, filters={}):
     
     result = execute_query(count_query, tuple(params), fetchone=True)
     return result['total_count'] if result else 0
+
 
 def validate_user_and_get_permissions(username, plain_password):
     """

@@ -17,7 +17,7 @@ AuthDependency = Annotated[TokenData, Depends(security.get_current_user_data)]
 @router.get("/", response_model=List[schemas.PartnerResponse])
 async def get_all_partners(
     auth: AuthDependency,
-    company_id: int = 1,
+    company_id: int = Query(...),
     skip: int = 0,
     limit: int = 100,
     
@@ -53,11 +53,12 @@ async def get_all_partners(
     )
     return [dict(p) for p in partners_raw]
 
+
 # --- ¡NUEVO ENDPOINT DE CONTEO! ---
 @router.get("/count", response_model=int)
 async def get_partners_count(
     auth: AuthDependency,
-    company_id: int = 1,
+    company_id: int = Query(...),
     
     # Mismos filtros que get_all_partners
     name: Optional[str] = Query(None),
@@ -94,7 +95,7 @@ async def get_partner(partner_id: int, auth: AuthDependency):
 async def create_partner(
     partner: schemas.PartnerCreate,
     auth: AuthDependency,
-    company_id: int = 1
+    company_id: int = Query(...),
 ):
     """ Crea un nuevo socio. """
     if "partners.can_crud" not in auth.permissions:
@@ -160,7 +161,7 @@ async def delete_partner(partner_id: int, auth: AuthDependency):
 @router.get("/export/csv", response_class=StreamingResponse)
 async def export_partners_csv(
     auth: AuthDependency,
-    company_id: int = 1,
+    company_id: int = Query(...),
 
     # Reutilizamos los filtros de la vista principal
     sort_by: Optional[str] = Query(None),

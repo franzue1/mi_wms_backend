@@ -17,7 +17,7 @@ AuthDependency = Annotated[TokenData, Depends(security.get_current_user_data)]
 @router.get("/", response_model=List[schemas.ProductResponse])
 async def get_all_products(
     auth: AuthDependency,
-    company_id: int = 1,
+    company_id: int = Query(...),
     skip: int = 0,
     limit: int = 100,
     
@@ -54,11 +54,12 @@ async def get_all_products(
     )
     return [dict(p) for p in products_raw]
 
+
 # --- ¡NUEVO ENDPOINT DE CONTEO! ---
 @router.get("/count", response_model=int)
 async def get_products_count(
     auth: AuthDependency,
-    company_id: int = 1,
+    company_id: int = Query(...),
     
     # Mismos filtros que get_all_products
     name: Optional[str] = Query(None),
@@ -81,11 +82,12 @@ async def get_products_count(
     count = db.get_products_count(company_id, filters=clean_filters)
     return count
 
+
 @router.post("/", response_model=schemas.ProductResponse, status_code=status.HTTP_201_CREATED)
 async def create_product(
     product: schemas.ProductCreate,
     auth: AuthDependency,
-    company_id: int = 1
+    company_id: int = Query(...)
 ):
     """ Crea un nuevo producto. """
     if "products.can_crud" not in auth.permissions:
@@ -164,7 +166,7 @@ async def delete_product(product_id: int, auth: AuthDependency):
 @router.get("/export/csv", response_class=StreamingResponse)
 async def export_products_csv(
     auth: AuthDependency,
-    company_id: int = 1,
+    company_id: int = Query(...),
 
     # Reutilizamos los mismos filtros que la vista principal
     sort_by: Optional[str] = Query(None),
@@ -231,8 +233,6 @@ async def export_products_csv(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al generar CSV: {e}")
     
-# app/api/products.py
-
 @router.post("/import/csv", response_model=dict)
 async def import_products_csv(
     auth: AuthDependency,
@@ -298,8 +298,8 @@ async def import_products_csv(
             try:
                 if not sku or not name:
                     raise ValueError("sku y name son obligatorios.")
-                
-                price = float(row.get('standard_price', '0').replace(',', '.'))
+                price_str = row.get('standard_price', '0').replace(',', '.')
+                price = float(price_str if price_str else '0')
                 if price < 0:
                     raise ValueError("standard_price no puede ser negativo.")
                 

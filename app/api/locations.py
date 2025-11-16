@@ -17,7 +17,7 @@ AuthDependency = Annotated[TokenData, Depends(security.get_current_user_data)]
 @router.get("/", response_model=List[schemas.LocationResponse])
 async def get_all_locations(
     auth: AuthDependency,
-    company_id: int = 1,
+    company_id: int = Query(...),
     skip: int = 0,
     limit: int = 100,
     
@@ -56,7 +56,7 @@ async def get_all_locations(
 @router.get("/count", response_model=int)
 async def get_locations_count(
     auth: AuthDependency,
-    company_id: int = 1,
+    company_id: int = Query(...),
 
     # Reutilizamos los filtros
     path: Optional[str] = Query(None),
@@ -94,7 +94,7 @@ async def get_location(location_id: int, auth: AuthDependency):
 async def create_location(
     location: schemas.LocationCreate,
     auth: AuthDependency,
-    company_id: int = 1
+    company_id: int = Query(...),
 ):
     """ Crea una nueva ubicación. """
     if "locations.can_crud" not in auth.permissions:
@@ -121,7 +121,7 @@ async def update_location(
     location_id: int,
     location: schemas.LocationUpdate,
     auth: AuthDependency,
-    company_id: int = 1
+    company_id: int = Query(...)
 ):
     """ Actualiza una ubicación existente. """
     if "locations.can_crud" not in auth.permissions:
@@ -166,7 +166,7 @@ async def delete_location(location_id: int, auth: AuthDependency):
 @router.get("/export/csv", response_class=StreamingResponse)
 async def export_locations_csv(
     auth: AuthDependency,
-    company_id: int = 1,
+    company_id: int = Query(...),
 
     # Reutilizamos los filtros
     sort_by: Optional[str] = Query(None),
@@ -230,7 +230,7 @@ async def export_locations_csv(
 @router.post("/import/csv", response_model=dict)
 async def import_locations_csv(
     auth: AuthDependency,
-    company_id: int = 1,
+    company_id: int = Query(...),
     file: UploadFile = File(...)
 ):
     """ Importa ubicaciones desde un archivo CSV. """
