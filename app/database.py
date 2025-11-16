@@ -1762,6 +1762,7 @@ def upsert_product_from_import(company_id, sku, name, category_id, uom_id, track
         if conn:
             db_pool.putconn(conn)
 
+
 def get_picking_details(picking_id, company_id): # <-- 1. ACEPTAR company_id
     query = """
         SELECT p.*, pt.code as type_code 
