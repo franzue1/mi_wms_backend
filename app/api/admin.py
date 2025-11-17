@@ -1,6 +1,7 @@
 # app/api/admin.py
 from fastapi import APIRouter, Depends, HTTPException, status
 from typing import List, Annotated, Dict
+from pydantic import BaseModel
 from app import database as db
 from app import schemas, security
 from app.security import TokenData, get_password_hash
@@ -141,14 +142,29 @@ async def update_role_permission(
         raise HTTPException(status_code=500, detail=msg)
     return {"message": msg}
 
+# ==========================================
 # --- Compañías (CRUD Completo) ---
+# ==========================================
 
-@router.get("/companies", response_model=List[schemas.ConfigResponse])
+# --- Modelos Pydantic Locales ---
+class CompanyBase(BaseModel):
+    name: str
+    country_code: str = "PE"
+
+class CompanyCreate(CompanyBase):
+    pass
+
+class CompanyUpdate(CompanyBase):
+    pass
+
+class CompanyResponse(CompanyBase):
+    id: int
+
+# --- Endpoints ---
+
+@router.get("/companies", response_model=List[CompanyResponse])
 async def get_all_companies(auth: AuthDependency):
-    """
-    Obtiene una lista de todas las compañías en el sistema.
-    """
-    # (Eventualmente, esto debería filtrar por permisos de usuario)
+    """Obtiene una lista de todas las compañías."""
     try:
         companies_raw = await asyncio.to_thread(db.get_companies) 
         return [dict(c) for c in companies_raw]
@@ -156,41 +172,32 @@ async def get_all_companies(auth: AuthDependency):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al obtener compañías: {e}")
 
-@router.post("/companies", response_model=schemas.ConfigResponse, status_code=201)
-async def create_company(
-    company_data: schemas.ConfigCreate, 
-    auth: AuthDependency
-):
-    """
-    Crea una nueva compañía.
-    """
-    if "admin.can_manage_roles" not in auth.permissions: # Reusamos un permiso de admin
+@router.post("/companies", response_model=CompanyResponse, status_code=201)
+async def create_company(company_data: CompanyCreate, auth: AuthDependency):
+    """Crea una nueva compañía."""
+    if "admin.can_manage_roles" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
     
     try:
-        new_company = await asyncio.to_thread(db.create_company, company_data.name)
+        new_company = await asyncio.to_thread(
+            db.create_company, company_data.name, company_data.country_code
+        )
         return dict(new_company)
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error interno al crear compañía: {e}")
+        raise HTTPException(status_code=500, detail=f"Error interno: {e}")
 
-@router.put("/companies/{company_id}", response_model=schemas.ConfigResponse)
-async def update_company(
-    company_id: int,
-    company_data: schemas.ConfigCreate, 
-    auth: AuthDependency
-):
-    """
-    Actualiza el nombre de una compañía.
-    """
-    if "admin.can_manage_roles" not in auth.permissions: # Reusamos un permiso de admin
+@router.put("/companies/{company_id}", response_model=CompanyResponse)
+async def update_company(company_id: int, company_data: CompanyUpdate, auth: AuthDependency):
+    """Actualiza nombre y país."""
+    if "admin.can_manage_roles" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
         
     try:
         updated_company = await asyncio.to_thread(
-            db.update_company, company_id, company_data.name
+            db.update_company, company_id, company_data.name, company_data.country_code
         )
         if not updated_company:
             raise HTTPException(status_code=404, detail="Compañía no encontrada.")
@@ -199,22 +206,21 @@ async def update_company(
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error interno al actualizar compañía: {e}")
+        raise HTTPException(status_code=500, detail=f"Error interno: {e}")
 
 @router.delete("/companies/{company_id}", status_code=200)
 async def delete_company(company_id: int, auth: AuthDependency):
-    """
-    Elimina una compañía.
-    """
-    if "admin.can_manage_roles" not in auth.permissions: # Reusamos un permiso de admin
+    # (Este endpoint no cambia, es igual que antes)
+    if "admin.can_manage_roles" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
         
     try:
         await asyncio.to_thread(db.delete_company, company_id)
         return {"message": "Compañía eliminada."}
     except ValueError as ve:
-        # Error de validación (ej. "Compañía tiene productos asociados")
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error interno al eliminar compañía: {e}")
+        raise HTTPException(status_code=500, detail=f"Error interno: {e}")
+
+

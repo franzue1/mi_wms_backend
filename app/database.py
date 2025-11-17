@@ -102,7 +102,6 @@ def execute_query(query, params=(), fetchone=False, fetchall=False):
             # --- 6. DEVOLVER LA CONEXIÓN AL POOL ---
             db_pool.putconn(conn) 
 
-
 def execute_commit_query(query, params=(), fetchone=False):
     """
     Función centralizada para ejecutar consultas de ESCRITURA (INSERT, UPDATE, DELETE).
@@ -147,7 +146,6 @@ def execute_commit_query(query, params=(), fetchone=False):
             # 3. Devolver la conexión al pool
             db_pool.putconn(conn)
 
-
 def create_schema(conn):
     cursor = conn.cursor()
     print("Verificando/Creando esquema de tablas en PostgreSQL...")
@@ -165,6 +163,13 @@ def create_schema(conn):
 
     # --- Tablas Principales (sin FKs) ---
     cursor.execute("CREATE TABLE IF NOT EXISTS companies (id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL);")
+    try:
+        # Añadimos la columna country_code si no existe. Por defecto 'PE' (Perú)
+        cursor.execute("ALTER TABLE companies ADD COLUMN IF NOT EXISTS country_code TEXT DEFAULT 'PE';")
+    except Exception: 
+        conn.rollback() # Ignorar si ya existe o falla levemente
+        cursor = conn.cursor()
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS product_categories (
             id SERIAL PRIMARY KEY,
@@ -6665,8 +6670,7 @@ def get_liquidation_details_combo(wo_id: int, company_id: int):
         traceback.print_exc()
         return None, f"Error interno de base de datos al cargar combo de liquidación: {e}"
 
-
-def create_company(name: str):
+def create_company(name: str, country_code: str = "PE"):
     """
     [MODIFICADO] Crea una nueva compañía Y sus categorías/socios por defecto,
     todo en una sola transacción atómica.
@@ -6689,8 +6693,8 @@ def create_company(name: str):
         with conn.cursor() as cursor:
             
             # 3. Insertar la Compañía
-            query_company = "INSERT INTO companies (name) VALUES (%s) RETURNING *"
-            cursor.execute(query_company, (name,))
+            query_company = "INSERT INTO companies (name, country_code) VALUES (%s, %s) RETURNING *"
+            cursor.execute(query_company, (name, country_code))
             new_company = cursor.fetchone()
             if not new_company:
                 raise Exception("No se pudo crear la compañía.")
@@ -6741,13 +6745,9 @@ def create_company(name: str):
             cursor.execute("INSERT INTO partners (company_id, name, category_id) VALUES (%s, %s, %s) ON CONFLICT (company_id, name) DO NOTHING", (new_company_id, "Cliente Varios", cat_cliente_id))
             cursor.execute("INSERT INTO partners (company_id, name, category_id) VALUES (%s, %s, %s) ON CONFLICT (company_id, name) DO NOTHING", (new_company_id, "Proveedor Varios", cat_externo_id))
             print("  -> Socios 'Varios' por defecto creados.")
-            
-            # --- FIN DE LA TRANSACCIÓN ---
-
             # 8. Si todo salió bien, hacer Commit
             conn.commit()
             print(f" -> [DB] Transacción completada (COMMIT). Compañía '{name}' está lista.")
-            
             # Devolver el objeto 'company' que obtuvimos en el paso 3
             return new_company
 
@@ -6756,28 +6756,25 @@ def create_company(name: str):
         if conn:
             conn.rollback()
         print(f"[ERROR] Falló la creación de la compañía (ROLLBACK ejecutado): {e}")
-        
         # Manejar error de duplicado (el más común)
         if "companies_name_key" in str(e):
             raise ValueError(f"La compañía '{name}' ya existe.")
-        
         # Re-lanzar el error para que la API lo capture
         raise e 
-    
     finally:
         # 10. Pase lo que pase, devolver la conexión al pool
         if conn:
             db_pool.putconn(conn)
 
-def update_company(company_id: int, name: str):
+def update_company(company_id: int, name: str, country_code: str):
     """
     Actualiza el nombre de una compañía y devuelve el registro actualizado.
     """
     print(f" -> [DB] Actualizando compañía ID: {company_id}")
-    query = "UPDATE companies SET name = %s WHERE id = %s RETURNING *"
+    query = "UPDATE companies SET name = %s, country_code = %s WHERE id = %s RETURNING *"
     
     try:
-        updated_company = execute_commit_query(query, (name, company_id), fetchone=True)
+        updated_company = execute_commit_query(query, (name, country_code, company_id), fetchone=True)
         return updated_company
     except Exception as e:
         if "companies_name_key" in str(e):
