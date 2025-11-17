@@ -71,11 +71,22 @@ async def get_pickings_count(
 ):
     if "operations.can_view" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
+    
     filters_dict = locals()
     clean_filters = _build_picking_filters(type_code, filters_dict)
+    
     try:
-        count = db.get_pickings_count(type_code, company_id, filters=clean_filters)
+        # --- ¡CAMBIO CLAVE AQUÍ! ---
+        # Usamos await asyncio.to_thread para no bloquear el servidor
+        count = await asyncio.to_thread(
+            db.get_pickings_count, 
+            type_code, 
+            company_id, 
+            filters=clean_filters
+        )
+        # ---------------------------
         return count
+
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al contar pickings: {e}")
