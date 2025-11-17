@@ -167,6 +167,7 @@ async def get_picking_ui_details(picking_id: int, auth: AuthDependency, company_
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al obtener UI-Details: {e}")
 
+
 @router.get("/{picking_id}/serials", response_model=Dict[int, Dict[str, float]])
 async def get_picking_serials(picking_id: int, auth: AuthDependency):
     """

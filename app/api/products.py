@@ -10,9 +10,32 @@ import traceback
 import io
 import csv
 from fastapi.responses import StreamingResponse
+import asyncio
 
 router = APIRouter()
 AuthDependency = Annotated[TokenData, Depends(security.get_current_user_data)]
+
+@router.get("/search-storable", response_model=List[schemas.ProductResponse])
+async def search_storable_products(
+    auth: AuthDependency,
+    company_id: int = Query(...),
+    term: str = Query(..., min_length=2) # Requiere al menos 2 caracteres
+):
+    """
+    Busca productos ALMACENABLES y ACTIVOS por nombre o SKU.
+    Optimizado para ser llamado por 'on_change' (con debounce).
+    """
+    try:
+        # Usamos to_thread para la consulta
+        products = await asyncio.to_thread(
+            db.search_storable_products_by_term,
+            company_id=company_id,
+            search_term=term
+        )
+        return [dict(p) for p in products]
+    except Exception as e:
+        # ... (manejo de error)
+        raise HTTPException(status_code=500, detail="Error al buscar productos")
 
 @router.get("/", response_model=List[schemas.ProductResponse])
 async def get_all_products(
@@ -340,3 +363,36 @@ async def import_products_csv(
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error crítico al procesar CSV: {e}")
+    
+# En app/api/products.py (o donde prefieras)
+
+class SKUImportRequest(BaseModel):
+    company_id: int
+    raw_text: str
+
+class SKUImportResponse(BaseModel):
+    found: List[dict]
+    errors: List[str]
+
+@router.post("/validate-skus-import", response_model=SKUImportResponse)
+async def validate_skus_for_import(
+    request: SKUImportRequest,
+    auth: AuthDependency
+):
+    """
+    Valida una lista de SKUs pegados desde texto crudo.
+    Devuelve los productos encontrados y los errores.
+    """
+    try:
+        # La lógica pesada la ponemos en una función de DB/lógica
+        found_products, errors = await asyncio.to_thread(
+            db.process_sku_import_list,
+            company_id=request.company_id,
+            raw_text=request.raw_text
+        )
+        
+        return {"found": [dict(p) for p in found_products], "errors": errors}
+        
+    except Exception as e:
+        # ... (manejo de error)
+        raise HTTPException(status_code=500, detail=f"Error al procesar SKUs: {e}")

@@ -102,6 +102,7 @@ def execute_query(query, params=(), fetchone=False, fetchall=False):
             # --- 6. DEVOLVER LA CONEXIÓN AL POOL ---
             db_pool.putconn(conn) 
 
+
 def execute_commit_query(query, params=(), fetchone=False):
     """
     Función centralizada para ejecutar consultas de ESCRITURA (INSERT, UPDATE, DELETE).
@@ -146,6 +147,7 @@ def execute_commit_query(query, params=(), fetchone=False):
             # 3. Devolver la conexión al pool
             db_pool.putconn(conn)
 
+
 def create_schema(conn):
     cursor = conn.cursor()
     print("Verificando/Creando esquema de tablas en PostgreSQL...")
@@ -171,7 +173,7 @@ def create_schema(conn):
             UNIQUE (company_id, name)
         );
     """)
-    cursor.execute("CREATE TABLE IF NOT EXISTS uom (id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL);") # <-- UOM SE QUEDA IGUAL (GLOBAL)
+    cursor.execute("CREATE TABLE IF NOT EXISTS uom (id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL);")
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS warehouse_categories (
             id SERIAL PRIMARY KEY,
@@ -432,6 +434,7 @@ def create_schema(conn):
     print(" -> Índices creados/verificados.")
 
     conn.commit()
+
 
 def create_initial_data(conn):
     cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor) # Usar DictCursor
@@ -6511,6 +6514,7 @@ def get_picking_ui_details_optimized(picking_id: int, company_id: int):
     
     return None, "No se encontraron datos."
 
+
 def get_liquidation_details_combo(wo_id: int, company_id: int):
     """
     [COMBO-CORREGIDO] Obtiene TODOS los datos para la UI de detalle de Liquidación,
@@ -6802,3 +6806,124 @@ def delete_company(company_id: int):
     execute_commit_query("DELETE FROM companies WHERE id = %s", (company_id,))
     return True
         
+def search_storable_products_by_term(company_id: int, search_term: str):
+    """
+    Busca productos por nombre o SKU usando ILIKE y LIMIT.
+    """
+    # El '%%' es para la sintaxis de 'LIKE' en SQL
+    like_term = f"%{search_term}%" 
+
+    sql_query = """
+        SELECT 
+            pr.id, pr.name, pr.sku, pr.tracking, pr.ownership, 
+            pr.uom_id, pr.standard_price, u.name as uom_name,
+            pr.company_id  -- <--- ¡AÑADE ESTA LÍNEA!
+        FROM products pr
+        LEFT JOIN uom u ON pr.uom_id = u.id
+        WHERE 
+            pr.company_id = %(company_id)s
+            AND pr.type = 'storable'
+            AND (pr.name ILIKE %(term)s OR pr.sku ILIKE %(term)s)
+        ORDER BY 
+            pr.name
+        LIMIT 20; 
+    """
+
+    params = {"company_id": company_id, "term": like_term}
+
+    results_rows = execute_query(sql_query, params, fetchall=True)
+    if not results_rows:
+        return []
+    return [dict(row) for row in results_rows]  
+
+def process_sku_import_list(company_id: int, raw_text: str):
+    """
+    Parsea una lista de SKUs y cantidades, y los valida contra la BD.
+    Usa UNA sola consulta SQL para máxima eficiencia.
+    """
+    parsed_lines = {} # Usamos un dict para agrupar SKUs duplicados
+    errors = []
+    
+    lines = raw_text.strip().split('\n')
+    
+    for i, line in enumerate(lines):
+        if not line.strip(): continue
+        
+        sku = ""
+        qty_str = "1"
+        
+        if '*' in line:
+            parts = line.split('*')
+            if len(parts) == 2:
+                sku = parts[0].strip().lower() # Normalizar a minúsculas
+                qty_str = parts[1].strip().replace(',', '.')
+            else:
+                errors.append(f"Línea {i+1}: Formato inválido (demasiados '*').")
+                continue
+        else:
+            sku = line.strip().lower() # Normalizar a minúsculas
+        
+        if not sku:
+            errors.append(f"Línea {i+1}: SKU vacío.")
+            continue
+            
+        try:
+            quantity = float(qty_str)
+            if quantity <= 0:
+                errors.append(f"Línea {i+1}: Cantidad debe ser positiva.")
+                continue
+        except (ValueError, TypeError):
+            errors.append(f"Línea {i+1}: Cantidad '{qty_str}' no es un número.")
+            continue
+            
+        # Agrupar cantidades por SKU
+        parsed_lines[sku] = parsed_lines.get(sku, 0) + quantity
+
+    # --- Validación contra la Base de Datos ---
+    
+    if not parsed_lines:
+        return [], errors # No hay nada que buscar
+
+    # Obtenemos la lista de SKUs únicos a buscar
+    skus_to_find = list(parsed_lines.keys())
+    
+    # ¡Consulta SQL eficiente!
+    # Usamos "LOWER(pr.sku) = ANY(%(skus)s)" para usar un array de PostgreSQL
+    sql_query = """
+        SELECT 
+            pr.id, pr.name, pr.sku, pr.tracking, pr.ownership, 
+            pr.uom_id, pr.standard_price, u.name as uom_name
+        FROM products pr
+        LEFT JOIN uom u ON pr.uom_id = u.id
+        WHERE 
+            pr.company_id = %(company_id)s
+            AND pr.type = 'storable'
+            AND LOWER(pr.sku) = ANY(%(skus)s); -- ¡Busca en un array!
+    """
+    params = {"company_id": company_id, "skus": skus_to_find}
+    db_results = execute_query(sql_query, params, fetchall=True)
+    
+# Asegúrate de que db_results sea una lista vacía si es None
+    if db_results is None:
+        db_results = []
+
+    found_products_map = {row['sku'].lower(): row for row in db_results}
+    
+    # --- Construir la respuesta ---
+    final_found_list = []
+    
+    for sku_lower, total_qty in parsed_lines.items():
+        product_data = found_products_map.get(sku_lower)
+        
+        if product_data:
+            # Producto encontrado. Añadir la cantidad
+            # Esto es lo que Flet recibirá en 'found'
+            final_found_list.append({
+                "product": dict(product_data),  # <--- Esta es la corrección
+                "quantity": total_qty
+            })
+        else:
+            # Producto no encontrado
+            errors.append(f"SKU '{sku_lower}' no encontrado, inactivo o no almacenable.")
+
+    return final_found_list, errors
