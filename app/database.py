@@ -12,7 +12,7 @@ import hashlib
 from dotenv import load_dotenv
 import json
 
-# --- 2. CONFIGURACIÓN DEL POOL GLOBAL ---
+# --- CONFIGURACIÓN DEL POOL GLOBAL ---
 # Este pool se creará UNA VEZ al iniciar la app.
 db_pool = None
 DATABASE_URL = None
@@ -42,6 +42,8 @@ def init_db_pool():
     DATABASE_URL = os.environ.get("DATABASE_URL")
     if DATABASE_URL is None:
         raise ValueError("No se pudo conectar: DATABASE_URL no está configurada.")
+
+    print(f"DEBUG URL: {repr(DATABASE_URL)}")
 
     try:
         # --- 3. CREAR EL POOL ---
@@ -216,18 +218,24 @@ def create_schema(conn):
     """)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS products ( 
-            id SERIAL PRIMARY KEY, company_id INTEGER NOT NULL, name TEXT NOT NULL, sku TEXT UNIQUE NOT NULL, 
+            id SERIAL PRIMARY KEY, company_id INTEGER NOT NULL, name TEXT NOT NULL, sku TEXT NOT NULL, 
             type TEXT NOT NULL DEFAULT 'storable', barcode TEXT, notes TEXT, 
             category_id INTEGER, uom_id INTEGER,
             tracking TEXT NOT NULL DEFAULT 'none',
             ownership TEXT NOT NULL DEFAULT 'owned' CHECK(ownership IN ('owned', 'consigned')),
-            standard_price REAL DEFAULT 0
+            standard_price REAL DEFAULT 0,
+            UNIQUE (company_id, sku)
         );""")
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS warehouses (
-            id SERIAL PRIMARY KEY, company_id INTEGER NOT NULL, name TEXT NOT NULL, code TEXT NOT NULL UNIQUE,
+            id SERIAL PRIMARY KEY, 
+            company_id INTEGER NOT NULL, 
+            name TEXT NOT NULL, 
+            code TEXT NOT NULL, -- Quitamos UNIQUE de aquí
             social_reason TEXT, ruc TEXT, email TEXT, phone TEXT, address TEXT,
-            category_id INTEGER, status TEXT NOT NULL DEFAULT 'activo' CHECK(status IN ('activo', 'inactivo'))
+            category_id INTEGER, 
+            status TEXT NOT NULL DEFAULT 'activo' CHECK(status IN ('activo', 'inactivo')),
+            UNIQUE (company_id, code) -- Añadimos restricción compuesta
         );
     """)
     cursor.execute("""
@@ -237,17 +245,28 @@ def create_schema(conn):
             category_id INTEGER, UNIQUE (company_id, name)
         );
     """)
-    cursor.execute("""CREATE TABLE IF NOT EXISTS locations (id SERIAL PRIMARY KEY, company_id INTEGER NOT NULL, name TEXT NOT NULL, path TEXT UNIQUE NOT NULL, type TEXT NOT NULL DEFAULT 'internal', category TEXT, warehouse_id INTEGER);""")
-
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS locations (
+            id SERIAL PRIMARY KEY, 
+            company_id INTEGER NOT NULL, 
+            name TEXT NOT NULL, 
+            path TEXT NOT NULL, -- Quitamos UNIQUE de aquí
+            type TEXT NOT NULL DEFAULT 'internal', 
+            category TEXT, 
+            warehouse_id INTEGER,
+            UNIQUE (company_id, path) -- Añadimos restricción compuesta
+        );
+    """)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS picking_types (
             id SERIAL PRIMARY KEY, 
             company_id INTEGER NOT NULL, 
-            name TEXT NOT NULL UNIQUE,  -- <-- ¡AÑADIMOS UNIQUE AQUÍ!
+            name TEXT NOT NULL, -- Quitamos UNIQUE de aquí
             code TEXT NOT NULL, 
             warehouse_id INTEGER NOT NULL, 
             default_location_src_id INTEGER, 
-            default_location_dest_id INTEGER
+            default_location_dest_id INTEGER,
+            UNIQUE (company_id, name) -- Añadimos restricción compuesta
         );""")
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS stock_lots (
@@ -494,7 +513,11 @@ def create_initial_data(conn):
         (default_company_id, "Pérdida de Inventario", "Virtual/Scrap", "inventory", "AJUSTE"),
         (default_company_id, "Contrata Cliente", "PA/ContractorCustomer", "customer", "CONTRATA CLIENTE")
     ]
-    cursor.executemany("INSERT INTO locations (company_id, name, path, type, category) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (path) DO NOTHING", locations_data)
+    cursor.executemany("""
+        INSERT INTO locations (company_id, name, path, type, category) 
+        VALUES (%s, %s, %s, %s, %s) 
+        ON CONFLICT (company_id, path) DO NOTHING
+    """, locations_data)
 
     # --- 3. Tipos de Operación (Estos son globales, no llevan company_id) ---
     op_types = [
@@ -585,9 +608,9 @@ def create_initial_data(conn):
     ]
     cursor.executemany("""
         INSERT INTO products (company_id, name, sku, category_id, tracking, uom_id, ownership, standard_price) 
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (sku) DO NOTHING
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s) 
+        ON CONFLICT (company_id, sku) DO NOTHING
     """, products_to_create)
-    
     # --- 8. Creamos los ALMACENES por defecto ---
     cursor.execute("SELECT id, name FROM warehouse_categories WHERE company_id = %s", (default_company_id,))
     all_wh_categories_actual = cursor.fetchall()
@@ -629,8 +652,10 @@ def create_initial_data(conn):
             
             cursor.execute("""
                 INSERT INTO picking_types (company_id, name, code, warehouse_id, default_location_src_id, default_location_dest_id) 
-                VALUES (%s, %s, 'ADJ', %s, %s, %s) ON CONFLICT (name) DO NOTHING
+                VALUES (%s, %s, 'ADJ', %s, %s, %s) 
+                ON CONFLICT (company_id, name) DO NOTHING
             """, (default_company_id, "Ajustes de Inventario", default_wh_id, adj_loc_id, adj_loc_id))
+
         else:
             print("[WARN] No se encontró categoría 'ALMACEN PRINCIPAL'. No se creó el tipo de operación ADJ.")
     else:
@@ -1284,12 +1309,7 @@ def get_lot_by_name(cursor, product_id, lot_name):
         return cursor.fetchone()
     
 def create_lot(cursor, product_id, lot_name):
-    """
-    Crea un nuevo lote (stock_lot) usando un cursor existente y devuelve el nuevo ID.
-    (Versión PostgreSQL con ON CONFLICT)
-    """
     try:
-        # Intentamos insertar. Si ya existe (ON CONFLICT), no hacemos nada.
         cursor.execute(
             "INSERT INTO stock_lots (name, product_id) VALUES (%s, %s) ON CONFLICT (product_id, name) DO NOTHING RETURNING id",
             (lot_name, product_id)
@@ -1810,77 +1830,53 @@ def get_or_create_by_name(cursor, table, name):
 
 def upsert_product_from_import(company_id, sku, name, category_id, uom_id, tracking, ownership, price):
     """
-    Intenta insertar o actualizar un producto (UPSERT).
-    [REFACTORIZADO] Usa el pool de conexiones y maneja la transacción
-    con commit/rollback de forma atómica.
+    Inserta o actualiza un producto (UPSERT).
+    [OPTIMIZADO] Usa ON CONFLICT para atomicidad y eficiencia.
     """
     
     # 1. Obtener el pool
     global db_pool
     if not db_pool:
-        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
         init_db_pool()
-        if not db_pool:
-            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
 
-    # 2. Preparar la conexión
     conn = None
+    
+    # Definimos la consulta UPSERT
+    # Fíjate en: ON CONFLICT (company_id, sku)
+    query = """
+        INSERT INTO products (company_id, sku, name, category_id, uom_id, tracking, ownership, standard_price)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (company_id, sku) DO UPDATE SET
+            name = EXCLUDED.name,
+            category_id = EXCLUDED.category_id,
+            uom_id = EXCLUDED.uom_id,
+            tracking = EXCLUDED.tracking,
+            ownership = EXCLUDED.ownership,
+            standard_price = EXCLUDED.standard_price
+        RETURNING (xmax = 0) AS inserted;
+    """
+    
+    params = (company_id, sku, name, category_id, uom_id, tracking, ownership, price)
+
     try:
-        # 3. Obtener UNA conexión para toda la operación
         conn = db_pool.getconn()
         
-        # 4. Usar DictCursor (tu código original lo necesita para existing_product['id'])
-        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+        # Usamos el cursor estándar (no necesitamos DictCursor para esto)
+        with conn.cursor() as cursor:
+            cursor.execute(query, params)
+            was_inserted = cursor.fetchone()[0]
             
-            # --- 1. Leer (SELECT) ---
-            cursor.execute(
-                "SELECT id FROM products WHERE sku = %s AND company_id = %s",
-                (sku, company_id)
-            )
-            existing_product = cursor.fetchone()
-            
-            # --- 2. Lógica y Escritura (UPDATE/INSERT) ---
-            if existing_product:
-                # 2A. Si existe, ACTUALIZAR
-                product_id = existing_product['id']
-                cursor.execute(
-                    """UPDATE products SET 
-                        name = %s, category_id = %s, uom_id = %s, 
-                        tracking = %s, ownership = %s, standard_price = %s 
-                        WHERE id = %s""",
-                    (name, category_id, uom_id, tracking, ownership, price, product_id)
-                )
-                conn.commit() # <-- Commit de la rama UPDATE
-                return "updated"
-            else:
-                # 2B. Si no existe, CREAR
-                cursor.execute(
-                    """INSERT INTO products 
-                        (company_id, sku, name, category_id, uom_id, tracking, ownership, standard_price) 
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                    (company_id, sku, name, category_id, uom_id, tracking, ownership, price)
-                )
-                conn.commit() # <-- Commit de la rama INSERT
-                return "created"
+            conn.commit()
+            return "created" if was_inserted else "updated"
 
-    except psycopg2.Error as db_err:
-        # 5. Si algo falla, hacer ROLLBACK
-        if conn:
-            conn.rollback()
-        print(f"Error procesando fila para SKU {sku}: {db_err}")
-        raise db_err # Re-lanzar para que el importador lo sepa
     except Exception as e:
-        # 5B. También en errores inesperados
-        if conn:
-            conn.rollback()
-        print(f"Error inesperado en upsert_product_from_import: {e}")
+        if conn: conn.rollback()
+        print(f"Error procesando fila para SKU {sku}: {e}")
+        # Es importante lanzar el error para que el contador de errores del importador funcione
         raise e
         
     finally:
-        # 6. PASE LO QUE PASE, devolver la conexión al pool
-        if conn:
-            db_pool.putconn(conn)
-
+        if conn: db_pool.putconn(conn)
 
 def get_picking_details(picking_id, company_id): # <-- 1. ACEPTAR company_id
     query = """
@@ -1996,16 +1992,21 @@ def get_warehouse_details_by_id(warehouse_id: int):
     return execute_query(query, (warehouse_id,), fetchone=True)
 
 def create_warehouse_with_data(cursor, name, code, company_id, category_id, for_existing=False, warehouse_id=None):
-    """Crea ubicaciones y tipos de operación para un almacén. (Versión PostgreSQL)"""
+    """
+    Crea ubicaciones y tipos de operación para un almacén. 
+    (Versión PostgreSQL - Corregida para Multi-Compañía)
+    """
     
     if not for_existing:
+        # --- CORRECCIÓN 1: Unicidad Compuesta en Warehouses ---
         cursor.execute(
             """INSERT INTO warehouses (company_id, name, code, category_id, status) 
                VALUES (%s, %s, %s, %s, 'activo') 
-               ON CONFLICT (code) DO NOTHING 
+               ON CONFLICT (company_id, code) DO NOTHING 
                RETURNING id""", 
             (company_id, name, code, category_id)
         )
+        # -------------------------------------------------------
         warehouse_id_row = cursor.fetchone()
         if not warehouse_id_row:
             print(f" -> Almacén '{code}' ya existía (llamado desde create_warehouse_with_data). Omitiendo.")
@@ -2014,61 +2015,66 @@ def create_warehouse_with_data(cursor, name, code, company_id, category_id, for_
 
     # --- 1. Crear Ubicación de Stock Principal ---
     stock_loc_name = f"{code}/Stock"
-    # (Corregido el INSERT, tu versión SQLite tenía un error aquí)
+    # --- CORRECCIÓN 2: Unicidad Compuesta en Locations ---
     cursor.execute(
         """INSERT INTO locations (company_id, name, path, type, category, warehouse_id) 
            VALUES (%s, 'Stock', %s, 'internal', %s, %s) 
-           ON CONFLICT (path) DO NOTHING 
+           ON CONFLICT (company_id, path) DO NOTHING 
            RETURNING id""",
         (company_id, stock_loc_name, "ALMACEN PRINCIPAL", warehouse_id)
     )
+    # -----------------------------------------------------
     stock_loc_id_row = cursor.fetchone()
-    if not stock_loc_id_row: # Si ya existía
-        cursor.execute("SELECT id FROM locations WHERE path = %s", (stock_loc_name,))
+    if not stock_loc_id_row: # Si ya existía, buscarlo con filtro de compañía
+        cursor.execute("SELECT id FROM locations WHERE path = %s AND company_id = %s", (stock_loc_name, company_id))
         stock_loc_id_row = cursor.fetchone()
     stock_loc_id = stock_loc_id_row[0]
 
     # --- 2. Crear Ubicación de Averiados ---
     damaged_loc_name = f"{code}/Averiados"
+    # --- CORRECCIÓN 3: Unicidad Compuesta en Locations ---
     cursor.execute(
         """INSERT INTO locations (company_id, name, path, type, category, warehouse_id) 
            VALUES (%s, 'Averiados', %s, 'internal', %s, %s) 
-           ON CONFLICT (path) DO NOTHING 
+           ON CONFLICT (company_id, path) DO NOTHING 
            RETURNING id""",
         (company_id, damaged_loc_name, "AVERIADO", warehouse_id)
     )
+    # -----------------------------------------------------
     damaged_loc_id_row = cursor.fetchone()
     if not damaged_loc_id_row: # Si ya existía
-        cursor.execute("SELECT id FROM locations WHERE path = %s", (damaged_loc_name,))
+        cursor.execute("SELECT id FROM locations WHERE path = %s AND company_id = %s", (damaged_loc_name, company_id))
         damaged_loc_id_row = cursor.fetchone()
     damaged_loc_id = damaged_loc_id_row[0]
     
-    # --- 3. Obtener IDs de Ubicaciones Virtuales (Sin "magic numbers") ---
-    cursor.execute("SELECT id FROM locations WHERE category = 'PROVEEDOR' LIMIT 1")
+    # --- 3. Obtener IDs de Ubicaciones Virtuales (Filtrado por Compañía) ---
+    # Añadimos 'AND company_id = %s' para evitar mezclar datos entre empresas
+    cursor.execute("SELECT id FROM locations WHERE category = 'PROVEEDOR' AND company_id = %s LIMIT 1", (company_id,))
     vendor_loc_row = cursor.fetchone()
-    if not vendor_loc_row: raise Exception("Ubicación virtual 'PROVEEDOR' no encontrada. create_initial_data debe correr primero.")
+    if not vendor_loc_row: raise Exception(f"Ubicación virtual 'PROVEEDOR' no encontrada para cia {company_id}.")
     vendor_loc_id = vendor_loc_row[0]
 
-    cursor.execute("SELECT id FROM locations WHERE category = 'CLIENTE' LIMIT 1")
+    cursor.execute("SELECT id FROM locations WHERE category = 'CLIENTE' AND company_id = %s LIMIT 1", (company_id,))
     customer_loc_row = cursor.fetchone()
-    if not customer_loc_row: raise Exception("Ubicación virtual 'CLIENTE' no encontrada.")
+    if not customer_loc_row: raise Exception(f"Ubicación virtual 'CLIENTE' no encontrada para cia {company_id}.")
     customer_loc_id = customer_loc_row[0]
     
-    # --- 4. Crear Tipos de Operación (usando %s y ON CONFLICT) ---
+    # --- 4. Crear Tipos de Operación ---
     picking_types_to_create = [
         (company_id, f"Recepciones {code}", 'IN', warehouse_id, vendor_loc_id, stock_loc_id),
         (company_id, f"Liquidaciones {code}", 'OUT', warehouse_id, stock_loc_id, customer_loc_id),
         (company_id, f"Despachos {code}", 'INT', warehouse_id, None, None),
         (company_id, f"Retiros {code}", 'RET', warehouse_id, customer_loc_id, damaged_loc_id)
     ]
+    # --- CORRECCIÓN 4: Unicidad Compuesta en Picking Types ---
     cursor.executemany("""
         INSERT INTO picking_types (company_id, name, code, warehouse_id, default_location_src_id, default_location_dest_id) 
         VALUES (%s, %s, %s, %s, %s, %s) 
-        ON CONFLICT (name) DO NOTHING
+        ON CONFLICT (company_id, name) DO NOTHING
     """, picking_types_to_create)
+    # ---------------------------------------------------------
     
     print(f" -> Datos (ubicaciones, tipos op) creados para Almacén '{code}' (ID: {warehouse_id}).")
-    # El commit se hace en create_initial_data
 
 def create_warehouse(name, code, category_id, company_id, social_reason, ruc, email, phone, address, status):
     """
@@ -2125,19 +2131,16 @@ def _create_warehouse_with_cursor(cursor, name, code, category_id, company_id, s
     cursor.execute(
         """INSERT INTO warehouses (name, code, category_id, company_id, social_reason, ruc, email, phone, address, status) 
            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-           ON CONFLICT (code) DO NOTHING
+           ON CONFLICT (company_id, code) DO NOTHING
            RETURNING id""",
         (name, code, category_id, company_id, social_reason, ruc, email, phone, address, status)
     )
     warehouse_id_row = cursor.fetchone()
-    
     if not warehouse_id_row:
-        print(f" -> Almacén con código '{code}' ya existía. Omitiendo creación de datos duplicados.")
-        return # Si el almacén ya existía, no creamos sus ubicaciones/tipos de op de nuevo
-
+        print(f" -> Almacén '{code}' ya existe en esta compañía. Omitiendo.")
+        return 
     warehouse_id = warehouse_id_row[0]
-
-    # Pasamos el cursor que ya tenemos, NO la conexión
+    # Pasamos el cursor que ya tenemos
     create_warehouse_with_data(cursor, name, code, company_id, category_id, for_existing=True, warehouse_id=warehouse_id)
 
 def update_warehouse(wh_id, name, code, category_id, social_reason, ruc, email, phone, address, status):
@@ -4072,26 +4075,23 @@ def get_warehouse_category_id_by_name(name):
 def upsert_warehouse_from_import(company_id, code, name, status, social_reason, ruc, email, phone, address, category_id):
     """
     Inserta o actualiza un almacén desde la importación.
-    [REFACTORIZADO] Usa el pool y maneja la transacción atómica (commit/rollback),
-    incluyendo la creación de datos asociados si es un nuevo almacén.
+    (Corregido para Multi-Compañía)
     """
     
     # 1. Obtener el pool
     global db_pool
     if not db_pool:
-        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
         init_db_pool()
-        if not db_pool:
-            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
 
     # 2. Preparar la conexión
     conn = None
     
-    # (Definir la consulta y parámetros aquí es una buena práctica)
+    # --- ¡CORRECCIÓN AQUÍ! ---
+    # Cambiamos ON CONFLICT (code) -> ON CONFLICT (company_id, code)
     query = """
         INSERT INTO warehouses (company_id, code, name, status, social_reason, ruc, email, phone, address, category_id)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (code) DO UPDATE SET
+        ON CONFLICT (company_id, code) DO UPDATE SET
             name = EXCLUDED.name,
             status = EXCLUDED.status,
             social_reason = EXCLUDED.social_reason,
@@ -4102,13 +4102,13 @@ def upsert_warehouse_from_import(company_id, code, name, status, social_reason, 
             category_id = EXCLUDED.category_id
         RETURNING (xmax = 0) AS inserted;
     """
+    # -------------------------
+
     params = (company_id, code, name, status, social_reason, ruc, email, phone, address, category_id)
 
     try:
-        # 3. Obtener UNA conexión del pool
         conn = db_pool.getconn()
         
-        # 4. Usar un cursor estándar (tu lógica usa fetchone()[0])
         with conn.cursor() as cursor:
             
             # --- 1. Ejecutar el UPSERT ---
@@ -4118,7 +4118,7 @@ def upsert_warehouse_from_import(company_id, code, name, status, social_reason, 
             # --- 2. Lógica Condicional ---
             if was_inserted:
                 print(f" -> Almacén nuevo '{code}'. Creando datos asociados...")
-                # Necesitamos el ID del almacén que acabamos de crear
+                # Recuperar ID (Filtro por company_id + code)
                 cursor.execute("SELECT id FROM warehouses WHERE code = %s AND company_id = %s", (code, company_id))
                 new_wh_id_row = cursor.fetchone()
                 
@@ -4127,25 +4127,24 @@ def upsert_warehouse_from_import(company_id, code, name, status, social_reason, 
                 
                 new_wh_id = new_wh_id_row[0]
                 
-                # Llamar a la función 'worker' que crea ubicaciones, etc.
+                # Llamar a la función auxiliar (que ya corregimos en el paso anterior)
                 create_warehouse_with_data(cursor, name, code, company_id, category_id, for_existing=True, warehouse_id=new_wh_id)
                 print(f" -> Datos asociados creados para el almacén ID {new_wh_id}.")
 
-            # 5. Si todo salió bien (el UPSERT y la creación condicional), hacer COMMIT
+            # 5. Si todo salió bien, hacer COMMIT
             conn.commit()
             
             return "created" if was_inserted else "updated"
 
     except Exception as e:
-        # 6. ¡CRÍTICO! ROLLBACK si algo falla
         if conn:
             conn.rollback()
         print(f"Error procesando fila para CÓDIGO {code} (ROLLBACK ejecutado): {e}")
         traceback.print_exc()
-        return "error"
+        # Es mejor lanzar la excepción para que la API sepa que falló
+        raise e 
         
     finally:
-        # 7. PASE LO QUE PASE, devolver la conexión al pool
         if conn:
             db_pool.putconn(conn)
 
@@ -6807,7 +6806,7 @@ def get_liquidation_details_combo(wo_id: int, company_id: int):
 
 def create_company(name: str, country_code: str = "PE"):
     """
-    Crea una nueva compañía con país.
+    Crea una nueva compañía con país e inicializa sus datos base.
     """
     print(f" -> [DB] Iniciando transacción para crear compañía: {name} ({country_code})")
 
@@ -6819,32 +6818,58 @@ def create_company(name: str, country_code: str = "PE"):
         conn.cursor_factory = psycopg2.extras.DictCursor
 
         with conn.cursor() as cursor:
-            # --- ¡AQUÍ ESTÁ LA CLAVE! ---
-            # Asegúrate de que la query tenga 'country_code' en el INSERT
+            # 1. Crear Compañía
             query_company = "INSERT INTO companies (name, country_code) VALUES (%s, %s) RETURNING *"
             cursor.execute(query_company, (name, country_code))
-            # ----------------------------
             
             new_company = cursor.fetchone()
             new_company_id = new_company['id']
 
-            # ... (El resto de la lógica de categorías/socios se queda IGUAL) ...
+            # 2. Categorías de Almacén
             wh_categories = [(new_company_id, "ALMACEN PRINCIPAL"), (new_company_id, "CONTRATISTA")]
-            cursor.executemany("INSERT INTO warehouse_categories (company_id, name) VALUES (%s, %s) ON CONFLICT (company_id, name) DO NOTHING", wh_categories)
+            cursor.executemany("""
+                INSERT INTO warehouse_categories (company_id, name) VALUES (%s, %s) 
+                ON CONFLICT (company_id, name) DO NOTHING
+            """, wh_categories)
             
+            # 3. Categorías de Socio
             partner_categories = [(new_company_id, "Proveedor Externo"), (new_company_id, "Proveedor Cliente")]
-            cursor.executemany("INSERT INTO partner_categories (company_id, name) VALUES (%s, %s) ON CONFLICT (company_id, name) DO NOTHING", partner_categories)
+            cursor.executemany("""
+                INSERT INTO partner_categories (company_id, name) VALUES (%s, %s) 
+                ON CONFLICT (company_id, name) DO NOTHING
+            """, partner_categories)
             
-            cursor.execute("INSERT INTO product_categories (company_id, name) VALUES (%s, %s) ON CONFLICT (company_id, name) DO NOTHING", (new_company_id, 'General'))
+            # 4. Categoría de Producto
+            cursor.execute("""
+                INSERT INTO product_categories (company_id, name) VALUES (%s, %s) 
+                ON CONFLICT (company_id, name) DO NOTHING
+            """, (new_company_id, 'General'))
 
-            # Insertar socios varios...
+            # 5. Obtener IDs de Categorías (para crear socios)
+            # Usamos AND company_id para asegurarnos de obtener las de ESTA empresa
             cursor.execute("SELECT id FROM partner_categories WHERE name = %s AND company_id = %s", ("Proveedor Cliente", new_company_id))
-            cat_cliente_id = cursor.fetchone()['id']
-            cursor.execute("SELECT id FROM partner_categories WHERE name = %s AND company_id = %s", ("Proveedor Externo", new_company_id))
-            cat_externo_id = cursor.fetchone()['id']
+            cat_cliente_row = cursor.fetchone()
             
-            cursor.execute("INSERT INTO partners (company_id, name, category_id) VALUES (%s, %s, %s) ON CONFLICT (company_id, name) DO NOTHING", (new_company_id, "Cliente Varios", cat_cliente_id))
-            cursor.execute("INSERT INTO partners (company_id, name, category_id) VALUES (%s, %s, %s) ON CONFLICT (company_id, name) DO NOTHING", (new_company_id, "Proveedor Varios", cat_externo_id))
+            cursor.execute("SELECT id FROM partner_categories WHERE name = %s AND company_id = %s", ("Proveedor Externo", new_company_id))
+            cat_externo_row = cursor.fetchone()
+            
+            # Validación de seguridad (por si acaso falló el insert anterior silenciosamente)
+            if not cat_cliente_row or not cat_externo_row:
+                raise Exception("Error interno: No se pudieron crear las categorías base.")
+
+            cat_cliente_id = cat_cliente_row['id']
+            cat_externo_id = cat_externo_row['id']
+            
+            # 6. Insertar Socios Varios
+            cursor.execute("""
+                INSERT INTO partners (company_id, name, category_id) VALUES (%s, %s, %s) 
+                ON CONFLICT (company_id, name) DO NOTHING
+            """, (new_company_id, "Cliente Varios", cat_cliente_id))
+            
+            cursor.execute("""
+                INSERT INTO partners (company_id, name, category_id) VALUES (%s, %s, %s) 
+                ON CONFLICT (company_id, name) DO NOTHING
+            """, (new_company_id, "Proveedor Varios", cat_externo_id))
 
             conn.commit()
             return new_company
@@ -6852,7 +6877,8 @@ def create_company(name: str, country_code: str = "PE"):
     except Exception as e:
         if conn: conn.rollback()
         print(f"[ERROR DB] Falló crear compañía: {e}")
-        if "companies_name_key" in str(e):
+        # Captura errores de restricción unique
+        if "companies_name_key" in str(e) or "duplicate key" in str(e):
             raise ValueError(f"La compañía '{name}' ya existe.")
         raise e 
     finally:
