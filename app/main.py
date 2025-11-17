@@ -5,49 +5,49 @@ import traceback
 import contextlib
 
 #---------------- PARA PRODUCCION
-@contextlib.asynccontextmanager
-async def lifespan(app: FastAPI):
-    print("--- Servidor iniciando, creando pool de conexiones... ---")
-    try:
-        db.init_db_pool()
-        print("--- Pool de conexiones a Base de Datos creado. ---")
-
-    except Exception as e:
-        print(f"!!! ERROR FATAL DURANTE EL INICIO: {e}")
-    
-    yield
-    
-    print("--- Servidor apagándose. ---")
-
-#-------------------------SOLO PARA CREACION INICIAL DE MODELO DE DATOS
 # @contextlib.asynccontextmanager
 # async def lifespan(app: FastAPI):
-#     print("--- Servidor iniciando, creando pool y verificando BD... ---")
-#     conn = None # Para asegurarnos de que podemos cerrarlo si algo falla
+#     print("--- Servidor iniciando, creando pool de conexiones... ---")
 #     try:
-#         # 1. Llama a la función que crea el pool global
 #         db.init_db_pool()
 #         print("--- Pool de conexiones a Base de Datos creado. ---")
-#         # 2. Obtener UNA conexión del pool para la configuración inicial
-#         conn = db.db_pool.getconn() 
-#         # 3. Ejecutar la creación de tablas
-#         print("--- Creando/Verificando esquema de tablas... ---")
-#         db.create_schema(conn)
-#         # 4. Ejecutar la creación de datos iniciales
-#         print("--- Creando/Verificando datos iniciales... ---")
-#         db.create_initial_data(conn)
-#         print("--- Base de datos verificada e inicializada. ---")
+
 #     except Exception as e:
 #         print(f"!!! ERROR FATAL DURANTE EL INICIO: {e}")
-#         traceback.print_exc()
-#         if conn:
-#             conn.rollback() # Revertir cambios si la creación de datos falló
-#     finally:
-#         # 5. Devolver la conexión de configuración al pool
-#         if conn:
-#             db.db_pool.putconn(conn)
+    
 #     yield
+    
 #     print("--- Servidor apagándose. ---")
+
+#-------------------------SOLO PARA CREACION INICIAL DE MODELO DE DATOS
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("--- Servidor iniciando, creando pool y verificando BD... ---")
+    conn = None # Para asegurarnos de que podemos cerrarlo si algo falla
+    try:
+        # 1. Llama a la función que crea el pool global
+        db.init_db_pool()
+        print("--- Pool de conexiones a Base de Datos creado. ---")
+        # 2. Obtener UNA conexión del pool para la configuración inicial
+        conn = db.db_pool.getconn() 
+        # 3. Ejecutar la creación de tablas
+        print("--- Creando/Verificando esquema de tablas... ---")
+        db.create_schema(conn)
+        # 4. Ejecutar la creación de datos iniciales
+        print("--- Creando/Verificando datos iniciales... ---")
+        db.create_initial_data(conn)
+        print("--- Base de datos verificada e inicializada. ---")
+    except Exception as e:
+        print(f"!!! ERROR FATAL DURANTE EL INICIO: {e}")
+        traceback.print_exc()
+        if conn:
+            conn.rollback() # Revertir cambios si la creación de datos falló
+    finally:
+        # 5. Devolver la conexión de configuración al pool
+        if conn:
+            db.db_pool.putconn(conn)
+    yield
+    print("--- Servidor apagándose. ---")
 #------------------------------------------------------------------------
 
 app = FastAPI(

@@ -379,17 +379,20 @@ class UserBase(BaseModel):
 
 class UserCreate(UserBase):
     password: str # Contraseña en texto plano
+    company_ids: List[int] = []
 
 class UserUpdate(BaseModel):
     full_name: Optional[str] = None
     role_id: Optional[int] = None
     is_active: Optional[bool] = None
     password: Optional[str] = None # Para cambiar la contraseña (opcional)
+    company_ids: List[int] = []
 
 class UserResponse(UserBase):
     id: int
     role_name: Optional[str] = None # Campo del JOIN
     # NOTA: 'hashed_password' se omite intencionalmente por seguridad
+    company_ids: List[int] = []
 
     class Config:
         from_attributes = True

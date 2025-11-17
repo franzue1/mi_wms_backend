@@ -25,6 +25,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
 # Modelo Pydantic para los datos del token
 class TokenData(BaseModel):
     username: Optional[str] = None
+    user_id: Optional[int] = None # <-- Añadir
     permissions: Optional[list] = []
 
 # --- Funciones de Contraseña ---
@@ -70,10 +71,11 @@ async def get_current_user_data(token: str = Depends(oauth2_scheme)) -> TokenDat
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
+        user_id = payload.get("user_id") # <-- Leer del token
         permissions: list = payload.get("permissions", [])
         if username is None:
             raise credentials_exception
-        token_data = TokenData(username=username, permissions=permissions)
+        token_data = TokenData(username=username, user_id=user_id, permissions=permissions)
     except JWTError:
         raise credentials_exception
     return token_data

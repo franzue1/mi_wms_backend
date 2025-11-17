@@ -166,7 +166,7 @@ def create_schema(conn):
         CREATE TABLE IF NOT EXISTS companies (
             id SERIAL PRIMARY KEY, 
             name TEXT UNIQUE NOT NULL,
-            country_code TEXT DEFAULT 'PE'  -- <--- ¡AÑADIDO AQUÍ!
+            country_code TEXT DEFAULT 'PE'
         );
     """)
     
@@ -182,9 +182,6 @@ def create_schema(conn):
     except Exception:
         conn.rollback() # Si falla, solo revertimos el ALTER, no la creación
         cursor = conn.cursor()
-
-
-
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS product_categories (
@@ -304,6 +301,18 @@ def create_schema(conn):
             full_name TEXT, role_id INTEGER NOT NULL, is_active INTEGER DEFAULT 1
         );
     """)
+    # --- ¡NUEVA TABLA! Relación Muchos-a-Muchos Usuario-Compañía ---
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_companies (
+            user_id INTEGER NOT NULL,
+            company_id INTEGER NOT NULL,
+            PRIMARY KEY (user_id, company_id),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE
+        );
+    """)
+    print(" -> Tabla 'user_companies' creada/verificada.")
+
     cursor.execute("CREATE TABLE IF NOT EXISTS permissions (id SERIAL PRIMARY KEY, key TEXT UNIQUE NOT NULL, description TEXT);")
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS role_permissions (
@@ -462,7 +471,13 @@ def create_initial_data(conn):
     print(" -> Creando datos iniciales (versión PostgreSQL)...")
 
     # --- 1. Empresa ---
-    cursor.execute("INSERT INTO companies (name) VALUES (%s) ON CONFLICT (name) DO NOTHING RETURNING id", ("Mi Empresa Principal",))
+    cursor.execute("""
+        INSERT INTO companies (name, country_code) 
+        VALUES (%s, %s) 
+        ON CONFLICT (name) DO UPDATE SET country_code = EXCLUDED.country_code 
+        RETURNING id
+    """, ("Mi Empresa Principal", "PE"))
+
     default_company_id_row = cursor.fetchone()
     if default_company_id_row:
         default_company_id = default_company_id_row['id']
@@ -641,6 +656,19 @@ def create_initial_data(conn):
         admin_pass_hashed = hash_password("admin")
         cursor.execute("INSERT INTO users (username, hashed_password, full_name, role_id) VALUES (%s, %s, %s, %s) ON CONFLICT (username) DO NOTHING", ("admin", admin_pass_hashed, "Administrador", admin_role_id))
 
+        # Primero obtenemos el ID real del admin (por si ya existía y el INSERT ignoró)
+        cursor.execute("SELECT id FROM users WHERE username = %s", ("admin",))
+        admin_user_row = cursor.fetchone()
+        
+        if admin_user_row:
+            admin_id = admin_user_row['id']
+            print(f" -> Asignando compañía '{default_company_id}' al usuario Admin ({admin_id})...")
+            cursor.execute("""
+                INSERT INTO user_companies (user_id, company_id) 
+                VALUES (%s, %s) 
+                ON CONFLICT (user_id, company_id) DO NOTHING
+            """, (admin_id, default_company_id))
+
         all_permissions = {
             "nav.dashboard.view": "Ver Dashboard", "nav.operations.view": "Ver menú Operaciones",
             "nav.masters.view": "Ver menú Maestros", "nav.reports.view": "Ver menú Reportes",
@@ -689,6 +717,7 @@ def create_initial_data(conn):
 
     conn.commit()
     print("Datos iniciales de PostgreSQL creados/verificados.")
+
 
 def hash_password(password):
     """Genera un hash SHA-256 para la contraseña."""
@@ -6120,16 +6149,54 @@ def validate_user_and_get_permissions(username, plain_password):
         print(f"[ERROR] en validate_user_and_get_permissions: {e}")
         traceback.print_exc()
         return None, None
-    
+
 def get_users_for_admin():
-    """Obtiene todos los usuarios con el nombre de su rol."""
-    query = """
-        SELECT u.id, u.username, u.full_name, u.is_active, r.name as role_name, u.role_id
-        FROM users u
-        LEFT JOIN roles r ON u.role_id = r.id
-        ORDER BY u.username
     """
-    return execute_query(query, fetchall=True)
+    Obtiene todos los usuarios con el nombre de su rol Y 
+    la lista de IDs de compañías a las que tienen acceso.
+    """
+    global db_pool
+    if not db_pool: init_db_pool()
+    
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        conn.cursor_factory = psycopg2.extras.DictCursor
+        
+        with conn.cursor() as cursor:
+            # 1. Obtener usuarios básicos
+            query_users = """
+                SELECT u.id, u.username, u.full_name, u.is_active, r.name as role_name, u.role_id
+                FROM users u
+                LEFT JOIN roles r ON u.role_id = r.id
+                ORDER BY u.username
+            """
+            cursor.execute(query_users)
+            users_rows = cursor.fetchall()
+            
+            final_users = []
+            
+            # 2. Para cada usuario, obtener sus compañías
+            # (Nota: Se podría optimizar con array_agg en SQL, pero esto es más legible y seguro por ahora)
+            for u_row in users_rows:
+                user_dict = dict(u_row)
+                
+                query_companies = "SELECT company_id FROM user_companies WHERE user_id = %s"
+                cursor.execute(query_companies, (user_dict['id'],))
+                company_rows = cursor.fetchall()
+                
+                # Convertir a una lista simple de enteros [1, 2, 5]
+                user_dict['company_ids'] = [row['company_id'] for row in company_rows]
+                final_users.append(user_dict)
+                print(f"[DEBUG DB] Usuario '{user_dict['username']}' companies: {user_dict['company_ids']}")
+                
+            return final_users
+
+    except Exception as e:
+        print(f"[ERROR DB] get_users_for_admin: {e}")
+        raise e
+    finally:
+        if conn: db_pool.putconn(conn)
 
 def get_roles_for_admin():
     """Obtiene todos los roles."""
@@ -6223,88 +6290,142 @@ def update_role(role_id, name, description):
         else:
             raise e
 
-def create_user(username, plain_password, full_name, role_id):
+def create_user(username, plain_password, full_name, role_id, company_ids=None):
     """
-    Crea un nuevo usuario con contraseña hasheada.
-    (Versión PostgreSQL - ADAPTADA AL POOL de conexiones)
+    Crea un usuario y asigna sus compañías permitidas.
     """
     if not username or not plain_password or not full_name or not role_id:
         raise ValueError("Todos los campos son obligatorios.")
 
+    global db_pool
+    if not db_pool: init_db_pool()
+    
+    conn = None
     try:
-        # Asumiendo que hash_password() está disponible en este archivo
-        hashed_pass = hash_password(plain_password) 
-        
-        query = """
-        INSERT INTO users (username, hashed_password, full_name, role_id, is_active)
-        VALUES (%s, %s, %s, %s, 1) 
-        RETURNING id
-        """
-        # ---
-        # ¡CORRECCIÓN! 
-        # Cambiamos 'TRUE' de nuevo a '1' para que coincida con tu columna 'integer'.
-        # ---
-        params = (username, hashed_pass, full_name, role_id)
-        
-        # Usamos execute_commit_query con fetchone=True para capturar el RETURNING
-        result = execute_commit_query(query, params, fetchone=True)
-        
-        if result:
-            new_id = result['id'] # Acceder al ID por su nombre de columna
-            return new_id
-        else:
-            raise Exception("No se pudo obtener el ID del usuario creado.")
-            
-    except Exception as e: 
-        # Capturamos la excepción propagada desde execute_commit_query
-        
-        # Revisa el nombre real del constraint UNIQUE en PostgreSQL
-        if "users_username_key" in str(e): 
-            raise ValueError(f"El nombre de usuario '{username}' ya existe.")
-        else:
-            # Re-lanzamos cualquier otro error
-            raise e
+        conn = db_pool.getconn()
+        conn.cursor_factory = psycopg2.extras.DictCursor
 
-def update_user(user_id, full_name, role_id, is_active, new_password=None):
-    """
-    Actualiza un usuario. Si new_password se provee, la cambia.
-    (Versión PostgreSQL - ADAPTADA AL POOL de conexiones)
-    """
-    try:
-        if new_password:
-            # Si hay nueva contraseña, hashearla y actualizarla
-            # Asumiendo que hash_password() está disponible en este archivo
-            hashed_pass = hash_password(new_password)
+        with conn.cursor() as cursor:
+            # 1. Hashear contraseña
+            hashed_pass = hash_password(plain_password) 
             
-            query = """
-                UPDATE users 
-                SET full_name = %s, role_id = %s, is_active = %s, hashed_password = %s 
-                WHERE id = %s
+            # 2. Insertar Usuario
+            query_user = """
+                INSERT INTO users (username, hashed_password, full_name, role_id, is_active)
+                VALUES (%s, %s, %s, %s, 1) 
+                RETURNING id
             """
-            # psycopg2 maneja True/False de Python correctamente
-            params = (full_name, role_id, is_active, hashed_pass, user_id)
+            cursor.execute(query_user, (username, hashed_pass, full_name, role_id))
+            new_id_row = cursor.fetchone()
             
-            execute_commit_query(query, params)
-            print(f"[DB-RBAC] Usuario {user_id} actualizado (CON nueva contraseña).")
-        
-        else:
-            # Si no hay nueva contraseña, no tocar ese campo
-            query = """
-                UPDATE users 
-                SET full_name = %s, role_id = %s, is_active = %s 
-                WHERE id = %s
-            """
-            # psycopg2 maneja True/False de Python correctamente
-            params = (full_name, role_id, is_active, user_id)
+            if not new_id_row:
+                raise Exception("No se pudo obtener el ID del nuevo usuario.")
             
-            execute_commit_query(query, params)
-            print(f"[DB-RBAC] Usuario {user_id} actualizado (SIN nueva contraseña).")
+            new_user_id = new_id_row['id']
 
-        # No se necesita conn.commit(), execute_commit_query lo maneja.
+            # 3. Insertar Relación con Compañías (Si hay)
+            if company_ids and isinstance(company_ids, list) and len(company_ids) > 0:
+                # Preparamos los datos: [(user_id, 1), (user_id, 2), ...]
+                values = [(new_user_id, int(c_id)) for c_id in company_ids]
+                
+                query_rel = "INSERT INTO user_companies (user_id, company_id) VALUES (%s, %s)"
+                cursor.executemany(query_rel, values)
+                print(f" -> Asignadas {len(values)} compañías al usuario {username}.")
+
+            # 4. Confirmar todo
+            conn.commit()
+            return new_user_id
 
     except Exception as e:
-        # La excepción se propaga desde execute_commit_query
+        if conn: conn.rollback() # Revertir si falla algo
+        if "users_username_key" in str(e): 
+            raise ValueError(f"El nombre de usuario '{username}' ya existe.")
+        raise e
+    finally:
+        if conn: db_pool.putconn(conn)
+
+def get_user_by_username(username: str):
+    """
+    Obtiene los datos básicos de un usuario por su nombre de usuario.
+    Usado para buscar el ID del usuario logueado.
+    """
+    query = "SELECT id, username, role_id, full_name FROM users WHERE username = %s"
+    # Usamos fetchone=True para obtener un solo diccionario
+    return execute_query(query, (username,), fetchone=True)
+
+def update_user(user_id, full_name, role_id, is_active, new_password=None, company_ids=None):
+    """
+    Actualiza datos del usuario y sus compañías.
+    Si 'company_ids' es None, no se tocan las compañías.
+    Si 'company_ids' es [], se le quitan todas las compañías.
+    """
+    global db_pool
+    if not db_pool: init_db_pool()
+    
+    conn = None
+
+
+
+    try:
+        conn = db_pool.getconn()
+        conn.cursor_factory = psycopg2.extras.DictCursor
+
+        with conn.cursor() as cursor:
+            # 1. Actualizar datos básicos
+            if new_password:
+                hashed_pass = hash_password(new_password)
+                query = """
+                    UPDATE users 
+                    SET full_name = %s, role_id = %s, is_active = %s, hashed_password = %s 
+                    WHERE id = %s
+                """
+                # --- ¡CORRECCIÓN AQUÍ! Usamos int(is_active) ---
+                params = (full_name, role_id, int(is_active), hashed_pass, user_id)
+                
+                cursor.execute(query, params)
+                print(f"[DB-RBAC] Usuario {user_id} actualizado (CON nueva contraseña).")
+        
+            else:
+                query = """
+                    UPDATE users 
+                    SET full_name = %s, role_id = %s, is_active = %s 
+                    WHERE id = %s
+                """
+                # --- ¡CORRECCIÓN AQUÍ TAMBIÉN! ---
+                params = (full_name, role_id, int(is_active), user_id)
+                
+                cursor.execute(query, params)
+                print(f"[DB-RBAC] Usuario {user_id} actualizado (SIN nueva contraseña).")
+
+            # 2. Actualizar Compañías
+            if company_ids is not None:
+                # ... (resto de tu lógica de compañías, que está bien) ...
+                cursor.execute("DELETE FROM user_companies WHERE user_id = %s", (user_id,))
+                if company_ids:
+                    values = [(user_id, int(c_id)) for c_id in company_ids]
+                    query_rel = "INSERT INTO user_companies (user_id, company_id) VALUES (%s, %s)"
+                    cursor.executemany(query_rel, values)
+
+            conn.commit()
+            return True
+
+    except Exception as e:
+        if conn: conn.rollback()
         raise ValueError(f"Error al actualizar usuario: {e}")
+    finally:
+        if conn: db_pool.putconn(conn)
+
+def get_user_companies(user_id):
+    """Devuelve una lista de dicts con las compañías permitidas para el usuario."""
+    query = """
+        SELECT c.id, c.name, c.country_code
+        FROM companies c
+        JOIN user_companies uc ON c.id = uc.company_id
+        WHERE uc.user_id = %s
+        ORDER BY c.name
+    """
+    return execute_query(query, (user_id,), fetchall=True)
+
 
 def get_product_reservations(product_id, location_id, lot_id=None):
     """

@@ -33,11 +33,15 @@ async def create_user(user: schemas.UserCreate, auth: AuthDependency):
             username=user.username,
             plain_password=user.password,
             full_name=user.full_name,
-            role_id=user.role_id
+            role_id=user.role_id,
+            company_ids=user.company_ids  # <--- ¡FALTABA ESTA LÍNEA!
         )
+        
+        # Recargar usuario para devolverlo completo
         user_raw = await asyncio.to_thread(db.get_users_for_admin)
         new_user = next((u for u in user_raw if u['id'] == new_user_id), None)
         return dict(new_user)
+        
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
@@ -56,13 +60,19 @@ async def update_user(user_id: int, user: schemas.UserUpdate, auth: AuthDependen
             full_name=user.full_name,
             role_id=user.role_id,
             is_active=user.is_active,
-            new_password=user.password
+            new_password=user.password,
+            company_ids=user.company_ids  # <--- ¡FALTABA ESTA LÍNEA!
         )
+        
+        # Recargar usuario
         user_raw = await asyncio.to_thread(db.get_users_for_admin)
         updated_user = next((u for u in user_raw if u['id'] == user_id), None)
+        
         if not updated_user:
              raise HTTPException(status_code=404, detail="Usuario no encontrado después de actualizar")
+        
         return dict(updated_user)
+        
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
@@ -164,10 +174,28 @@ class CompanyResponse(CompanyBase):
 
 @router.get("/companies", response_model=List[CompanyResponse])
 async def get_all_companies(auth: AuthDependency):
-    """Obtiene una lista de todas las compañías."""
+    """
+    Obtiene una lista de compañías.
+    - Si es ROL ADMINISTRADOR (ID 1): Devuelve TODAS.
+    - Si es OTRO ROL: Devuelve solo las asignadas.
+    """
     try:
-        companies_raw = await asyncio.to_thread(db.get_companies) 
+        # 1. Obtener datos completos del usuario actual
+        user = await asyncio.to_thread(db.get_user_by_username, auth.username)
+        if not user:
+            raise HTTPException(401, "Usuario no encontrado")
+            
+        # 2. Lógica de Super Usuario
+        # Asumimos que el Rol ID 1 es siempre "Administrador"
+        if user['role_id'] == 1:
+            # El admin ve TODO (para poder asignar empresas a otros, editar, etc.)
+            companies_raw = await asyncio.to_thread(db.get_companies)
+        else:
+            # Los mortales solo ven lo que tienen asignado
+            companies_raw = await asyncio.to_thread(db.get_user_companies, user['id'])
+
         return [dict(c) for c in companies_raw]
+        
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al obtener compañías: {e}")

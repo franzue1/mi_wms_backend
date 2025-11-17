@@ -28,12 +28,18 @@ async def login_for_access_token(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # --- ¡CAMBIO! Obtener compañías permitidas ---
+    allowed_companies = db.get_user_companies(user_data['id'])
+    # Convertir a lista de dicts simple para el token (o endpoint 'me')
+    companies_list = [dict(c) for c in allowed_companies]
+
     # 2. Crear el token JWT con los datos del usuario
     token_data_to_encode = {
         "sub": user_data['username'],
         "user_id": user_data['id'],
         "full_name": user_data['full_name'],
-        "permissions": list(permissions_set) # Convertir el set a lista
+        "permissions": list(permissions_set), # Convertir el set a lista
+        "allowed_companies": companies_list
     }
     
     access_token = security.create_access_token(data=token_data_to_encode)
