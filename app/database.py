@@ -146,29 +146,45 @@ def execute_commit_query(query, params=(), fetchone=False):
             # 3. Devolver la conexión al pool
             db_pool.putconn(conn)
 
+
 def create_schema(conn):
     cursor = conn.cursor()
     print("Verificando/Creando esquema de tablas en PostgreSQL...")
     
-    # --- ¡NUEVO! Habilitar la extensión para búsquedas de texto rápidas ---
+    # --- Extensiones ---
     try:
         cursor.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
         print(" -> Extensión 'pg_trgm' habilitada.")
     except Exception as e:
-        # Si falla (ej. permisos), no es fatal, pero las búsquedas serán lentas.
-        print(f"[ADVERTENCIA] No se pudo habilitar 'pg_trgm'. Búsquedas de texto pueden ser lentas. {e}")
-        # Es importante revertir la transacción fallida para poder continuar.
-        conn.rollback() 
-        cursor = conn.cursor() # Reabrir el cursor
-
-    # --- Tablas Principales (sin FKs) ---
-    cursor.execute("CREATE TABLE IF NOT EXISTS companies (id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL);")
-    try:
-        # Añadimos la columna country_code si no existe. Por defecto 'PE' (Perú)
-        cursor.execute("ALTER TABLE companies ADD COLUMN IF NOT EXISTS country_code TEXT DEFAULT 'PE';")
-    except Exception: 
-        conn.rollback() # Ignorar si ya existe o falla levemente
+        print(f"[ADVERTENCIA] No se pudo habilitar 'pg_trgm': {e}")
+        conn.rollback()
         cursor = conn.cursor()
+
+    # --- 1. CREACIÓN DE TABLA COMPANIES (CORREGIDO) ---
+    # Definimos la columna directamente aquí. Ya no necesitamos ALTER.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS companies (
+            id SERIAL PRIMARY KEY, 
+            name TEXT UNIQUE NOT NULL,
+            country_code TEXT DEFAULT 'PE'  -- <--- ¡AÑADIDO AQUÍ!
+        );
+    """)
+    
+    # ¡IMPORTANTE! Hacemos commit INMEDIATAMENTE para guardar la tabla
+    # antes de seguir con el resto. Esto evita que un error futuro la borre.
+    conn.commit() 
+    
+    # (Opcional) Bloque de compatibilidad por si restauras una BD vieja
+    # Solo intenta añadir la columna si la tabla ya existía sin ella
+    try:
+        cursor.execute("ALTER TABLE companies ADD COLUMN IF NOT EXISTS country_code TEXT DEFAULT 'PE';")
+        conn.commit()
+    except Exception:
+        conn.rollback() # Si falla, solo revertimos el ALTER, no la creación
+        cursor = conn.cursor()
+
+
+
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS product_categories (
@@ -2825,7 +2841,14 @@ def mark_picking_as_ready(picking_id):
         if conn: db_pool.putconn(conn)
 
 def get_companies():
-    return execute_query("SELECT id, name FROM companies ORDER BY name", fetchall=True)
+    """Obtiene todas las compañías."""
+    # Opción A: Seleccionar todo (Recomendado)
+    query = "SELECT * FROM companies ORDER BY id"
+    
+    # Opción B: Seleccionar explícitamente (Si prefieres)
+    # query = "SELECT id, name, country_code FROM companies ORDER BY id"
+    
+    return execute_query(query, fetchall=True)
 
 def get_category_id_by_name(name):
     """Busca el ID de una categoría de producto por su nombre exacto."""
@@ -5251,15 +5274,6 @@ def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id'
 
     return execute_query(query, tuple(query_params), fetchall=True)
 
-def get_companies():
-    """
-    Obtiene una lista simple de todas las compañías (ID y Nombre)
-    para el dropdown de multi-compañía.
-    """
-    print(" -> [DB] Obteniendo lista de todas las compañías...")
-    # Usamos la función del pool que ya existe
-    return execute_query("SELECT id, name FROM companies ORDER BY name", fetchall=True)
-
 def get_location_name_details(location_id):
     """
     Obtiene el nombre de la ubicación y el nombre/ID de su almacén asociado.
@@ -6672,108 +6686,70 @@ def get_liquidation_details_combo(wo_id: int, company_id: int):
 
 def create_company(name: str, country_code: str = "PE"):
     """
-    [MODIFICADO] Crea una nueva compañía Y sus categorías/socios por defecto,
-    todo en una sola transacción atómica.
+    Crea una nueva compañía con país.
     """
-    print(f" -> [DB] Iniciando transacción para crear compañía: {name}")
+    print(f" -> [DB] Iniciando transacción para crear compañía: {name} ({country_code})")
 
-    # 1. Obtener el pool (procedimiento estándar)
     global db_pool
-    if not db_pool:
-        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
-        init_db_pool()
-        if not db_pool:
-            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
+    if not db_pool: init_db_pool()
     conn = None
     try:
-        # 2. Obtener UNA conexión del pool para toda la transacción
         conn = db_pool.getconn()
         conn.cursor_factory = psycopg2.extras.DictCursor
 
         with conn.cursor() as cursor:
-            
-            # 3. Insertar la Compañía
+            # --- ¡AQUÍ ESTÁ LA CLAVE! ---
+            # Asegúrate de que la query tenga 'country_code' en el INSERT
             query_company = "INSERT INTO companies (name, country_code) VALUES (%s, %s) RETURNING *"
             cursor.execute(query_company, (name, country_code))
+            # ----------------------------
+            
             new_company = cursor.fetchone()
-            if not new_company:
-                raise Exception("No se pudo crear la compañía.")
             new_company_id = new_company['id']
-            print(f"  -> Compañía ID {new_company_id} ('{name}') creada.")
 
-            # 4. Insertar Categorías de Almacén por defecto
-            wh_categories = [
-                (new_company_id, "ALMACEN PRINCIPAL"),
-                (new_company_id, "CONTRATISTA")
-            ]
-            cursor.executemany(
-                "INSERT INTO warehouse_categories (company_id, name) VALUES (%s, %s) ON CONFLICT (company_id, name) DO NOTHING", 
-                wh_categories
-            )
-            print("  -> Categorías de Almacén por defecto creadas.")
+            # ... (El resto de la lógica de categorías/socios se queda IGUAL) ...
+            wh_categories = [(new_company_id, "ALMACEN PRINCIPAL"), (new_company_id, "CONTRATISTA")]
+            cursor.executemany("INSERT INTO warehouse_categories (company_id, name) VALUES (%s, %s) ON CONFLICT (company_id, name) DO NOTHING", wh_categories)
+            
+            partner_categories = [(new_company_id, "Proveedor Externo"), (new_company_id, "Proveedor Cliente")]
+            cursor.executemany("INSERT INTO partner_categories (company_id, name) VALUES (%s, %s) ON CONFLICT (company_id, name) DO NOTHING", partner_categories)
+            
+            cursor.execute("INSERT INTO product_categories (company_id, name) VALUES (%s, %s) ON CONFLICT (company_id, name) DO NOTHING", (new_company_id, 'General'))
 
-            # 5. Insertar Categorías de Socio por defecto
-            partner_categories = [
-                (new_company_id, "Proveedor Externo"),
-                (new_company_id, "Proveedor Cliente")
-            ]
-            cursor.executemany(
-                "INSERT INTO partner_categories (company_id, name) VALUES (%s, %s) ON CONFLICT (company_id, name) DO NOTHING", 
-                partner_categories
-            )
-            print("  -> Categorías de Socio por defecto creadas.")
-
-            # 6. Insertar Categoría 'General' de Producto
-            cursor.execute(
-                "INSERT INTO product_categories (company_id, name) VALUES (%s, %s) ON CONFLICT (company_id, name) DO NOTHING RETURNING id", 
-                (new_company_id, 'General')
-            )
-            print("  -> Categoría 'General' de Producto creada.")
-
-            # 7. Insertar Socios 'Varios' por defecto (requiere los IDs del paso 5)
+            # Insertar socios varios...
             cursor.execute("SELECT id FROM partner_categories WHERE name = %s AND company_id = %s", ("Proveedor Cliente", new_company_id))
-            cat_cliente_row = cursor.fetchone()
-            cat_cliente_id = cat_cliente_row['id'] if cat_cliente_row else None
-
+            cat_cliente_id = cursor.fetchone()['id']
             cursor.execute("SELECT id FROM partner_categories WHERE name = %s AND company_id = %s", ("Proveedor Externo", new_company_id))
-            cat_externo_row = cursor.fetchone()
-            cat_externo_id = cat_externo_row['id'] if cat_externo_row else None
-
-            if not cat_cliente_id or not cat_externo_id:
-                 raise Exception("No se pudieron encontrar las categorías de socio recién creadas.")
-
+            cat_externo_id = cursor.fetchone()['id']
+            
             cursor.execute("INSERT INTO partners (company_id, name, category_id) VALUES (%s, %s, %s) ON CONFLICT (company_id, name) DO NOTHING", (new_company_id, "Cliente Varios", cat_cliente_id))
             cursor.execute("INSERT INTO partners (company_id, name, category_id) VALUES (%s, %s, %s) ON CONFLICT (company_id, name) DO NOTHING", (new_company_id, "Proveedor Varios", cat_externo_id))
-            print("  -> Socios 'Varios' por defecto creados.")
-            # 8. Si todo salió bien, hacer Commit
+
             conn.commit()
-            print(f" -> [DB] Transacción completada (COMMIT). Compañía '{name}' está lista.")
-            # Devolver el objeto 'company' que obtuvimos en el paso 3
             return new_company
 
     except Exception as e:
-        # 9. Si algo falla, hacer Rollback
-        if conn:
-            conn.rollback()
-        print(f"[ERROR] Falló la creación de la compañía (ROLLBACK ejecutado): {e}")
-        # Manejar error de duplicado (el más común)
+        if conn: conn.rollback()
+        print(f"[ERROR DB] Falló crear compañía: {e}")
         if "companies_name_key" in str(e):
             raise ValueError(f"La compañía '{name}' ya existe.")
-        # Re-lanzar el error para que la API lo capture
         raise e 
     finally:
-        # 10. Pase lo que pase, devolver la conexión al pool
-        if conn:
-            db_pool.putconn(conn)
+        if conn: db_pool.putconn(conn)
 
 def update_company(company_id: int, name: str, country_code: str):
     """
-    Actualiza el nombre de una compañía y devuelve el registro actualizado.
+    Actualiza el nombre y país de una compañía.
     """
-    print(f" -> [DB] Actualizando compañía ID: {company_id}")
+    print(f" -> [DB] Actualizando compañía ID {company_id}: {name}, {country_code}")
+    
+    # --- ¡AQUÍ ESTÁ LA CLAVE! ---
+    # Asegúrate de que la query tenga 'country_code = %s'
     query = "UPDATE companies SET name = %s, country_code = %s WHERE id = %s RETURNING *"
+    # ----------------------------
     
     try:
+        # Y asegúrate de pasar los 3 argumentos en orden
         updated_company = execute_commit_query(query, (name, country_code, company_id), fetchone=True)
         return updated_company
     except Exception as e:
@@ -6783,22 +6759,68 @@ def update_company(company_id: int, name: str, country_code: str):
 
 def delete_company(company_id: int):
     """
-    Elimina una compañía.
-    PRECAUCIÓN: Esto fallará si la compañía tiene datos asociados
-    (productos, almacenes, etc.) debido a las Foreign Keys.
+    Elimina una compañía y sus datos de configuración asociados.
+    Bloquea la eliminación si hay datos operativos (productos, movimientos).
     """
     print(f" -> [DB] Intentando eliminar compañía ID: {company_id}")
     
-    # Comprobación de seguridad (simple): ¿Tiene productos?
-    check_query = "SELECT 1 FROM products WHERE company_id = %s LIMIT 1"
-    has_data = execute_query(check_query, (company_id,), fetchone=True)
-    if has_data:
-        raise ValueError("No se puede eliminar: La compañía ya tiene productos asociados.")
+    global db_pool
+    if not db_pool: init_db_pool()
+    conn = None
     
-    # (Puedes añadir más comprobaciones para almacenes, socios, etc. aquí)
-    
-    execute_commit_query("DELETE FROM companies WHERE id = %s", (company_id,))
-    return True
+    try:
+        conn = db_pool.getconn()
+        with conn.cursor() as cursor:
+            
+            # 1. SEGURIDAD: Verificar si hay datos operativos críticos
+            # No queremos borrar una empresa que ya tiene historial de movimientos o productos reales.
+            cursor.execute("SELECT COUNT(*) FROM products WHERE company_id = %s", (company_id,))
+            if cursor.fetchone()[0] > 0:
+                raise ValueError("No se puede eliminar: La compañía tiene PRODUCTOS registrados.")
+
+            cursor.execute("SELECT COUNT(*) FROM pickings WHERE company_id = %s", (company_id,))
+            if cursor.fetchone()[0] > 0:
+                raise ValueError("No se puede eliminar: La compañía tiene OPERACIONES (Albaranes) registradas.")
+
+            cursor.execute("SELECT COUNT(*) FROM warehouses WHERE company_id = %s", (company_id,))
+            if cursor.fetchone()[0] > 0:
+                raise ValueError("No se puede eliminar: La compañía tiene ALMACENES registrados.")
+
+            # 2. LIMPIEZA: Borrar datos de configuración (Hijos)
+            # Debemos hacerlo en orden para respetar las FKs entre ellos.
+            
+            print("   -> Eliminando socios (Partners)...")
+            cursor.execute("DELETE FROM partners WHERE company_id = %s", (company_id,))
+            
+            print("   -> Eliminando categorías de producto...")
+            cursor.execute("DELETE FROM product_categories WHERE company_id = %s", (company_id,))
+            
+            print("   -> Eliminando categorías de almacén...")
+            cursor.execute("DELETE FROM warehouse_categories WHERE company_id = %s", (company_id,))
+            
+            print("   -> Eliminando categorías de socio...")
+            cursor.execute("DELETE FROM partner_categories WHERE company_id = %s", (company_id,))
+
+            # 3. FINAL: Borrar la compañía (Padre)
+            print("   -> Eliminando registro de compañía...")
+            cursor.execute("DELETE FROM companies WHERE id = %s", (company_id,))
+            
+            if cursor.rowcount == 0:
+                raise ValueError("La compañía no existe o ya fue eliminada.")
+
+            conn.commit()
+            print(f" -> Compañía ID {company_id} eliminada correctamente.")
+            return True, "Compañía eliminada."
+
+    except Exception as e:
+        if conn: conn.rollback()
+        print(f"[ERROR DB] Falló delete_company: {e}")
+        # Convertimos errores de FK en mensajes legibles si se nos pasó algo
+        if "ForeignKeyViolation" in str(e):
+            raise ValueError("No se puede eliminar: Existen datos relacionados que impiden el borrado.")
+        raise e
+    finally:
+        if conn: db_pool.putconn(conn)
         
 def search_storable_products_by_term(company_id: int, search_term: str):
     """

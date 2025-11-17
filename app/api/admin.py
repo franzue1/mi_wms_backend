@@ -175,6 +175,7 @@ async def get_all_companies(auth: AuthDependency):
 @router.post("/companies", response_model=CompanyResponse, status_code=201)
 async def create_company(company_data: CompanyCreate, auth: AuthDependency):
     """Crea una nueva compañía."""
+    print(f"[DEBUG BACKEND] create_company recibió payload: {company_data}")
     if "admin.can_manage_roles" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
     
@@ -192,6 +193,7 @@ async def create_company(company_data: CompanyCreate, auth: AuthDependency):
 @router.put("/companies/{company_id}", response_model=CompanyResponse)
 async def update_company(company_id: int, company_data: CompanyUpdate, auth: AuthDependency):
     """Actualiza nombre y país."""
+    print(f"[DEBUG BACKEND] update_company recibió payload: {company_data}")
     if "admin.can_manage_roles" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
         
