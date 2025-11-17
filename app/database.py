@@ -6806,7 +6806,11 @@ def get_liquidation_details_combo(wo_id: int, company_id: int):
 
 def create_company(name: str, country_code: str = "PE"):
     """
-    Crea una nueva compañía con país e inicializa sus datos base.
+    Crea una nueva compañía e inicializa TODA su infraestructura base:
+    - Categorías
+    - Ubicaciones Virtuales
+    - Almacén Principal (y sus ubicaciones)
+    - Tipos de Operación (incluyendo ADJ)
     """
     print(f" -> [DB] Iniciando transacción para crear compañía: {name} ({country_code})")
 
@@ -6819,57 +6823,86 @@ def create_company(name: str, country_code: str = "PE"):
 
         with conn.cursor() as cursor:
             # 1. Crear Compañía
-            query_company = "INSERT INTO companies (name, country_code) VALUES (%s, %s) RETURNING *"
-            cursor.execute(query_company, (name, country_code))
-            
+            cursor.execute(
+                "INSERT INTO companies (name, country_code) VALUES (%s, %s) RETURNING *", 
+                (name, country_code)
+            )
             new_company = cursor.fetchone()
             new_company_id = new_company['id']
 
             # 2. Categorías de Almacén
             wh_categories = [(new_company_id, "ALMACEN PRINCIPAL"), (new_company_id, "CONTRATISTA")]
-            cursor.executemany("""
-                INSERT INTO warehouse_categories (company_id, name) VALUES (%s, %s) 
-                ON CONFLICT (company_id, name) DO NOTHING
-            """, wh_categories)
+            cursor.executemany("INSERT INTO warehouse_categories (company_id, name) VALUES (%s, %s) ON CONFLICT (company_id, name) DO NOTHING", wh_categories)
             
             # 3. Categorías de Socio
             partner_categories = [(new_company_id, "Proveedor Externo"), (new_company_id, "Proveedor Cliente")]
-            cursor.executemany("""
-                INSERT INTO partner_categories (company_id, name) VALUES (%s, %s) 
-                ON CONFLICT (company_id, name) DO NOTHING
-            """, partner_categories)
+            cursor.executemany("INSERT INTO partner_categories (company_id, name) VALUES (%s, %s) ON CONFLICT (company_id, name) DO NOTHING", partner_categories)
             
             # 4. Categoría de Producto
-            cursor.execute("""
-                INSERT INTO product_categories (company_id, name) VALUES (%s, %s) 
-                ON CONFLICT (company_id, name) DO NOTHING
-            """, (new_company_id, 'General'))
+            cursor.execute("INSERT INTO product_categories (company_id, name) VALUES (%s, %s) ON CONFLICT (company_id, name) DO NOTHING", (new_company_id, 'General'))
 
-            # 5. Obtener IDs de Categorías (para crear socios)
-            # Usamos AND company_id para asegurarnos de obtener las de ESTA empresa
-            cursor.execute("SELECT id FROM partner_categories WHERE name = %s AND company_id = %s", ("Proveedor Cliente", new_company_id))
-            cat_cliente_row = cursor.fetchone()
-            
-            cursor.execute("SELECT id FROM partner_categories WHERE name = %s AND company_id = %s", ("Proveedor Externo", new_company_id))
-            cat_externo_row = cursor.fetchone()
-            
-            # Validación de seguridad (por si acaso falló el insert anterior silenciosamente)
-            if not cat_cliente_row or not cat_externo_row:
-                raise Exception("Error interno: No se pudieron crear las categorías base.")
+            # 5. Crear Ubicaciones Virtuales (¡NUEVO E IMPORTANTE!)
+            # Estas son necesarias para que funcionen los tipos de operación
+            virtual_locs = [
+                (new_company_id, "Proveedores", "PA/Vendors", "vendor", "PROVEEDOR"),
+                (new_company_id, "Clientes", "PA/Customers", "customer", "CLIENTE"),
+                (new_company_id, "Pérdida de Inventario", "Virtual/Scrap", "inventory", "AJUSTE")
+            ]
+            cursor.executemany("""
+                INSERT INTO locations (company_id, name, path, type, category) 
+                VALUES (%s, %s, %s, %s, %s) 
+                ON CONFLICT (company_id, path) DO NOTHING
+            """, virtual_locs)
 
-            cat_cliente_id = cat_cliente_row['id']
-            cat_externo_id = cat_externo_row['id']
+            # 6. Crear Almacén Principal por Defecto (¡NUEVO!)
+            # Buscamos el ID de la categoría que acabamos de crear
+            cursor.execute("SELECT id FROM warehouse_categories WHERE company_id = %s AND name = 'ALMACEN PRINCIPAL'", (new_company_id,))
+            main_wh_cat = cursor.fetchone()
             
-            # 6. Insertar Socios Varios
-            cursor.execute("""
-                INSERT INTO partners (company_id, name, category_id) VALUES (%s, %s, %s) 
-                ON CONFLICT (company_id, name) DO NOTHING
-            """, (new_company_id, "Cliente Varios", cat_cliente_id))
+            main_wh_id = None
+            if main_wh_cat:
+                # Usamos el helper interno para crear el almacén y sus ubicaciones (Stock, Averiados)
+                # Generamos un código único simple (ej: PRI-ID)
+                wh_code = f"PRI-{new_company_id}" 
+                
+                # Nota: _create_warehouse_with_cursor DEBE estar definido en este archivo (lo revisamos antes)
+                _create_warehouse_with_cursor(
+                    cursor, 
+                    "Almacén Principal", 
+                    wh_code, 
+                    main_wh_cat['id'], 
+                    new_company_id, 
+                    "", "", "", "", "", "activo"
+                )
+                
+                # Recuperar el ID del almacén recién creado para usarlo en el ADJ
+                cursor.execute("SELECT id FROM warehouses WHERE company_id = %s AND code = %s", (new_company_id, wh_code))
+                wh_row = cursor.fetchone()
+                if wh_row: main_wh_id = wh_row['id']
+
+            # 7. Crear Tipo de Operación 'ADJ' (Ajuste de Inventario) (¡CRÍTICO!)
+            if main_wh_id:
+                # Buscar ubicación de ajuste
+                cursor.execute("SELECT id FROM locations WHERE company_id = %s AND category = 'AJUSTE'", (new_company_id,))
+                adj_loc_row = cursor.fetchone()
+                
+                if adj_loc_row:
+                    adj_loc_id = adj_loc_row['id']
+                    cursor.execute("""
+                        INSERT INTO picking_types (company_id, name, code, warehouse_id, default_location_src_id, default_location_dest_id) 
+                        VALUES (%s, %s, 'ADJ', %s, %s, %s) 
+                        ON CONFLICT (company_id, name) DO NOTHING
+                    """, (new_company_id, "Ajustes de Inventario", main_wh_id, adj_loc_id, adj_loc_id))
+                    print(f" -> Tipo de operación ADJ creado para cia {new_company_id}")
+
+            # 8. Crear Socios por defecto (Varios)
+            cursor.execute("SELECT id FROM partner_categories WHERE name = 'Proveedor Cliente' AND company_id = %s", (new_company_id,))
+            cat_cl_id = cursor.fetchone()['id']
+            cursor.execute("SELECT id FROM partner_categories WHERE name = 'Proveedor Externo' AND company_id = %s", (new_company_id,))
+            cat_ex_id = cursor.fetchone()['id']
             
-            cursor.execute("""
-                INSERT INTO partners (company_id, name, category_id) VALUES (%s, %s, %s) 
-                ON CONFLICT (company_id, name) DO NOTHING
-            """, (new_company_id, "Proveedor Varios", cat_externo_id))
+            cursor.execute("INSERT INTO partners (company_id, name, category_id) VALUES (%s, 'Cliente Varios', %s) ON CONFLICT (company_id, name) DO NOTHING", (new_company_id, cat_cl_id))
+            cursor.execute("INSERT INTO partners (company_id, name, category_id) VALUES (%s, 'Proveedor Varios', %s) ON CONFLICT (company_id, name) DO NOTHING", (new_company_id, cat_ex_id))
 
             conn.commit()
             return new_company
@@ -6877,8 +6910,7 @@ def create_company(name: str, country_code: str = "PE"):
     except Exception as e:
         if conn: conn.rollback()
         print(f"[ERROR DB] Falló crear compañía: {e}")
-        # Captura errores de restricción unique
-        if "companies_name_key" in str(e) or "duplicate key" in str(e):
+        if "companies_name_key" in str(e):
             raise ValueError(f"La compañía '{name}' ya existe.")
         raise e 
     finally:
