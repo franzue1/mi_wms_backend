@@ -58,6 +58,7 @@ async def get_stock_summary_report(
     auth: AuthDependency,
     company_id: int = Query(...),
     warehouse_id: Optional[int] = None,
+    location_id: Optional[int] = None,
     sku: Optional[str] = None,
     product_name: Optional[str] = None,
     category_name: Optional[str] = None
@@ -66,7 +67,7 @@ async def get_stock_summary_report(
     if "reports.stock.view" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
     
-    filters = { "warehouse_id": warehouse_id, "sku": sku, "product_name": product_name, "category_name": category_name }
+    filters = { "warehouse_id": warehouse_id,"location_id": location_id, "sku": sku, "product_name": product_name, "category_name": category_name }
     filters = {k: v for k, v in filters.items() if v is not None}
 
     try:
@@ -74,6 +75,7 @@ async def get_stock_summary_report(
         return [dict(row) for row in stock_data]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al generar reporte de stock: {e}")
+
 
 @router.get("/aging", response_model=List[schemas.AgingDetailResponse])
 async def get_aging_report(
@@ -370,22 +372,16 @@ async def get_stock_detail_report(
     
     # Adaptamos los filtros del frontend a los de la función de BD
     filters = { 
+        "warehouse_id": warehouse_id, 
+        "location_id": location_id,
         "sku": sku, 
         "product_name": product_name, 
-        "category_name": category_name,
-        "location_id": location_id
+        "category_name": category_name 
     }
     filters = {k: v for k, v in filters.items() if v is not None and v != ""}
 
     try:
-        # Asumimos que la función de BD espera warehouse_id por separado
-        stock_data = db.get_stock_on_hand_filtered_sorted(
-            company_id=company_id, 
-            warehouse_id=warehouse_id, 
-            filters=filters,
-            sort_by='sku', # El frontend no parece pasar sort aquí, ponemos un default
-            ascending=True
-        )
+        stock_data = db.get_stock_summary_filtered_sorted(company_id=company_id, filters=filters)
         return [dict(row) for row in stock_data]
     except Exception as e:
         traceback.print_exc()

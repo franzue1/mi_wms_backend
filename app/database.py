@@ -3258,10 +3258,7 @@ def get_stock_summary_by_product(warehouse_id=None):
         base_query += " AND w.id = %s"
         params.append(warehouse_id)
 
-    # --- ¡ESTA ES LA CORRECCIÓN! ---
-    base_query += " GROUP BY w.id, w.name, p.id, p.sku, p.name, pc.id, pc.name, u.id, u.name"
-    # --- FIN DE LA CORRECCIÓN ---
-    
+    base_query += " GROUP BY w.id, w.name, p.id, p.sku, p.name, pc.id, pc.name, u.id, u.name"    
     base_query += " ORDER BY w.name, p.name"
     return execute_query(base_query, tuple(params), fetchall=True)
 
