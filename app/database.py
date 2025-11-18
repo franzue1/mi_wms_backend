@@ -1996,9 +1996,7 @@ def create_warehouse_with_data(cursor, name, code, company_id, category_id, for_
     Crea ubicaciones y tipos de operación para un almacén. 
     (Versión PostgreSQL - Corregida para Multi-Compañía)
     """
-    
     if not for_existing:
-        # --- CORRECCIÓN 1: Unicidad Compuesta en Warehouses ---
         cursor.execute(
             """INSERT INTO warehouses (company_id, name, code, category_id, status) 
                VALUES (%s, %s, %s, %s, 'activo') 
@@ -2006,13 +2004,11 @@ def create_warehouse_with_data(cursor, name, code, company_id, category_id, for_
                RETURNING id""", 
             (company_id, name, code, category_id)
         )
-        # -------------------------------------------------------
         warehouse_id_row = cursor.fetchone()
         if not warehouse_id_row:
             print(f" -> Almacén '{code}' ya existía (llamado desde create_warehouse_with_data). Omitiendo.")
             return
         warehouse_id = warehouse_id_row[0]
-
     # --- 1. Crear Ubicación de Stock Principal ---
     stock_loc_name = f"{code}/Stock"
     # --- CORRECCIÓN 2: Unicidad Compuesta en Locations ---
@@ -2023,13 +2019,11 @@ def create_warehouse_with_data(cursor, name, code, company_id, category_id, for_
            RETURNING id""",
         (company_id, stock_loc_name, "ALMACEN PRINCIPAL", warehouse_id)
     )
-    # -----------------------------------------------------
     stock_loc_id_row = cursor.fetchone()
     if not stock_loc_id_row: # Si ya existía, buscarlo con filtro de compañía
         cursor.execute("SELECT id FROM locations WHERE path = %s AND company_id = %s", (stock_loc_name, company_id))
         stock_loc_id_row = cursor.fetchone()
     stock_loc_id = stock_loc_id_row[0]
-
     # --- 2. Crear Ubicación de Averiados ---
     damaged_loc_name = f"{code}/Averiados"
     # --- CORRECCIÓN 3: Unicidad Compuesta en Locations ---
@@ -2040,25 +2034,21 @@ def create_warehouse_with_data(cursor, name, code, company_id, category_id, for_
            RETURNING id""",
         (company_id, damaged_loc_name, "AVERIADO", warehouse_id)
     )
-    # -----------------------------------------------------
     damaged_loc_id_row = cursor.fetchone()
     if not damaged_loc_id_row: # Si ya existía
         cursor.execute("SELECT id FROM locations WHERE path = %s AND company_id = %s", (damaged_loc_name, company_id))
         damaged_loc_id_row = cursor.fetchone()
     damaged_loc_id = damaged_loc_id_row[0]
-    
     # --- 3. Obtener IDs de Ubicaciones Virtuales (Filtrado por Compañía) ---
     # Añadimos 'AND company_id = %s' para evitar mezclar datos entre empresas
     cursor.execute("SELECT id FROM locations WHERE category = 'PROVEEDOR' AND company_id = %s LIMIT 1", (company_id,))
     vendor_loc_row = cursor.fetchone()
     if not vendor_loc_row: raise Exception(f"Ubicación virtual 'PROVEEDOR' no encontrada para cia {company_id}.")
     vendor_loc_id = vendor_loc_row[0]
-
     cursor.execute("SELECT id FROM locations WHERE category = 'CLIENTE' AND company_id = %s LIMIT 1", (company_id,))
     customer_loc_row = cursor.fetchone()
     if not customer_loc_row: raise Exception(f"Ubicación virtual 'CLIENTE' no encontrada para cia {company_id}.")
     customer_loc_id = customer_loc_row[0]
-    
     # --- 4. Crear Tipos de Operación ---
     picking_types_to_create = [
         (company_id, f"Recepciones {code}", 'IN', warehouse_id, vendor_loc_id, stock_loc_id),
@@ -2072,59 +2062,75 @@ def create_warehouse_with_data(cursor, name, code, company_id, category_id, for_
         VALUES (%s, %s, %s, %s, %s, %s) 
         ON CONFLICT (company_id, name) DO NOTHING
     """, picking_types_to_create)
-    # ---------------------------------------------------------
-    
     print(f" -> Datos (ubicaciones, tipos op) creados para Almacén '{code}' (ID: {warehouse_id}).")
 
-def create_warehouse(name, code, category_id, company_id, social_reason, ruc, email, phone, address, status):
-    """
-    Función pública que AHORA incluye el estado.
-    [REFACTORIZADO] Usa el pool y maneja la transacción completa (commit/rollback).
-    """
-    
-    # 1. Obtener el pool
-    global db_pool
-    if not db_pool:
-        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
-        init_db_pool()
-        if not db_pool:
-            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
 
-    # 2. Preparar la conexión
+def create_warehouse(company_id, name, code, category_id, social_reason=None, ruc=None, email=None, phone=None, address=None):
+    """
+    Crea un nuevo almacén desde el formulario de la UI.
+    Incluye la creación automática de ubicaciones y tipos de operación.
+    """
+    print(f" -> [DB] Creando almacén: {name} ({code}) para Cía {company_id}")
+    
+    global db_pool
+    if not db_pool: init_db_pool()
     conn = None
+    
     try:
-        # 3. Obtener UNA conexión del pool para toda la transacción
         conn = db_pool.getconn()
-        
-        # 4. Abrir el cursor
-        # (Tu código usa fetchone()[0], así que un cursor estándar está bien)
+        # Usamos el cursor normal para poder pasar el cursor a la función auxiliar
         with conn.cursor() as cursor:
             
-            # 5. Llamar a la función interna (worker)
-            # Esta función ejecutará el INSERT y llamará a 
-            # create_warehouse_with_data, todo con el MISMO cursor.
-            _create_warehouse_with_cursor(
-                cursor, name, code, category_id, company_id, 
-                social_reason, ruc, email, phone, address, status
+            # Validar si ya existe el código en esta compañía
+            cursor.execute("SELECT id FROM warehouses WHERE code = %s AND company_id = %s", (code, company_id))
+            if cursor.fetchone():
+                raise ValueError(f"El código de almacén '{code}' ya existe en esta compañía.")
+
+            # --- REUTILIZAMOS LA LÓGICA SEGURA ---
+            # Llamamos a la función auxiliar que ya tiene toda la lógica de:
+            # 1. Insertar Warehouse (con los campos extra)
+            # 2. Crear Ubicación Stock/Averiados
+            # 3. Crear Picking Types (IN/OUT/INT/RET)
+            
+            # Nota: create_warehouse_with_data espera un cursor.
+            # Debemos adaptar la llamada para pasarle los campos extra.
+            
+            # 1. Insertar el Almacén manualmente aquí para pasar todos los campos de contacto
+            cursor.execute(
+                """INSERT INTO warehouses (company_id, name, code, category_id, social_reason, ruc, email, phone, address, status) 
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'activo') 
+                   RETURNING id""",
+                (company_id, name, code, category_id, social_reason, ruc, email, phone, address)
             )
-        
-        # 6. Si todo salió bien, hacer COMMIT
-        conn.commit()
-        print(f"[DB] Almacén '{name}' y datos asociados creados/verificados exitosamente.")
+            new_wh_row = cursor.fetchone()
+            if not new_wh_row: raise Exception("Error al insertar almacén.")
+            new_wh_id = new_wh_row[0]
+            
+            # 2. Llamar al auxiliar para crear Ubicaciones y Operaciones
+            # Pasamos for_existing=True porque ya lo acabamos de insertar arriba
+            create_warehouse_with_data(
+                cursor, 
+                name, 
+                code, 
+                company_id, 
+                category_id, 
+                for_existing=True, 
+                warehouse_id=new_wh_id
+            )
+
+            conn.commit()
+            return new_wh_id
 
     except Exception as e:
-        # 7. Si algo falló (el INSERT o create_warehouse_with_data),
-        #    hacer ROLLBACK
-        if conn:
-            conn.rollback()
-        print(f"[DB-ERROR] Fallo al crear almacén '{name}' (ROLLBACK ejecutado): {e}")
-        traceback.print_exc()
-        raise e # Re-lanzar la excepción para que la API la maneje
-
+        if conn: conn.rollback()
+        print(f"[ERROR DB] create_warehouse: {e}")
+        # Capturar errores de unicidad si se nos pasó algo
+        if "warehouses_code_company_key" in str(e) or "unique constraint" in str(e):
+            raise ValueError(f"El código '{code}' ya existe.")
+        raise e
     finally:
-        # 8. PASE LO QUE PASE, devolver la conexión al pool
-        if conn:
-            db_pool.putconn(conn)
+        if conn: db_pool.putconn(conn)
+
 
 def _create_warehouse_with_cursor(cursor, name, code, category_id, company_id, social_reason, ruc, email, phone, address, status):
     """Función interna que AHORA incluye el estado. (Versión PostgreSQL)"""

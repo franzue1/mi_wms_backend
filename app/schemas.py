@@ -509,3 +509,6 @@ class LiquidationDetailsResponse(BaseModel):
 class StockCheckRequest(BaseModel):
     location_id: int
     product_ids: List[int]
+
+
+    

@@ -60,6 +60,7 @@ from app.api import (
     auth, products, warehouses, partners, locations, reports, 
     pickings, work_orders, adjustments, configuration, admin
 )
+
 app.include_router(auth.router, prefix="/auth", tags=["Autenticación"])
 app.include_router(products.router, prefix="/products", tags=["Productos"])
 app.include_router(warehouses.router, prefix="/warehouses", tags=["Almacenes"])

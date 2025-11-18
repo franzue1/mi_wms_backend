@@ -10,6 +10,7 @@ import traceback
 import io
 import csv
 from fastapi.responses import StreamingResponse
+import asyncio
 
 router = APIRouter()
 AuthDependency = Annotated[TokenData, Depends(security.get_current_user_data)]
@@ -124,32 +125,36 @@ async def create_warehouse(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
     
     try:
-        with db.connect_db() as conn:
-            with conn.cursor() as cursor:
-                db._create_warehouse_with_cursor(
-                    cursor,
-                    name=warehouse.name,
-                    code=warehouse.code.upper(),
-                    category_id=warehouse.category_id,
-                    company_id=company_id,
-                    social_reason=warehouse.social_reason,
-                    ruc=warehouse.ruc,
-                    email=warehouse.email,
-                    phone=warehouse.phone,
-                    address=warehouse.address,
-                    status=warehouse.status
-                )
+        # --- ¡CORRECCIÓN! ---
+        # Llamamos directamente a la función pública de DB en un hilo.
+        # NO abrimos 'with db.connect_db()...' aquí.
         
-        new_wh_raw = db.execute_query("SELECT id FROM warehouses WHERE code = %s AND company_id = %s", (warehouse.code.upper(), company_id), fetchone=True)
-        if not new_wh_raw:
-            raise HTTPException(status_code=500, detail="Error al verificar la creación del almacén.")
-            
-        created_warehouse = db.get_warehouse_details_by_id(new_wh_raw['id'])
-        return dict(created_warehouse)
+        new_wh_id = await asyncio.to_thread(
+            db.create_warehouse, # La función pública que revisamos
+            company_id=company_id,
+            name=warehouse.name,
+            code=warehouse.code.upper(),
+            category_id=warehouse.category_id,
+            social_reason=warehouse.social_reason,
+            ruc=warehouse.ruc,
+            email=warehouse.email,
+            phone=warehouse.phone,
+            address=warehouse.address
+        )
+        # --------------------
+        
+        # Obtener los detalles del almacén creado para devolverlos
+        created_warehouse_raw = await asyncio.to_thread(db.get_warehouse_details_by_id, new_wh_id)
+        
+        if not created_warehouse_raw:
+             raise HTTPException(status_code=500, detail="Almacén creado pero no encontrado.")
+
+        return dict(created_warehouse_raw)
 
     except ValueError as ve:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error interno: {e}")
 
 
