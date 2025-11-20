@@ -5190,36 +5190,61 @@ def get_pickings_count(picking_type_code, company_id, filters={}):
     """
     params = [picking_type_code, company_id]
     where_clauses = []
+    
+    # --- Mapeo de Claves de DB (CLAVE para la Consistencia) ---
+    filter_map_db = {
+        'src_path_display': "(CASE WHEN pt.code = 'IN' THEN partner.name ELSE COALESCE(l_src.path, w_src.name) END)",
+        'dest_path_display': "(CASE WHEN pt.code = 'OUT' THEN partner.name ELSE COALESCE(l_dest.path, w_dest.name) END)",
+        'w_src.name': 'w_src.name',
+        'w_dest.name': 'w_dest.name',
+        'p.state': 'p.state', 
+        'p.custom_operation_type': 'p.custom_operation_type', 
+        'p.partner_ref': 'p.partner_ref', 
+        'p.responsible_user': 'p.responsible_user',
+        'p.name': 'p.name',
+        'p.purchase_order': 'p.purchase_order'
+    }
+    # -----------------------------------------------------------
 
-    # Construir WHERE dinámico para filtros
     for key, value in filters.items():
         if value:
+            # Lógica para Fechas
             if key in ["date_transfer_from", "date_transfer_to"]:
                 try:
                     db_date = datetime.strptime(value, "%d/%m/%Y").strftime("%Y-%m-%d")
                     operator = ">=" if key == "date_transfer_from" else "<="
-                    where_clauses.append(f"p.date_transfer {operator}  %s")
+                    where_clauses.append(f"p.date_transfer {operator} %s")
                     params.append(db_date)
                 except ValueError: pass
-            elif key == 'state':
-                where_clauses.append("p.state =  %s")
-                params.append(value)
-            # Mapeo de otras claves de filtro a las columnas correctas
-            elif key in ["partner_ref", "custom_operation_type", "name", "purchase_order", "responsible_user"]:
-                where_clauses.append(f"p.{key} LIKE  %s")
-                params.append(f"%{value}%")
-            elif key == 'src_path':
-                where_clauses.append("(CASE WHEN pt.code = 'IN' THEN partner.name ELSE COALESCE(w_src.name, l_src.path) END) LIKE  %s")
-                params.append(f"%{value}%")
-            elif key == 'dest_path':
-                where_clauses.append("(CASE WHEN pt.code = 'OUT' THEN partner.name ELSE COALESCE(w_dest.name, l_dest.path) END) LIKE  %s")
-                params.append(f"%{value}%")
+            
+            # Lógica para Claves de Filtro (ej. 'w_src.name', 'src_path_display')
+            elif key in filter_map_db:
+                db_column = filter_map_db[key]
+                
+                # Manejar los campos especiales que no son LIKE simple (display fields)
+                if key in ['src_path_display', 'dest_path_display']:
+                    # Usamos la definición compleja de la columna
+                    where_clauses.append(f"{db_column} ILIKE %s")
+                
+                # Campos simples (w_src.name, p.state)
+                elif key in ['w_src.name', 'w_dest.name']:
+                    where_clauses.append(f"{db_column} ILIKE %s")
+                    
+                elif key == 'p.state':
+                    where_clauses.append(f"{db_column} = %s")
+                
+                # Campos puros de pickings
+                else:
+                    where_clauses.append(f"{key} ILIKE %s")
+                
+                params.append(f"%{value}%") # Añadir el valor filtrado
                 
     if where_clauses:
         base_query += " AND " + " AND ".join(where_clauses)
         
     result = execute_query(base_query, tuple(params), fetchone=True)
     return result['total_count'] if result else 0
+
 
 def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id', ascending=False, limit=None, offset=None):
     sort_map = {
@@ -5307,6 +5332,7 @@ def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id'
         query_params.extend([limit, offset])
 
     return execute_query(query, tuple(query_params), fetchall=True)
+
 
 def get_location_name_details(location_id):
     """

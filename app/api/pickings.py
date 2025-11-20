@@ -76,7 +76,6 @@ async def get_pickings_count(
     clean_filters = _build_picking_filters(type_code, filters_dict)
     
     try:
-        # --- ¡CAMBIO CLAVE AQUÍ! ---
         # Usamos await asyncio.to_thread para no bloquear el servidor
         count = await asyncio.to_thread(
             db.get_pickings_count, 
@@ -84,7 +83,6 @@ async def get_pickings_count(
             company_id, 
             filters=clean_filters
         )
-        # ---------------------------
         return count
 
     except Exception as e:
