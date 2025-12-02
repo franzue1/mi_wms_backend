@@ -22,62 +22,66 @@ async def get_dashboard_kpis(
     company_id: int = Query(...)
 ):
     """ 
-    Obtiene TODOS los KPIs. 
-    [ESTABILIZADO] Ejecuta consultas en BLOQUES secuenciales para no saturar 
-    el pool de conexiones de la base de datos (evita error SSL connection closed).
+    [MODO SEGURO] Ejecución ESTRICTAMENTE SECUENCIAL.
+    Se eliminó asyncio.gather para evitar abrir múltiples conexiones SSL
+    simultáneas que saturan el Pooler de Supabase/Render.
     """
     if "nav.dashboard.view" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
     
     try:
-        # --- BLOQUE 1: KPIs Numéricos Ligeros (Rápidos) ---
-        # Ejecutamos estos 3 en paralelo porque consumen poco recurso
-        batch_1 = await asyncio.gather(
-            asyncio.to_thread(db.get_dashboard_kpis, company_id),           # Conteos
-            asyncio.to_thread(db.execute_query, "SELECT COUNT(*) as c FROM work_orders WHERE phase != 'Liquidado' AND company_id=%s", (company_id,), fetchone=True), # OTs
-            asyncio.to_thread(db.get_total_liquidated_value_global, company_id) # Liquidado Global
-        )
-        kpis_counts = batch_1[0]
-        ots_pendientes = batch_1[1]['c'] if batch_1[1] else 0
-        total_liquidated = batch_1[2]
+        # Ejecutamos UNA consulta a la vez (await explicito paso a paso)
+        
+        # 1. Conteos Básicos
+        kpis_counts = await asyncio.to_thread(db.get_dashboard_kpis, company_id)
+        
+        # 2. OTs Pendientes
+        ots_res = await asyncio.to_thread(db.execute_query, "SELECT COUNT(*) as c FROM work_orders WHERE phase != 'Liquidado' AND company_id=%s", (company_id,), fetchone=True)
+        ots_pendientes = ots_res['c'] if ots_res else 0
 
-        # --- BLOQUE 2: Análisis Financiero y Gráficos (Pesados) ---
-        # Ejecutamos secuencialmente o en un grupo pequeño
+        # 3. Valor Liquidado Global
+        total_liquidated = await asyncio.to_thread(db.get_total_liquidated_value_global, company_id)
+
+        # 4. Valor Inventario (Financiero)
         inv_values = await asyncio.to_thread(db.get_inventory_value_kpis, company_id)
+
+        # 5. Distribución Propiedad
         ownership_stats = await asyncio.to_thread(db.get_ownership_distribution, company_id)
-        
-        batch_2_charts = await asyncio.gather(
-            asyncio.to_thread(db.get_operations_throughput, company_id),
-            asyncio.to_thread(db.get_inventory_aging, company_id),
-            asyncio.to_thread(db.get_material_flow_series, company_id, 30) # Default 30 days
-        )
-        throughput = batch_2_charts[0]
-        aging = batch_2_charts[1]
-        flow_data = batch_2_charts[2]
 
-        # --- BLOQUE 3: Rankings y Listas (Complejos) ---
-        # Estos suelen tener JOINs y GROUP BYs grandes
-        batch_3 = await asyncio.gather(
-            asyncio.to_thread(db.get_top_projects_statistics, company_id),
-            asyncio.to_thread(db.get_value_by_region, company_id),
-            asyncio.to_thread(db.get_top_products_by_value, company_id),
-            asyncio.to_thread(db.get_value_by_category, company_id),
-            asyncio.to_thread(db.get_warehouse_ranking_by_category, company_id, "ALMACEN PRINCIPAL", 5),
-            asyncio.to_thread(db.get_warehouse_ranking_by_category, company_id, "CONTRATISTA", 10),
-            asyncio.to_thread(db.get_abc_stats, company_id),
-            asyncio.to_thread(db.get_reverse_logistics_rate, company_id)
-        )
-        
-        top_projects = batch_3[0]
-        geo_data = batch_3[1]
-        top_products = batch_3[2]
-        val_by_cat = batch_3[3]
-        top_wh = batch_3[4]
-        top_cont = batch_3[5]
-        abc_data = batch_3[6]
-        ret_rate = batch_3[7]
+        # 6. Gráfico Rendimiento
+        throughput = await asyncio.to_thread(db.get_operations_throughput, company_id)
 
-        # --- Procesamiento Final (En memoria) ---
+        # 7. Aging
+        aging = await asyncio.to_thread(db.get_inventory_aging, company_id)
+
+        # 8. Flujo Materiales
+        flow_data = await asyncio.to_thread(db.get_material_flow_series, company_id, 30)
+
+        # 9. Top Proyectos
+        top_projects = await asyncio.to_thread(db.get_top_projects_statistics, company_id)
+
+        # 10. Geo Data
+        geo_data = await asyncio.to_thread(db.get_value_by_region, company_id)
+
+        # 11. Top Productos
+        top_products = await asyncio.to_thread(db.get_top_products_by_value, company_id)
+
+        # 12. Por Categoría
+        val_by_cat = await asyncio.to_thread(db.get_value_by_category, company_id)
+
+        # 13. Top Almacenes
+        top_wh = await asyncio.to_thread(db.get_warehouse_ranking_by_category, company_id, "ALMACEN PRINCIPAL", 5)
+
+        # 14. Top Contratistas
+        top_cont = await asyncio.to_thread(db.get_warehouse_ranking_by_category, company_id, "CONTRATISTA", 10)
+
+        # 15. Estadísticas ABC
+        abc_data = await asyncio.to_thread(db.get_abc_stats, company_id)
+
+        # 16. Tasa Devolución
+        ret_rate = await asyncio.to_thread(db.get_reverse_logistics_rate, company_id)
+
+        # --- Procesamiento Final ---
         own_val = sum(x['value'] for x in ownership_stats if x['type'] == 'Propio')
         cons_val = sum(x['value'] for x in ownership_stats if x['type'] == 'Consignado')
 
@@ -113,9 +117,8 @@ async def get_dashboard_kpis(
         return response
         
     except Exception as e:
-        print(f"ERROR DASHBOARD: {e}") # Log para Render
+        print(f"ERROR DASHBOARD: {e}") 
         traceback.print_exc()
-        # Devolvemos un error 500 limpio pero informativo
         raise HTTPException(status_code=500, detail=f"Error de DB: {str(e)}")
 
 @router.get("/stock-summary", response_model=List[schemas.StockReportResponse])
