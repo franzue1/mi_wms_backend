@@ -1093,14 +1093,13 @@ def get_value_by_category(company_id):
 
 def get_value_by_region(company_id):
     """
-    [NUEVO] Agrupa el valor en custodia por Departamento (Mapa de Calor).
+    Agrupa el valor en custodia por Departamento.
     """
     query = """
         SELECT 
-            -- Si el campo está vacío, lo agrupamos como 'Sin Región'
             COALESCE(NULLIF(p.department, ''), 'Sin Región') as region,
             COUNT(DISTINCT p.id) as projects_count,
-            SUM(sq.quantity * prod.standard_price) as total_value
+            COALESCE(SUM(sq.quantity * prod.standard_price), 0) as total_value
         FROM stock_quants sq
         JOIN products prod ON sq.product_id = prod.id
         JOIN projects p ON sq.project_id = p.id
@@ -1116,7 +1115,7 @@ def get_value_by_region(company_id):
 def get_warehouse_ranking_by_category(company_id, category_name, limit=10):
     """
     Obtiene el valor total de stock agrupado por Almacén, filtrado por Categoría.
-    Útil para: Top Almacenes Principales y Top Contratistas.
+    [CORREGIDO] Alias de tabla 'prod' unificado en el WHERE.
     """
     query = """
         SELECT 
@@ -1128,17 +1127,17 @@ def get_warehouse_ranking_by_category(company_id, category_name, limit=10):
         JOIN locations l ON sq.location_id = l.id
         JOIN warehouses w ON l.warehouse_id = w.id
         JOIN warehouse_categories wc ON w.category_id = wc.id
-        WHERE p.company_id = %s 
+        
+        -- [FIX] Usamos 'prod.company_id' porque el alias arriba es 'prod'
+        WHERE prod.company_id = %s 
           AND l.type = 'internal'
           AND wc.name = %s
           AND sq.quantity > 0
+          
         GROUP BY w.id, w.name
         ORDER BY total_value DESC
         LIMIT %s
     """
-    # Nota: en la query usé 'p.company_id' pero el join es 'prod'. Corrigiendo alias:
-    query = query.replace("p.company_id", "prod.company_id")
-    
     results = execute_query(query, (company_id, category_name, limit), fetchall=True)
     return [dict(r) for r in results]
 
