@@ -1,48 +1,46 @@
 # app/security.py
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, List
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from pydantic import BaseModel
-from app import database as db # Importamos app.database.py
+from app import database as db
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 
 # --- Configuración de Hashing de Contraseña ---
-# Usamos passlib para hashear contraseñas de forma segura
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # --- Configuración de Token JWT ---
-# Idealmente, esto debe estar en variables de entorno
 SECRET_KEY = os.environ.get("SECRET_KEY", "tu_super_secreto_por_defecto_cambia_esto")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 8 # 8 horas
 
-# Esquema de OAuth2 para que FastAPI sepa cómo recibir el token
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
 
-# Modelo Pydantic para los datos del token
+# --- MODELO DE DATOS DEL TOKEN (CORREGIDO) ---
 class TokenData(BaseModel):
     username: Optional[str] = None
-    user_id: Optional[int] = None # <-- Añadir
+    user_id: Optional[int] = None
     permissions: Optional[list] = []
+    # --- NUEVOS CAMPOS NECESARIOS PARA VALIDACIÓN IDOR ---
+    role_name: Optional[str] = None
+    company_ids: List[int] = []
 
 # --- Funciones de Contraseña ---
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verifica una contraseña plana contra un hash."""
-    # Primero, verificamos contra el hash que ya tienes (sha256)
     if db.check_password(hashed_password, plain_password):
         return True
-    # Luego, verificamos contra el nuevo hash (bcrypt)
     try:
         return pwd_context.verify(plain_password, hashed_password)
     except Exception:
         return False
 
 def get_password_hash(password: str) -> str:
-    """Crea un nuevo hash seguro (bcrypt) para contraseñas nuevas."""
+    """Crea un nuevo hash seguro (bcrypt)."""
     return pwd_context.hash(password)
 
 # --- Funciones de Token JWT ---
@@ -60,8 +58,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
 
 async def get_current_user_data(token: str = Depends(oauth2_scheme)) -> TokenData:
     """
-    Dependencia de FastAPI: Valida el token y devuelve los datos del usuario.
-    Esto protegerá nuestros endpoints.
+    Valida el token y devuelve los datos del usuario (incluyendo rol y compañías).
     """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -70,12 +67,45 @@ async def get_current_user_data(token: str = Depends(oauth2_scheme)) -> TokenDat
     )
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        
         username: str = payload.get("sub")
-        user_id = payload.get("user_id") # <-- Leer del token
+        user_id = payload.get("user_id")
         permissions: list = payload.get("permissions", [])
+        
+        # --- EXTRACCIÓN DE NUEVOS DATOS ---
+        role_name: str = payload.get("role")        # Rol del usuario
+        company_ids: list = payload.get("companies", []) # Lista de IDs de empresa permitidos
+
         if username is None:
             raise credentials_exception
-        token_data = TokenData(username=username, user_id=user_id, permissions=permissions)
+            
+        token_data = TokenData(
+            username=username, 
+            user_id=user_id, 
+            permissions=permissions,
+            role_name=role_name,      # <--- Asignamos
+            company_ids=company_ids   # <--- Asignamos
+        )
     except JWTError:
         raise credentials_exception
+    
     return token_data
+
+def verify_company_access(auth: TokenData, company_id: int):
+    """
+    Verifica estrictamente si el usuario tiene permiso para acceder a la compañía solicitada.
+    Lanza HTTP 403 Forbidden si no tiene permiso.
+    """
+    # 1. El Super Admin (Rol 'Administrador') tiene pase maestro.
+    # Asegúrate que el nombre del rol coincida con tu BD (ej. 'Administrador', 'admin', etc.)
+    if auth.role_name == "Administrador":
+        return
+
+    # 2. Verificar si el ID de la empresa está en la lista permitida del token.
+    # auth.company_ids viene del token JWT, que se firmó al hacer login.
+    if company_id not in auth.company_ids:
+        print(f"[SECURITY BLOCK] Usuario '{auth.username}' (Rol: {auth.role_name}) intentó acceder a Company ID {company_id} sin permiso.")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, 
+            detail="ACCESO DENEGADO: No tienes autorización para acceder a los datos de esta compañía."
+        )

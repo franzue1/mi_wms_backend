@@ -1,0 +1,564 @@
+import traceback
+import psycopg2.extras
+from ..core import get_db_connection, return_db_connection, execute_query, execute_commit_query
+
+# --- PRODUCTOS ---
+
+def get_products(company_id, ownership_filter=None):
+    """
+    Obtiene los productos, AHORA INCLUYENDO los nuevos campos.
+    """
+    query = """
+    SELECT p.id, p.name, p.sku, p.type, pc.name as category_name, u.name as uom_name, 
+           p.tracking, p.ownership, p.standard_price  -- <-- AÑADIDO
+    FROM products p
+    LEFT JOIN product_categories pc ON p.category_id = pc.id
+    LEFT JOIN uom u ON p.uom_id = u.id
+    WHERE p.company_id =  %s
+    """
+    params = (company_id,)
+    if ownership_filter:
+        query += " AND p.ownership =  %s"
+        params += (ownership_filter,)
+    query += " ORDER BY p.name"
+    return execute_query(query, params, fetchall=True)
+
+def get_product_details(product_id):
+    """ Obtiene un producto por su ID con todos los campos del schema. """
+    query = """
+        SELECT 
+            p.id, p.company_id, p.name, p.sku, 
+            p.category_id, pc.name as category_name, 
+            p.uom_id, u.name as uom_name,
+            p.tracking, p.ownership, p.standard_price, p.type
+        FROM products p
+        LEFT JOIN product_categories pc ON p.category_id = pc.id
+        LEFT JOIN uom u ON p.uom_id = u.id
+        WHERE p.id = %s
+    """
+    return execute_query(query, (product_id,), fetchone=True)
+
+def get_product_details_by_sku(sku, company_id):
+    """Busca los detalles completos de un producto por su SKU exacto para una compañía."""
+    if not sku: return None
+    # Incluimos id, name, tracking, y uom_name (útil para la fila)
+    query = """
+        SELECT p.id, p.name, p.tracking, u.name as uom_name, p.standard_price
+        FROM products p
+        LEFT JOIN uom u ON p.uom_id = u.id
+        WHERE p.sku =  %s AND p.company_id =  %s
+    """
+    return execute_query(query, (sku, company_id), fetchone=True)
+
+def create_product(name, sku, category_id, tracking, uom_id, company_id, ownership, standard_price):
+    """
+    Crea un nuevo producto usando el helper de commit.
+    """
+    # Eliminamos la lógica manual del pool. execute_commit_query ya lo hace.
+    
+    query = """
+        INSERT INTO products (name, sku, category_id, tracking, uom_id, company_id, ownership, standard_price) 
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s) 
+        RETURNING id
+    """
+    params = (name, sku, category_id, tracking, uom_id, company_id, ownership, standard_price)
+
+    try:
+        # Usamos el helper que maneja conexión, cursor y commit automáticamente
+        result = execute_commit_query(query, params, fetchone=True)
+        
+        if result:
+            return result[0]
+        else:
+            raise Exception("No se devolvió ID al crear producto.")
+            
+    except Exception as e:
+        # Manejo específico de errores
+        if "products_sku_key" in str(e):
+            raise ValueError(f"El SKU '{sku}' ya existe.")
+        else:
+            # Loguear y re-lanzar
+            print(f"Error DB [create_product]: {e}")
+            traceback.print_exc()
+            raise e
+
+def update_product(product_id, name, sku, category_id, tracking, uom_id, ownership, standard_price):
+    """
+    Actualiza un producto existente usando el pool de conexiones.
+    Maneja la restricción de SKU único.
+    """
+    query = """
+        UPDATE products 
+        SET name = %s, sku = %s, category_id = %s, tracking = %s, 
+            uom_id = %s, ownership = %s, standard_price = %s 
+        WHERE id = %s
+    """
+    params = (name, sku, category_id, tracking, uom_id, ownership, standard_price, product_id)
+
+    try:
+        # 1. Usamos la función centralizada de escritura.
+        execute_commit_query(query, params)
+        
+    except Exception as e:
+        # 2. Manejamos errores comunes (como SKU duplicado)
+        #    que execute_commit_query re-lanza desde la BD.
+        
+        # ¡Ajusta 'products_sku_key' al nombre real de tu constraint si es diferente!
+        if "products_sku_key" in str(e): 
+            raise ValueError(f"El SKU '{sku}' ya existe para otro producto.")
+        
+        # Puedes añadir más 'elif' si, por ejemplo, el nombre también es único
+        # elif "products_name_key" in str(e):
+        #    raise ValueError(f"El nombre de producto '{name}' ya existe.")
+        
+        else:
+            # Re-lanzar cualquier otro error de BD
+            raise e
+
+def delete_product(product_id):
+    """
+    Elimina un producto y sus datos asociados (quants, lots)
+    SÓLO SI no tiene movimientos de stock.
+    Usa el pool, pero maneja la transacción manualmente.
+    """
+    global db_pool
+    if not db_pool:
+        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
+        init_db_pool()
+        if not db_pool:
+            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
+
+    conn = None # 1. Definimos la conexión fuera del try
+    try:
+        # 2. Obtenemos UNA conexión del pool para toda la transacción
+        conn = get_db_connection()
+        conn.cursor_factory = psycopg2.extras.DictCursor
+
+        # Usamos un cursor para toda la operación
+        with conn.cursor() as cursor:
+            
+            # --- EL GUARDIÁN (LECTURA) ---
+            cursor.execute("SELECT COUNT(*) FROM stock_moves WHERE product_id = %s", (product_id,))
+            move_count = cursor.fetchone()[0]
+            
+            # --- LÓGICA DE NEGOCIO ---
+            if move_count > 0:
+                # Si retornamos aquí, el 'finally' se ejecutará
+                # y devolverá la conexión al pool. ¡Perfecto!
+                return (False, "Este producto no se puede eliminar porque tiene movimientos de inventario registrados.")
+            
+            # --- LA ELIMINACIÓN (ESCRITURA MÚLTIPLE) ---
+            # Si move_count == 0, procedemos a borrar todo
+            cursor.execute("DELETE FROM stock_quants WHERE product_id = %s", (product_id,))
+            cursor.execute("DELETE FROM stock_lots WHERE product_id = %s", (product_id,))
+            cursor.execute("DELETE FROM stock_moves WHERE product_id = %s", (product_id,)) # (Aunque ya sabemos que son 0)
+            cursor.execute("DELETE FROM products WHERE id = %s", (product_id,))
+            
+            # 3. Si todos los DELETEs fueron bien, hacemos COMMIT
+            conn.commit()
+            
+            return (True, "Producto eliminado correctamente.")
+            
+    except Exception as e:
+        # 4. Si CUALQUIER COSA falla (el SELECT, un DELETE),
+        #    hacemos rollback para revertir todo.
+        if conn:
+            conn.rollback()
+        print(f"[DB-ERROR] delete_product: {e}")
+        traceback.print_exc() # Muy útil para depurar
+        return (False, f"Error inesperado en la base de datos: {e}")
+        
+    finally:
+        # 5. PASE LO QUE PASE (éxito, error, o return anticipado),
+        #    DEVOLVEMOS la conexión al pool.
+        if conn:
+            return_db_connection(conn)
+
+def get_products_filtered_sorted(company_id, filters={}, sort_by='name', ascending=True, limit=None, offset=None):
+    """ 
+    Obtiene productos filtrados, ordenados y paginados.
+    [CORREGIDO] Asegura que se seleccionen todos los campos requeridos por el schema ProductResponse.
+    """
+    
+    # --- ¡INICIO DE LA CORRECCIÓN! ---
+    # Aseguramos que 'p.type' y 'p.company_id' estén en el SELECT
+    base_query = """
+    SELECT 
+        p.id, p.company_id, p.name, p.sku, 
+        p.category_id, pc.name as category_name, 
+        p.uom_id, u.name as uom_name,
+        p.tracking, p.ownership, p.standard_price, 
+        p.type  -- Este campo era requerido por el schema
+    FROM products p
+    LEFT JOIN product_categories pc ON p.category_id = pc.id
+    LEFT JOIN uom u ON p.uom_id = u.id
+    WHERE p.company_id = %s
+    """
+    # --- FIN DE LA CORRECCIÓN ---
+    
+    params = [company_id]
+    where_clauses = []
+
+    # (El resto de tu lógica de filtros es correcta)
+    column_map = {
+        'name': "p.name", 'sku': "p.sku", 'category_name': "pc.name",
+        'uom_name': "u.name", 'tracking': "p.tracking", 'ownership': "p.ownership"
+    }
+
+    for key, value in filters.items():
+        if not value: continue
+        sql_column = column_map.get(key)
+        if not sql_column: continue
+
+        if key in ['name', 'sku']:
+            where_clauses.append(f"{sql_column} ILIKE %s") 
+            params.append(f"%{value}%")
+        else: 
+            where_clauses.append(f"{sql_column} = %s")
+            params.append(value)
+
+    if where_clauses:
+        base_query += " AND " + " AND ".join(where_clauses)
+
+    sort_column_map = {
+        'id': "p.id", 'name': "p.name", 'sku': "p.sku", 'category_name': "pc.name",
+        'uom_name': "u.name", 'tracking': "p.tracking", 'ownership': "p.ownership",
+        'standard_price': "p.standard_price"
+    }
+    order_by_col = sort_column_map.get(sort_by, "p.id")
+    direction = "ASC" if ascending else "DESC"
+    base_query += f" ORDER BY {order_by_col} {direction}"
+
+    if limit is not None and offset is not None:
+        base_query += " LIMIT %s OFFSET %s"
+        params.extend([limit, offset])
+
+    return execute_query(base_query, tuple(params), fetchall=True)
+
+def get_products_count(company_id, filters={}):
+    """ Cuenta el total de productos que coinciden con los filtros. """
+    base_query = """
+    SELECT COUNT(p.id) as total_count
+    FROM products p
+    LEFT JOIN product_categories pc ON p.category_id = pc.id
+    LEFT JOIN uom u ON p.uom_id = u.id
+    WHERE p.company_id =  %s
+    """
+    params = [company_id]
+    where_clauses = []
+
+    column_map = {
+        'name': "p.name", 'sku': "p.sku", 'category_name': "pc.name",
+        'uom_name': "u.name", 'tracking': "p.tracking", 'ownership': "p.ownership"
+    }
+    
+    for key, value in filters.items():
+        if not value: continue
+        sql_column = column_map.get(key)
+        if not sql_column: continue
+
+        if key in ['name', 'sku']:
+            where_clauses.append(f"{sql_column} LIKE  %s")
+            params.append(f"%{value}%")
+        else:
+            where_clauses.append(f"{sql_column} =  %s")
+            params.append(value)
+
+    if where_clauses:
+        base_query += " AND " + " AND ".join(where_clauses)
+
+    result = execute_query(base_query, tuple(params), fetchone=True)
+    return result['total_count'] if result else 0
+
+def upsert_product_from_import(company_id, sku, name, category_id, uom_id, tracking, ownership, price):
+    """
+    Inserta o actualiza un producto (UPSERT).
+    """
+    conn = None
+    
+    query = """... (tu query gigante) ..."""
+    params = (company_id, sku, name, category_id, uom_id, tracking, ownership, price)
+
+    try:
+        conn = get_db_connection() # <-- Usar helper
+        with conn.cursor() as cursor:
+            cursor.execute(query, params)
+            was_inserted = cursor.fetchone()[0]
+            conn.commit()
+            return "created" if was_inserted else "updated"
+
+    except Exception as e:
+        if conn: conn.rollback()
+        print(f"Error procesando fila para SKU {sku}: {e}")
+        raise e
+        
+    finally:
+        if conn: return_db_connection(conn) # <-- Usar helper
+
+def search_storable_products_by_term(company_id: int, search_term: str):
+    """
+    Busca productos por nombre o SKU usando ILIKE y LIMIT.
+    """
+    # El '%%' es para la sintaxis de 'LIKE' en SQL
+    like_term = f"%{search_term}%" 
+    sql_query = """
+        SELECT 
+            pr.id, pr.name, pr.sku, pr.tracking, pr.ownership, 
+            pr.uom_id, pr.standard_price, u.name as uom_name,
+            pr.company_id  -- <--- ¡AÑADE ESTA LÍNEA!
+        FROM products pr
+        LEFT JOIN uom u ON pr.uom_id = u.id
+        WHERE 
+            pr.company_id = %(company_id)s
+            AND pr.type = 'storable'
+            AND (pr.name ILIKE %(term)s OR pr.sku ILIKE %(term)s)
+        ORDER BY 
+            pr.name
+        LIMIT 20; 
+    """
+    params = {"company_id": company_id, "term": like_term}
+
+    results_rows = execute_query(sql_query, params, fetchall=True)
+    if not results_rows:
+        return []
+    return [dict(row) for row in results_rows]  
+
+def process_sku_import_list(company_id: int, raw_text: str):
+    """
+    Parsea una lista de SKUs y cantidades, y los valida contra la BD.
+    Usa UNA sola consulta SQL para máxima eficiencia.
+    """
+    parsed_lines = {} # Usamos un dict para agrupar SKUs duplicados
+    errors = []
+    
+    lines = raw_text.strip().split('\n')
+    
+    for i, line in enumerate(lines):
+        if not line.strip(): continue
+        
+        sku = ""
+        qty_str = "1"
+        
+        if '*' in line:
+            parts = line.split('*')
+            if len(parts) == 2:
+                sku = parts[0].strip().lower() # Normalizar a minúsculas
+                qty_str = parts[1].strip().replace(',', '.')
+            else:
+                errors.append(f"Línea {i+1}: Formato inválido (demasiados '*').")
+                continue
+        else:
+            sku = line.strip().lower() # Normalizar a minúsculas
+        
+        if not sku:
+            errors.append(f"Línea {i+1}: SKU vacío.")
+            continue
+            
+        try:
+            quantity = float(qty_str)
+            if quantity <= 0:
+                errors.append(f"Línea {i+1}: Cantidad debe ser positiva.")
+                continue
+        except (ValueError, TypeError):
+            errors.append(f"Línea {i+1}: Cantidad '{qty_str}' no es un número.")
+            continue
+            
+        # Agrupar cantidades por SKU
+        parsed_lines[sku] = parsed_lines.get(sku, 0) + quantity
+
+    # --- Validación contra la Base de Datos ---
+    
+    if not parsed_lines:
+        return [], errors # No hay nada que buscar
+
+    # Obtenemos la lista de SKUs únicos a buscar
+    skus_to_find = list(parsed_lines.keys())
+    
+    # ¡Consulta SQL eficiente!
+    # Usamos "LOWER(pr.sku) = ANY(%(skus)s)" para usar un array de PostgreSQL
+    sql_query = """
+        SELECT 
+            pr.id, pr.name, pr.sku, pr.tracking, pr.ownership, 
+            pr.uom_id, pr.standard_price, u.name as uom_name
+        FROM products pr
+        LEFT JOIN uom u ON pr.uom_id = u.id
+        WHERE 
+            pr.company_id = %(company_id)s
+            AND pr.type = 'storable'
+            AND LOWER(pr.sku) = ANY(%(skus)s); -- ¡Busca en un array!
+    """
+    params = {"company_id": company_id, "skus": skus_to_find}
+    db_results = execute_query(sql_query, params, fetchall=True)
+    
+# Asegúrate de que db_results sea una lista vacía si es None
+    if db_results is None:
+        db_results = []
+
+    found_products_map = {row['sku'].lower(): row for row in db_results}
+    
+    # --- Construir la respuesta ---
+    final_found_list = []
+    
+    for sku_lower, total_qty in parsed_lines.items():
+        product_data = found_products_map.get(sku_lower)
+        
+        if product_data:
+            # Producto encontrado. Añadir la cantidad
+            # Esto es lo que Flet recibirá en 'found'
+            final_found_list.append({
+                "product": dict(product_data),  # <--- Esta es la corrección
+                "quantity": total_qty
+            })
+        else:
+            # Producto no encontrado
+            errors.append(f"SKU '{sku_lower}' no encontrado, inactivo o no almacenable.")
+
+    return final_found_list, errors
+
+# --- UNIDADES DE MEDIDA (UOM) ---
+
+def get_uoms(): return execute_query("SELECT id, name FROM uom ORDER BY name", fetchall=True)
+
+def create_uom(name):
+    """
+    Crea una nueva Unidad de Medida (UOM) usando el pool de conexiones.
+    Maneja la restricción de nombre único.
+    """
+    query = "INSERT INTO uom (name) VALUES (%s) RETURNING id"
+    params = (name,)
+    
+    try:
+        # 1. Llamamos a la función de escritura, pidiendo que retorne el resultado
+        result = execute_commit_query(query, params, fetchone=True)
+        
+        if result:
+            new_id = result[0] # O result['id'] si tu cursor devuelve dict
+            return new_id
+        else:
+            raise Exception("No se pudo crear la UOM o no se retornó el ID.")
+
+    except Exception as e: 
+        # 2. La lógica para detectar el error de duplicado sigue
+        #    funcionando porque execute_commit_query re-lanza el error.
+        if "uom_name_key" in str(e): 
+            raise ValueError(f"La unidad de medida '{name}' ya existe.")
+        else:
+            # Re-lanzar cualquier otro error de BD
+            raise e
+
+def update_uom(uom_id, name):
+    """
+    Actualiza el nombre de una Unidad de Medida (UOM) usando el pool de conexiones.
+    Maneja la restricción de nombre único.
+    """
+    query = "UPDATE uom SET name = %s WHERE id = %s"
+    params = (name, uom_id)
+    
+    try:
+        # 1. Llamamos a la función de escritura centralizada.
+        # No necesitamos fetchone=True para un UPDATE.
+        execute_commit_query(query, params)
+        
+    except Exception as e: 
+        # 2. La excepción de la BD es re-lanzada por execute_commit_query,
+        #    así que la capturamos aquí para manejarla.
+        if "uom_name_key" in str(e): 
+            raise ValueError(f"La unidad de medida '{name}' ya existe.")
+        else:
+            # Re-lanzar cualquier otro error de BD
+            raise e
+
+def delete_uom(uom_id):
+    """
+    Elimina una Unidad de Medida (UOM) usando el pool de conexiones.
+    Maneja errores de integridad referencial (foreign key).
+    """
+    query = "DELETE FROM uom WHERE id = %s"
+    params = (uom_id,)
+    
+    try:
+        # 1. Usamos la función centralizada de escritura
+        # No se necesita fetchone=True para un DELETE
+        execute_commit_query(query, params)
+        
+        # 2. Si no hubo error, la eliminación fue exitosa
+        return True, "Unidad de medida eliminada."
+        
+    except Exception as e:
+        # 3. execute_commit_query re-lanza el error de la BD,
+        #    así que podemos inspeccionarlo aquí.
+        
+        # Detectar error de llave foránea
+        if "violates foreign key constraint" in str(e):
+            return False, "No se puede eliminar: Esta UdM está asignada a uno o más productos."
+        
+        # Cualquier otro error
+        print(f"[DB-ERROR] delete_uom: {e}")
+        return False, f"Error al eliminar: {e}"
+    
+def get_uom_id_by_name(name):
+    """Busca el ID de una unidad de medida por su nombre exacto."""
+    if not name or not name.strip(): return None
+    result = execute_query("SELECT id FROM uom WHERE name =  %s", (name,), fetchone=True)
+    return result['id'] if result else None
+
+def get_product_categories(company_id: int):
+    """Obtiene categorías de producto FILTRADAS POR COMPAÑÍA."""
+    return execute_query(
+        "SELECT id, name FROM product_categories WHERE company_id = %s ORDER BY name", 
+        (company_id,), 
+        fetchall=True
+    )
+
+def create_product_category(name: str, company_id: int):
+    """Crea una categoría de producto PARA UNA COMPAÑÍA."""
+    try:
+        new_item = execute_commit_query(
+            "INSERT INTO product_categories (name, company_id) VALUES (%s, %s) RETURNING id, name",
+            (name, company_id),
+            fetchone=True
+        )
+        return new_item
+    except Exception as e:
+        if "product_categories_company_id_name_key" in str(e): # Error de duplicado
+            raise ValueError(f"La categoría '{name}' ya existe para esta compañía.")
+        raise e
+
+def update_product_category(category_id: int, name: str, company_id: int):
+    """Actualiza una categoría de producto, verificando la compañía."""
+    try:
+        updated_item = execute_commit_query(
+            "UPDATE product_categories SET name = %s WHERE id = %s AND company_id = %s RETURNING id, name",
+            (name, category_id, company_id),
+            fetchone=True
+        )
+        if not updated_item:
+            raise ValueError("Categoría no encontrada o no pertenece a esta compañía.")
+        return updated_item
+    except Exception as e:
+        if "product_categories_company_id_name_key" in str(e):
+            raise ValueError(f"El nombre '{name}' ya existe (duplicado).")
+        raise e
+ 
+def delete_product_category(category_id: int, company_id: int):
+    """Elimina una categoría de producto, verificando la compañía."""
+    try:
+        execute_commit_query(
+            "DELETE FROM product_categories WHERE id = %s AND company_id = %s",
+            (category_id, company_id)
+        )
+        return True, "Categoría eliminada."
+    except Exception as e:
+        # (Si falla por FK, e.g. un producto la usa, aquí se captura)
+        if "foreign key constraint" in str(e):
+            return False, "Error: Esta categoría ya está siendo usada por productos."
+        return False, f"Error inesperado: {e}"
+
+def get_category_id_by_name(name):
+    """Busca el ID de una categoría de producto por su nombre exacto."""
+    if not name or not name.strip(): return None
+    result = execute_query("SELECT id FROM product_categories WHERE name =  %s", (name,), fetchone=True)
+    return result['id'] if result else None
+
+
+

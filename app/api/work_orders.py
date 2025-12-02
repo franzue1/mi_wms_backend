@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, U
 from typing import List, Annotated, Optional
 from app import database as db
 from app import schemas, security
-from app.security import TokenData
+from app.security import TokenData, verify_company_access
 import traceback
 import asyncio
 import io
@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 router = APIRouter()
 AuthDependency = Annotated[TokenData, Depends(security.get_current_user_data)]
 
-# --- ¡NUEVO! Helper para parsear filtros ---
+# --- Helper para parsear filtros ---
 def _parse_filters_from_request(request: Request) -> dict:
     """
     Lee los query params de la URL y los convierte en un dict de filtros
@@ -25,9 +25,9 @@ def _parse_filters_from_request(request: Request) -> dict:
     KNOWN_FILTER_KEYS = {
         'id', 'ot_number', 'service_type', 'job_type', 
         'customer_name', 'address', 'phase', 'warehouse_name', 
-        'location_src_path', 'service_act_number'
+        'location_src_path', 'service_act_number', 'project_name'
     }
-    
+
     # Ignorar claves que no son de filtrado
     RESERVED_KEYS = {'company_id', 'skip', 'limit', 'sort_by', 'ascending', 'token'}
 
@@ -49,6 +49,7 @@ async def get_all_work_orders(
     sort_by: str = 'id',
     ascending: bool = False
 ):
+    verify_company_access(auth, company_id) # <--- BLINDAJE DE SEGURIDAD
     """ 
     Obtiene la lista paginada de Órdenes de Trabajo (Liquidaciones).
     ¡AHORA ACEPTA FILTROS DINÁMICOS!
@@ -79,6 +80,7 @@ async def get_work_orders_count(
     company_id: int,
     request: Request # <-- ¡CAMBIO! Aceptamos el Request
 ):
+    verify_company_access(auth, company_id) # <--- BLINDAJE
     """ 
     Obtiene el CONTEO TOTAL de Órdenes de Trabajo (Liquidaciones).
     ¡AHORA ACEPTA FILTROS DINÁMICOS!
@@ -102,6 +104,7 @@ async def get_work_order_details_combo(
     auth: AuthDependency, 
     company_id: int = Query(...) # <-- ¡Este es el cambio!
 ):
+    verify_company_access(auth, company_id) # <--- BLINDAJE
     """ 
     [COMBO] Obtiene TODOS los datos necesarios para la
     vista de detalle de Liquidación en una sola llamada.
@@ -129,7 +132,9 @@ async def create_work_order(
     auth: AuthDependency,
     company_id: int = Query(...)
 ):
-    """ Crea una nueva Orden de Trabajo. """
+    """ Crea una nueva Orden de Trabajo vinculada a un Proyecto. """
+    verify_company_access(auth, company_id) # <--- BLINDAJE
+
     if "liquidaciones.can_create" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
     
@@ -140,7 +145,8 @@ async def create_work_order(
             customer=work_order.customer_name,
             address=work_order.address,
             service=work_order.service_type,
-            job_type=work_order.job_type
+            job_type=work_order.job_type,
+            project_id=work_order.project_id
         )
         
         wo_raw = db.get_work_orders_filtered_sorted(
@@ -165,10 +171,9 @@ async def save_liquidation_progress(
     wo_id: int,
     data: schemas.WorkOrderSaveRequest,
     auth: AuthDependency,
-    # --- ¡CORRECCIÓN AQUÍ! ---
-    # Ya no es un default, ahora es un Query parameter obligatorio
     company_id: int = Query(...) 
 ):
+    verify_company_access(auth, company_id) # <--- BLINDAJE
     """
     Guarda el progreso de una liquidación (actualiza la OT y los pickings 'draft').
     """
@@ -177,7 +182,6 @@ async def save_liquidation_progress(
     
     try:
         user_name = auth.username
-        
         consumo_data_dict = data.consumo_data.dict()
         retiro_data_dict = data.retiro_data.dict() if data.retiro_data else None
         
@@ -203,8 +207,9 @@ async def liquidate_work_order(
     wo_id: int,
     data: schemas.WorkOrderSaveRequest, # Reusa el mismo schema de guardado
     auth: AuthDependency,
-    company_id: int = Query(...) # <-- ¡CORRECCIÓN 1!
+    company_id: int = Query(...)
 ):
+    verify_company_access(auth, company_id) # <--- BLINDAJE
     """
     Valida y Liquida una OT. 
     Primero guarda el progreso (como /save) y luego valida los pickings.
@@ -214,7 +219,6 @@ async def liquidate_work_order(
     
     try:
         user_name = auth.username
-        
         consumo_data_dict = data.consumo_data.dict()
         retiro_data_dict = data.retiro_data.dict() if data.retiro_data else None
         
@@ -248,6 +252,7 @@ async def export_work_orders_csv(
     # name: Optional[str] = Query(None), 
     # phase: Optional[str] = Query(None),
 ):
+    verify_company_access(auth, company_id)
     """
     [NUEVO] Genera y transmite un archivo CSV de las Órdenes de Trabajo.
     """
@@ -292,95 +297,93 @@ async def export_work_orders_csv(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al generar CSV: {e}")
 
-
 @router.post("/import/csv", response_model=dict)
 async def import_work_orders_csv(
     auth: AuthDependency,
     company_id: int = Query(...),
     file: UploadFile = File(...)
 ):
+    verify_company_access(auth, company_id)
     """
-    [NUEVO] Importa Órdenes de Trabajo (solo cabeceras) desde un archivo CSV.
-    Usa una transacción para garantizar la integridad (Todo o Nada).
+    [ACTUALIZADO] Importa OTs leyendo la columna de PROYECTO.
+    Soporta: 'project', 'proyecto', 'project_name', 'obra'.
     """
     if "liquidaciones.can_import_export" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
-    # (Esta lógica es la que movimos desde tu 'process_import_result' en el frontend)
     try:
         content = await file.read()
-        content_decoded = content.decode('utf-8-sig')
+        # Intentamos decodificar con utf-8-sig para quitar el BOM de Excel
+        content_decoded = content.decode('utf-8-sig') 
         file_io = io.StringIO(content_decoded)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error al leer el archivo: {e}")
 
-    reader = csv.DictReader(file_io, delimiter=';')
+    # Detectar delimitador automáticamente (Excel usa ; en regiones latinas, , en US)
+    dialect = csv.Sniffer().sniff(content_decoded[:1024], delimiters=";,")
+    file_io.seek(0)
+    reader = csv.DictReader(file_io, dialect=dialect)
+
     try:
         rows_to_process = list(reader)
         if not rows_to_process: raise ValueError("El archivo CSV está vacío.")
         
+        # Validar cabeceras mínimas
         headers = {h.lower().strip() for h in reader.fieldnames or []}
-        required_headers = {"ot_number", "customer_name"} # Mínimos requeridos
+        required_headers = {"ot_number", "customer_name"} 
         if not required_headers.issubset(headers):
             missing = required_headers - headers
             raise ValueError(f"Faltan columnas obligatorias: {', '.join(sorted(list(missing)))}")
 
-        # Validar valores únicos
-        valid_services = {"Internet residencial", "Condominio"}
-        valid_job_types = {"Instalación", "Mantenimiento", "Avería", "Garantía"}
-        
-        invalid_services, invalid_job_types = set(), set()
-        for row in rows_to_process:
-            clean_row = {k.lower().strip(): v.strip() for k, v in row.items()}
-            service = clean_row.get('service_type')
-            job = clean_row.get('job_type')
-            if service and service not in valid_services: invalid_services.add(service)
-            if job and job not in valid_job_types: invalid_job_types.add(job)
-        
-        error_messages = []
-        if invalid_services: error_messages.append(f"Servicios no válidos: {', '.join(invalid_services)}")
-        if invalid_job_types: error_messages.append(f"Tipos de Servicio no válidos: {', '.join(invalid_job_types)}")
-        if error_messages: raise ValueError(". ".join(error_messages))
-
-        # --- FASE 2: EJECUCIÓN (TRANSACCIONAL) ---
-        # (Asumiremos que 'upsert_work_order_from_import' existe, la crearemos en el Paso 2)
-        
         created_count, updated_count, error_list = 0, 0, []
         
         for i, row in enumerate(rows_to_process):
             row_num = i + 2
-            clean_row = {k.lower().strip(): v.strip() for k, v in row.items()}
+            # Limpieza de claves y valores
+            clean_row = {k.lower().strip(): v.strip() for k, v in row.items() if k}
+            
             ot = clean_row.get('ot_number')
             cust = clean_row.get('customer_name')
             
             if not ot or not cust:
-                error_list.append(f"Fila {row_num}: 'ot_number' y 'customer_name' son obligatorios.")
+                error_list.append(f"Fila {row_num}: Faltan datos (OT o Cliente).")
                 continue
-                
+            
+            # --- CAPTURA INTELIGENTE DEL PROYECTO ---
+            # Buscamos variaciones comunes del nombre de la columna
+            project_name = (
+                clean_row.get('project_name') or 
+                clean_row.get('project') or 
+                clean_row.get('proyecto') or 
+                clean_row.get('obra')
+            )
+            # ----------------------------------------
+
             try:
                 payload = {
                     "ot_number": ot,
                     "customer_name": cust,
                     "address": clean_row.get('address', ''),
                     "service_type": clean_row.get('service_type'),
-                    "job_type": clean_row.get('job_type')
+                    "job_type": clean_row.get('job_type'),
+                    "project_name": project_name # <-- Pasamos el nombre al repo
                 }
                 
-                # ¡Llamada a la nueva función de BD!
+                # Llamada al repositorio inteligente
                 result = db.upsert_work_order_from_import(company_id, payload)
                 
                 if result == "created": created_count += 1
                 elif result == "updated": updated_count += 1
                     
             except Exception as e:
-                # Captura errores de la BD (ej. OT duplicado si no manejamos 'updated')
-                error_list.append(f"Fila {row_num} (OT: {ot}): {e}")
+                error_list.append(f"Fila {row_num} (OT: {ot}): {str(e)}")
 
         if error_list:
-            raise HTTPException(
-                status_code=400, 
-                detail="Importación fallida. Corrija los errores y reintente:\n- " + "\n- ".join(error_list)
-            )
+            # Si hay pocos errores, los mostramos. Si son muchos, mostramos resumen.
+            detail_msg = "Errores en la importación:\n- " + "\n- ".join(error_list[:10])
+            if len(error_list) > 10: detail_msg += f"\n... y {len(error_list)-10} errores más."
+            
+            raise HTTPException(status_code=400, detail=detail_msg)
 
         return {"created": created_count, "updated": updated_count, "errors": 0}
 
@@ -389,3 +392,4 @@ async def import_work_orders_csv(
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error crítico al procesar CSV: {e}")
+

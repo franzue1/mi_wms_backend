@@ -67,7 +67,6 @@ def init_db_pool():
         traceback.print_exc()
         raise
 
-
 def execute_query(query, params=(), fetchone=False, fetchall=False):
     """
     Función centralizada para ejecutar consultas de LECTURA (SELECT).
@@ -2117,7 +2116,6 @@ def create_warehouse(company_id, name, code, category_id, social_reason=None, ru
                 for_existing=True, 
                 warehouse_id=new_wh_id
             )
-
             conn.commit()
             return new_wh_id
 
@@ -2130,7 +2128,6 @@ def create_warehouse(company_id, name, code, category_id, social_reason=None, ru
         raise e
     finally:
         if conn: db_pool.putconn(conn)
-
 
 def _create_warehouse_with_cursor(cursor, name, code, category_id, company_id, social_reason, ruc, email, phone, address, status):
     """Función interna que AHORA incluye el estado. (Versión PostgreSQL)"""

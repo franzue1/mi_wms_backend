@@ -1,0 +1,1269 @@
+#app/database/repositories/report_repo.py
+
+from datetime import datetime, date, timedelta
+from collections import defaultdict
+from ..core import get_db_connection, return_db_connection, execute_query
+
+# --- DASHBOARD & KPIs ---
+
+def get_dashboard_kpis(company_id):
+    query = """
+        SELECT
+            pt.code,
+            COUNT(p.id) as pending_count
+        FROM pickings p
+        JOIN picking_types pt ON p.picking_type_id = pt.id
+        WHERE p.company_id =  %s AND p.state IN ('draft', 'listo')
+        GROUP BY pt.code
+    """
+    results = execute_query(query, (company_id,), fetchall=True)
+    
+    kpis = {'IN': 0, 'OUT': 0, 'INT': 0}
+    for row in results:
+        if row['code'] in kpis:
+            kpis[row['code']] = row['pending_count']
+    return kpis
+
+def get_operations_throughput(company_id):
+    """
+    Devuelve el número de operaciones completadas por día durante los últimos 7 días.
+    VERSIÓN POSTGRESQL: Usa CURRENT_DATE e INTERVAL.
+    """
+    # 1. Python calcula las fechas de inicio y fin
+    today = date.today()
+    start_date = today - timedelta(days=6)
+    days_data = {(start_date + timedelta(days=i)): 0 for i in range(7)}
+
+    # 2. La consulta SQL ahora es más simple y solo pide un rango
+    query = """
+        SELECT
+            date_done::date as day,
+            COUNT(id) as count
+        FROM pickings
+        WHERE
+            state = 'done' AND
+            company_id = %s AND
+            date_done >= (CURRENT_DATE - INTERVAL '6 days')
+        GROUP BY day
+    """
+    results = execute_query(query, (company_id,), fetchall=True)
+
+    for row in results:
+        day = row['day'] # psycopg2 ya lo devuelve como objeto date
+        if day in days_data:
+            days_data[day] = row['count']
+            
+    return sorted(days_data.items())
+
+def get_inventory_value_kpis(company_id):
+    """
+    [VERSIÓN FINAL VALIDADA] Calcula el valor del inventario.
+    Usa lógica de agrupación flexible en Python para garantizar que no se pierdan
+    categorías por temas de sintaxis SQL.
+    """
+    # Consulta amplia: Trae todo lo que tenga stock > 0
+    query = """
+        SELECT 
+            UPPER(wc.name) as category_name, 
+            SUM(sq.quantity * p.standard_price) as val
+        FROM stock_quants sq
+        JOIN products p ON sq.product_id = p.id
+        JOIN locations l ON sq.location_id = l.id
+        JOIN warehouses w ON l.warehouse_id = w.id
+        JOIN warehouse_categories wc ON w.category_id = wc.id
+        WHERE l.type = 'internal' 
+          AND p.company_id = %s 
+          AND sq.quantity > 0
+        GROUP BY wc.name
+    """
+    results = execute_query(query, (company_id,), fetchall=True)
+
+    kpis = {"total": 0.0, "pri": 0.0, "tec": 0.0}
+    
+    if results:
+        for row in results:
+            cat = row['category_name']
+            val = float(row['val'] or 0.0)
+            
+            # 1. Detectar Almacenes Principales
+            # Buscamos palabras clave típicas
+            if 'PRINCIPAL' in cat or 'CENTRAL' in cat or 'ALMACEN' in cat: 
+                # Evitamos falsos positivos (ej. "Almacén Contratista")
+                if 'CONTRAT' not in cat and 'TERCERO' not in cat:
+                    kpis['pri'] += val
+            
+            # 2. Detectar Contratistas
+            if 'CONTRAT' in cat or 'TERCERO' in cat:
+                kpis['tec'] += val
+    
+    # Totalizar
+    kpis['total'] = kpis['pri'] + kpis['tec']
+    return kpis
+
+# --- REPORTES DE INVENTARIO (Aging, Cobertura) ---
+
+def get_inventory_aging(company_id, tracked_only=True):
+    """
+    Calcula el antiguamiento del inventario RASTREANDO CADA LOTE individualmente.
+    (Versión PostgreSQL)
+    """
+    buckets = {'0-30 días': 0, '31-60 días': 0, '61-90 días': 0, '+90 días': 0, 'Sin Fecha': 0}
+    tracking_filter_sql = "AND p.tracking != 'none'" if tracked_only else ""
+    # (La consulta CTE es similar, pero la lógica CASE usa resta de fechas)
+    query = f"""
+        WITH LotCreationDate AS (
+            SELECT
+                sml.lot_id,
+                MIN(COALESCE(p.date_transfer, p.date_done::date)) as effective_date
+            FROM pickings p
+            JOIN stock_moves sm ON p.id = sm.picking_id
+            JOIN stock_move_lines sml ON sm.id = sml.move_id
+            JOIN picking_types pt ON p.picking_type_id = pt.id
+            WHERE p.state = 'done' AND pt.code = 'IN' AND p.company_id = %s
+            GROUP BY sml.lot_id
+        )
+        SELECT
+            CASE
+                WHEN lcd.effective_date IS NULL THEN 'Sin Fecha'
+                WHEN (CURRENT_DATE - lcd.effective_date) <= 30 THEN '0-30 días'
+                WHEN (CURRENT_DATE - lcd.effective_date) <= 60 THEN '31-60 días'
+                WHEN (CURRENT_DATE - lcd.effective_date) <= 90 THEN '61-90 días'
+                ELSE '+90 días'
+            END as age_bucket,
+            SUM(sq.quantity) as total_quantity
+        FROM stock_quants sq
+        JOIN products p ON sq.product_id = p.id
+        JOIN locations l ON sq.location_id = l.id
+        LEFT JOIN LotCreationDate lcd ON sq.lot_id = lcd.lot_id
+        WHERE l.type = 'internal' AND l.company_id = %s {tracking_filter_sql} AND sq.lot_id IS NOT NULL
+        GROUP BY age_bucket
+    """
+    params = (company_id, company_id)
+    results = execute_query(query, params, fetchall=True)
+
+    for row in results:
+        if row['age_bucket'] and row['age_bucket'] in buckets:
+            buckets[row['age_bucket']] = row['total_quantity']
+    final_buckets = {k: v for k, v in buckets.items() if v > 0}
+    return final_buckets
+
+def get_inventory_aging_details(company_id, filters={}):
+    # (La consulta CTE es similar, la resta de fechas es la clave)
+    base_query = """
+        WITH LotCreationInfo AS (
+            SELECT
+                sml.lot_id,
+                MIN(COALESCE(p.date_transfer, p.date_done::date)) as effective_date,
+                AVG(sm.price_unit) as unit_cost
+            FROM pickings p
+            JOIN stock_moves sm ON p.id = sm.picking_id
+            JOIN stock_move_lines sml ON sm.id = sml.move_id
+            JOIN picking_types pt ON p.picking_type_id = pt.id
+            WHERE p.state = 'done' AND pt.code = 'IN' AND p.company_id = %s
+            GROUP BY sml.lot_id
+        )
+        SELECT
+            p.sku, p.name as product_name, sl.name as lot_name,
+            w.id as warehouse_id, w.name as warehouse_name,
+            lci.effective_date as entry_date,
+            (CURRENT_DATE - lci.effective_date) as aging_days,
+            sq.quantity,
+            COALESCE(lci.unit_cost, p.standard_price, 0) as unit_cost,
+            (sq.quantity * COALESCE(lci.unit_cost, p.standard_price, 0)) as total_value
+        FROM stock_quants sq
+        JOIN products p ON sq.product_id = p.id
+        JOIN stock_lots sl ON sq.lot_id = sl.id
+        JOIN locations l ON sq.location_id = l.id
+        JOIN warehouses w ON l.warehouse_id = w.id
+        LEFT JOIN LotCreationInfo lci ON sq.lot_id = lci.lot_id
+        WHERE l.type = 'internal' AND l.company_id = %s AND sq.lot_id IS NOT NULL
+    """
+    # (La lógica de filtros dinámicos se mantiene, pero usa %s)
+    where_clauses = []
+    params = [company_id, company_id] 
+
+    if filters.get("product"):
+        product_query = f"%{filters['product']}%"
+        where_clauses.append("(p.sku ILIKE %s OR p.name ILIKE %s)") # Usamos ILIKE para case-insensitive
+        params.extend([product_query, product_query])
+        
+    if filters.get("warehouse_id"):
+        where_clauses.append("w.id = %s")
+        params.append(filters["warehouse_id"])
+
+    if filters.get("bucket"):
+        bucket = filters["bucket"]
+        # (La lógica de buckets usa 'aging_days' que ya está calculado)
+        if bucket == '0-30': where_clauses.append("aging_days BETWEEN 0 AND 30")
+        elif bucket == '31-60': where_clauses.append("aging_days BETWEEN 31 AND 60")
+        elif bucket == '61-90': where_clauses.append("aging_days BETWEEN 61 AND 90")
+        elif bucket == '+90': where_clauses.append("aging_days > 90")
+    
+    if where_clauses:
+        base_query += " AND " + " AND ".join(where_clauses)
+
+    base_query += " ORDER BY aging_days DESC"
+    return execute_query(base_query, tuple(params), fetchall=True)
+
+def get_stock_coverage_report(company_id, history_days=90, product_filter=None):
+    safe_history_days = max(1, history_days)
+    params = [company_id, company_id, company_id]
+    
+    product_clause = ""
+    if product_filter:
+        product_clause = "AND (p.sku ILIKE %s OR p.name ILIKE %s)"
+        params.extend([f"%{product_filter}%", f"%{product_filter}%"])
+
+    # (La lógica es similar, pero reemplaza date() por ::date y usa INTERVAL)
+    query = f"""
+        WITH
+        CurrentStock AS (
+            SELECT sq.product_id, SUM(sq.quantity) as on_hand_qty
+            FROM stock_quants sq
+            JOIN locations l ON sq.location_id = l.id
+            WHERE l.type = 'internal' AND sq.lot_id IS NULL AND l.company_id = %s
+            GROUP BY sq.product_id
+        ),
+        ConsumptionData AS (
+            SELECT sm.product_id, SUM(sm.quantity_done) as total_consumed
+            FROM stock_moves sm
+            JOIN pickings p ON sm.picking_id = p.id
+            JOIN picking_types pt ON p.picking_type_id = pt.id
+            WHERE p.state = 'done'
+              AND pt.code = 'OUT'
+              AND p.company_id = %s
+              AND p.date_done::date >= (CURRENT_DATE - INTERVAL '{safe_history_days} days')
+            GROUP BY sm.product_id
+        )
+        SELECT
+            p.sku, p.name as product_name,
+            COALESCE(cs.on_hand_qty, 0) AS current_stock,
+            COALESCE(cd.total_consumed, 0) AS total_consumption,
+            (COALESCE(cd.total_consumed, 0) * 1.0 / {safe_history_days}) AS avg_daily_consumption,
+            CASE
+                WHEN (COALESCE(cd.total_consumed, 0) * 1.0 / {safe_history_days}) > 0
+                THEN COALESCE(cs.on_hand_qty, 0) / (COALESCE(cd.total_consumed, 0) * 1.0 / {safe_history_days})
+                ELSE 999
+            END AS coverage_days
+        FROM products p
+        LEFT JOIN CurrentStock cs ON p.id = cs.product_id
+        LEFT JOIN ConsumptionData cd ON p.id = cd.product_id
+        WHERE p.company_id = %s AND p.tracking = 'none' AND COALESCE(cs.on_hand_qty, 0) > 0
+        {product_clause}
+        ORDER BY coverage_days ASC, p.name ASC;
+    """
+    return execute_query(query, tuple(params), fetchall=True)
+
+# --- KARDEX ---
+
+def get_product_kardex(company_id, product_id, date_from=None, date_to=None, warehouse_id=None):
+    """
+    Obtiene el historial de movimientos crudos para un producto, generando
+    filas separadas para entradas y salidas, incluso en transferencias internas.
+    (Versión Corregida v5 - Lógica de JOIN 'l' y CASE)
+    """
+    
+    # --- 1. Parámetros y cláusulas para el WHERE ---
+    where_clauses = ["p.state = 'done'", "sm.product_id =  %s", "p.company_id =  %s"]
+    params = [product_id, company_id] # 2 params
+
+    if date_from:
+        where_clauses.append("date(p.date_done) >=  %s")
+        params.append(date_from) # 3 params
+    if date_to:
+        where_clauses.append("date(p.date_done) <=  %s")
+        params.append(date_to) # 4 params
+    
+    # --- 2. Filtro de Almacén (se aplica al JOIN 'l') ---
+    if warehouse_id and warehouse_id != "all":
+        where_clauses.append("l.warehouse_id =  %s")
+        params.append(warehouse_id) # 5 params
+    else:
+        # Si queremos "Todos", solo nos importan las ubicaciones internas
+        where_clauses.append("l.type = 'internal'")
+        
+    query = f"""
+        SELECT
+            p.id, p.date_done as date, p.name as operation_ref, p.custom_operation_type,
+            p.purchase_order, p.adjustment_reason, pt.code as type_code,
+            prod.sku as product_sku, prod.name as product_name, pc.name as category_name,
+
+            CASE
+                WHEN p.custom_operation_type = 'Liquidación por OT' THEN p.attention_date
+                ELSE p.date_transfer
+            END as date_transfer,
+            CASE
+                WHEN p.custom_operation_type = 'Liquidación por OT' THEN p.service_act_number
+                ELSE p.partner_ref
+            END as partner_ref,
+            CASE 
+                WHEN p.custom_operation_type = 'Liquidación por OT' THEN wo.ot_number
+                ELSE partner.name 
+            END as partner_name,
+            
+            w.name as affected_warehouse, -- <-- El almacén que estamos "viendo"
+            
+            CASE 
+                WHEN sm.location_dest_id = l.id THEN sm.quantity_done
+                ELSE 0 
+            END as quantity_in,
+            
+            CASE 
+                WHEN sm.location_src_id = l.id THEN sm.quantity_done
+                ELSE 0 
+            END as quantity_out,
+            
+            CASE 
+                WHEN sm.location_dest_id = l.id THEN sm.quantity_done * sm.price_unit
+                ELSE 0 
+            END as initial_value_in,
+            
+            sm.price_unit,
+            sm.cost_at_adjustment,
+            
+            w_src.name as almacen_origen,
+            l_src.name as ubicacion_origen,
+            w_dest.name as almacen_destino,
+            l_dest.name as ubicacion_destino,
+            l_src.path as location_src_path,
+            l_dest.path as location_dest_path
+            
+        FROM stock_moves sm
+        JOIN pickings p ON sm.picking_id = p.id
+        JOIN picking_types pt ON p.picking_type_id = pt.id
+        
+        -- ¡EL JOIN CLAVE RESTAURADO!
+        JOIN locations l ON (sm.location_src_id = l.id OR sm.location_dest_id = l.id)
+        
+        JOIN warehouses w ON l.warehouse_id = w.id
+        JOIN products prod ON sm.product_id = prod.id -- JOIN para product_id
+        LEFT JOIN product_categories pc ON prod.category_id = pc.id
+        LEFT JOIN partners partner ON p.partner_id = partner.id
+        LEFT JOIN locations l_src ON sm.location_src_id = l_src.id
+        LEFT JOIN locations l_dest ON sm.location_dest_id = l_dest.id
+        LEFT JOIN warehouses w_src ON l_src.warehouse_id = w_src.id
+        LEFT JOIN warehouses w_dest ON l_dest.warehouse_id = w_dest.id
+        LEFT JOIN work_orders wo ON p.work_order_id = wo.id
+        
+        WHERE {" AND ".join(where_clauses)}
+        AND (
+            (CASE WHEN sm.location_dest_id = l.id THEN sm.quantity_done ELSE 0 END) > 0
+            OR 
+            (CASE WHEN sm.location_src_id = l.id THEN sm.quantity_done ELSE 0 END) > 0
+        )
+        -- --------------------------------------------------------------------
+        
+        ORDER BY p.date_done, p.id
+    """
+
+    return execute_query(query, tuple(params), fetchall=True)
+
+def get_kardex_summary(company_id, date_from, date_to, product_filter=None, warehouse_id=None):
+    # (La lógica es similar, pero reemplaza date() por ::date)
+    params = []
+    warehouse_clause_cte = ""
+    warehouse_clause_sub = ""
+    wh_id = warehouse_id if warehouse_id and warehouse_id != "all" else "all"
+
+    params.append(company_id)
+    if wh_id != "all":
+        warehouse_clause_cte = " AND w.id = %s"
+        params.append(wh_id)
+
+    params.append(date_from)
+    if wh_id != "all":
+        warehouse_clause_sub = " AND warehouse_id = %s"
+        params.append(wh_id)
+
+    params.append(date_from)
+    params.append(date_to)
+    if wh_id != "all":
+        params.append(wh_id)
+        
+    params.append(company_id)
+    
+    product_clause = ""
+    if product_filter:
+        product_clause = " AND (p.sku ILIKE %s OR p.name ILIKE %s)" # Usamos ILIKE
+        params.extend([f"%{product_filter}%", f"%{product_filter}%"])
+     
+    query = f"""
+        WITH InternalStockMoves AS (
+            SELECT
+                sm.product_id, p.date_done, l.warehouse_id,
+                CASE WHEN sm.location_dest_id = l.id THEN sm.quantity_done ELSE 0 END as quantity_in,
+                CASE WHEN sm.location_src_id = l.id THEN sm.quantity_done ELSE 0 END as quantity_out,
+                CASE WHEN sm.location_dest_id = l.id THEN sm.quantity_done * sm.price_unit ELSE 0 END as value_in,
+                CASE WHEN sm.location_src_id = l.id THEN sm.quantity_done * sm.price_unit ELSE 0 END as value_out
+            FROM stock_moves sm
+            JOIN pickings p ON sm.picking_id = p.id
+            JOIN locations l ON (sm.location_src_id = l.id OR sm.location_dest_id = l.id)
+            JOIN warehouses w ON l.warehouse_id = w.id
+            WHERE p.state = 'done' AND l.type = 'internal' AND p.company_id = %s {warehouse_clause_cte}
+        ),
+        InitialBalance AS (
+            SELECT product_id,
+                   SUM(quantity_in) - SUM(quantity_out) as balance,
+                   SUM(value_in) - SUM(value_out) as value_balance
+            FROM InternalStockMoves WHERE date_done::date < %s {warehouse_clause_sub} GROUP BY product_id
+        ),
+        PeriodMovements AS (
+            SELECT product_id,
+                   SUM(quantity_in) as total_in, SUM(quantity_out) as total_out,
+                   SUM(value_in) as total_value_in, SUM(value_out) as total_value_out
+            FROM InternalStockMoves WHERE date_done::date BETWEEN %s AND %s {warehouse_clause_sub} GROUP BY product_id
+        )
+        SELECT
+            p.id as product_id, p.sku, p.name as product_name,
+            pc.name as category_name,
+            COALESCE(ib.balance, 0) as initial_balance,
+            COALESCE(pm.total_in, 0) as total_in,
+            COALESCE(pm.total_out, 0) as total_out,
+            (COALESCE(ib.balance, 0) + COALESCE(pm.total_in, 0) - COALESCE(pm.total_out, 0)) as final_balance,
+            COALESCE(ib.value_balance, 0) as initial_value,
+            COALESCE(pm.total_value_in, 0) as total_value_in,
+            COALESCE(pm.total_value_out, 0) as total_value_out,
+            (COALESCE(ib.value_balance, 0) + COALESCE(pm.total_value_in, 0) - COALESCE(pm.total_value_out, 0)) as final_value
+        FROM products p
+        LEFT JOIN PeriodMovements pm ON p.id = pm.product_id
+        LEFT JOIN InitialBalance ib ON p.id = ib.product_id
+        LEFT JOIN product_categories pc ON p.category_id = pc.id
+        WHERE p.company_id = %s AND (pm.product_id IS NOT NULL OR ib.product_id IS NOT NULL)
+        {product_clause}
+        ORDER BY p.name
+    """
+    return execute_query(query, tuple(params), fetchall=True)
+
+# --- STOCK SUMMARY (Reporte simple) ---
+
+def get_stock_summary_by_product(warehouse_id=None):
+    """
+    Devuelve el stock total por producto, agrupando todas las series/lotes.
+    """
+    base_query = """
+    SELECT
+        p.sku, p.name as product_name, pc.name as category_name,
+        w.name as warehouse_name,
+        SUM(sq.quantity) as quantity,
+        u.name as uom_name,
+        -- Añadir IDs/columnas para agrupar
+        w.id, p.id, pc.id, u.id
+    FROM stock_quants sq
+    JOIN products p ON sq.product_id = p.id
+    JOIN locations l ON sq.location_id = l.id
+    JOIN warehouses w ON l.warehouse_id = w.id
+    LEFT JOIN product_categories pc ON p.category_id = pc.id
+    LEFT JOIN uom u ON p.uom_id = u.id
+    WHERE sq.quantity > 0
+    """
+    params = []
+    if warehouse_id:
+        base_query += " AND w.id = %s"
+        params.append(warehouse_id)
+
+    base_query += " GROUP BY w.id, w.name, p.id, p.sku, p.name, pc.id, pc.name, u.id, u.name"    
+    base_query += " ORDER BY w.name, p.name"
+    return execute_query(base_query, tuple(params), fetchall=True)
+
+def get_full_product_kardex_data(company_id, date_from, date_to, warehouse_id=None, product_filter=None):
+    """
+    Obtiene TODOS los movimientos de stock detallados ('done') para el EXPORT CSV,
+    generando filas separadas para entradas y salidas, incluso en transferencias internas.
+    (Versión Corregida v5 - Lógica de JOIN 'l' y CASE)
+    """
+    
+    # --- 1. Parámetros y cláusulas para el WHERE ---
+    where_clauses = ["p.state = 'done'", "p.company_id =  %s"]
+    params = [company_id]
+
+    if date_from:
+        where_clauses.append("date(p.date_done) >=  %s")
+        params.append(date_from)
+    if date_to:
+        where_clauses.append("date(p.date_done) <=  %s")
+        params.append(date_to)
+    
+    # Filtro de Almacén
+    if warehouse_id and warehouse_id != "all":
+        where_clauses.append("l.warehouse_id =  %s")
+        params.append(warehouse_id)
+    else:
+        where_clauses.append("l.type = 'internal'")
+        
+    # Filtro de Producto
+    if product_filter:
+        where_clauses.append("(prod.sku LIKE  %s OR prod.name LIKE  %s)")
+        params.extend([f"%{product_filter}%", f"%{product_filter}%"])
+        
+    query = f"""
+        SELECT
+            sm.id as move_id,
+            sm.product_id,
+            prod.sku as product_sku,
+            prod.name as product_name,
+            pc.name as category_name,
+            p.id as picking_id,
+            p.date_done as date,
+            p.name as operation_ref,
+            p.custom_operation_type,
+            p.purchase_order,
+            pt.code as type_code,
+            p.adjustment_reason,
+
+            CASE
+                WHEN p.custom_operation_type = 'Liquidación por OT' THEN p.attention_date
+                ELSE p.date_transfer
+            END as date_transfer,
+            CASE
+                WHEN p.custom_operation_type = 'Liquidación por OT' THEN p.service_act_number
+                ELSE p.partner_ref
+            END as partner_ref,
+            CASE
+                WHEN p.custom_operation_type = 'Liquidación por OT' THEN wo.ot_number
+                ELSE par.name
+            END as partner_name,
+
+            CASE pt.code
+                WHEN 'IN' THEN par.name
+                ELSE COALESCE(w_src.name, l_src.path)
+            END as source_name,
+            CASE pt.code
+                WHEN 'OUT' THEN par.name
+                ELSE COALESCE(w_dest.name, l_dest.path)
+            END as destination_name,
+
+            w.name as affected_warehouse,
+
+            -- Lógica de Entrada/Salida basada en el JOIN 'l'
+            CASE WHEN sm.location_dest_id = l.id THEN sm.quantity_done ELSE 0 END as quantity_in,
+            CASE WHEN sm.location_src_id = l.id THEN sm.quantity_done ELSE 0 END as quantity_out,
+            CASE WHEN sm.location_dest_id = l.id THEN sm.quantity_done * sm.price_unit ELSE 0 END as initial_value_in,
+            
+            sm.price_unit,
+            sm.cost_at_adjustment,
+            
+            w_src.name as almacen_origen,
+            l_src.name as ubicacion_origen,
+            w_dest.name as almacen_destino,
+            l_dest.name as ubicacion_destino,
+            l_src.path as location_src_path,
+            l_dest.path as location_dest_path
+
+        FROM stock_moves sm
+        JOIN pickings p ON sm.picking_id = p.id
+        JOIN picking_types pt ON p.picking_type_id = pt.id
+        
+        -- ¡EL JOIN CLAVE RESTAURADO!
+        JOIN locations l ON (sm.location_src_id = l.id OR sm.location_dest_id = l.id)
+        
+        JOIN warehouses w ON l.warehouse_id = w.id
+        JOIN products prod ON sm.product_id = prod.id
+        LEFT JOIN product_categories pc ON prod.category_id = pc.id
+        LEFT JOIN partners par ON p.partner_id = par.id
+        LEFT JOIN locations l_src ON sm.location_src_id = l_src.id
+        LEFT JOIN locations l_dest ON sm.location_dest_id = l_dest.id
+        LEFT JOIN warehouses w_src ON l_src.warehouse_id = w_src.id
+        LEFT JOIN warehouses w_dest ON l_dest.warehouse_id = w_dest.id
+        LEFT JOIN work_orders wo ON p.work_order_id = wo.id
+
+        WHERE {" AND ".join(where_clauses)}
+        
+        AND sm.quantity_done > 0 -- ¡CORREGIDO!
+
+        ORDER BY prod.sku ASC, p.date_done ASC, p.id ASC
+    """
+
+    print(f"[DB DEBUG] get_full_product_kardex_data Query Params: {tuple(params)}")
+    return execute_query(query, tuple(params), fetchall=True)
+
+def get_data_for_export(company_id, export_type='headers'):
+    """
+    Obtiene los datos necesarios para exportar albaranes.
+    [CORREGIDO] Ahora incluye la columna 'project_name'.
+    """
+    # --- Consulta de Cabeceras (MODIFICADA) ---
+    base_query = """
+        SELECT
+            p.id as picking_id, 
+            p.name as picking_name, 
+            pt.code as picking_type_code, 
+            p.state,
+            p.custom_operation_type,
+            
+            -- [NUEVO] Nombre del Proyecto
+            COALESCE(proj.name, 'Stock General') as project_name, 
+
+            CASE
+                WHEN l_src.type = 'internal' THEN w_src.name
+                ELSE NULL
+            END as almacen_origen,
+            CASE
+                WHEN pt.code = 'IN' THEN COALESCE(par_prov.name, 'N/A')
+                ELSE COALESCE(l_src.name, 'N/A')
+            END as ubicacion_origen,
+            CASE
+                WHEN l_dest.type = 'internal' THEN w_dest.name
+                ELSE NULL
+            END as almacen_destino,
+             CASE
+                WHEN pt.code = 'OUT' THEN COALESCE(par_cli.name, 'N/A')
+                ELSE COALESCE(l_dest.name, 'N/A')
+            END as ubicacion_destino,
+            
+            -- --- ¡CORRECCIÓN! Usar TO_CHAR en lugar de strftime ---
+            p.partner_ref, p.purchase_order, TO_CHAR(p.date_transfer, 'DD/MM/YYYY') as date_transfer, p.responsible_user
+            -- --- FIN CORRECCIÓN ---
+        
+        FROM pickings p 
+        JOIN picking_types pt ON p.picking_type_id = pt.id
+        LEFT JOIN locations l_src ON p.location_src_id = l_src.id
+        LEFT JOIN locations l_dest ON p.location_dest_id = l_dest.id
+        LEFT JOIN warehouses w_src ON l_src.warehouse_id = w_src.id
+        LEFT JOIN warehouses w_dest ON l_dest.warehouse_id = w_dest.id
+        LEFT JOIN partners par_prov ON p.partner_id = par_prov.id AND pt.code = 'IN'
+        LEFT JOIN partners par_cli ON p.partner_id = par_cli.id AND pt.code = 'OUT'
+        
+        -- [NUEVO] Join con Proyectos
+        LEFT JOIN projects proj ON p.project_id = proj.id
+
+        WHERE p.company_id = %s AND pt.code != 'ADJ' ORDER BY p.id
+    """
+    
+    pickings_data_raw = execute_query(base_query, (company_id,), fetchall=True)
+    pickings_map = {row['picking_id']: dict(row) for row in pickings_data_raw}
+
+    if export_type == 'headers' or not pickings_map:
+        return list(pickings_map.values())
+
+    picking_ids = tuple(pickings_map.keys())
+    if not picking_ids: 
+        return [] 
+        
+    placeholders = ', '.join('%s' for _ in picking_ids)
+    moves_query = f"""
+        SELECT
+            sm.id as move_id, sm.picking_id, prod.sku as product_sku, prod.name as product_name,
+            sm.quantity_done, prod.tracking, sm.price_unit,
+            sml.id as move_line_id, sl.name as serial, sml.qty_done as serial_qty
+        FROM stock_moves sm JOIN products prod ON sm.product_id = prod.id
+        LEFT JOIN stock_move_lines sml ON sm.id = sml.move_id
+        LEFT JOIN stock_lots sl ON sml.lot_id = sl.id
+        WHERE sm.picking_id IN ({placeholders})
+        ORDER BY sm.picking_id, prod.sku, sl.name
+    """
+    moves_data_raw = execute_query(moves_query, picking_ids, fetchall=True)
+
+    full_export_data = []
+    moves_grouped = defaultdict(list)
+    if moves_data_raw:
+        for move_line_row in moves_data_raw:
+            moves_grouped[move_line_row['move_id']].append(dict(move_line_row))
+
+    # --- Lógica de combinación (Sin cambios, solo re-ensambla) ---
+    for move_id, lines in moves_grouped.items():
+        base_line = lines[0]; picking_id = base_line['picking_id']
+        if picking_id not in pickings_map: continue
+        product_tracking = base_line['tracking']
+        has_tracking_lines = any(line['move_line_id'] is not None for line in lines)
+        
+        if product_tracking != 'none' and has_tracking_lines:
+            processed_serials_for_move = set()
+            for line in lines:
+                if line['move_line_id'] is not None:
+                    serial_or_lot_name = line['serial']
+                    if serial_or_lot_name not in processed_serials_for_move:
+                        combined_row = pickings_map[picking_id].copy()
+                        combined_row.update({
+                            'product_sku': base_line['product_sku'], 'product_name': base_line['product_name'],
+                            'price_unit': base_line['price_unit'], 'serial': serial_or_lot_name,
+                            'quantity': 1.0 if product_tracking == 'serial' else (line['serial_qty'] or 0.0)
+                        })
+                        full_export_data.append(combined_row)
+                        processed_serials_for_move.add(serial_or_lot_name)
+        else:
+            combined_row = pickings_map[picking_id].copy()
+            combined_row.update({
+                'product_sku': base_line['product_sku'], 'product_name': base_line['product_name'],
+                'price_unit': base_line['price_unit'], 'serial': '',
+                'quantity': base_line['quantity_done']
+            })
+            full_export_data.append(combined_row)
+            
+    pickings_with_moves = {row['picking_id'] for row in full_export_data}
+    for pid, p_data in pickings_map.items():
+        if pid not in pickings_with_moves:
+             p_data_dict = dict(p_data)
+             p_data_dict.update({ 'product_sku': '', 'product_name': '', 'quantity': '', 'price_unit': '', 'serial': '' })
+             full_export_data.append(p_data_dict)
+             
+    full_export_data.sort(key=lambda x: (x.get('picking_name', ''), x.get('product_sku', ''), x.get('serial', '')))
+
+    return full_export_data
+
+# --- REPORTE DE PROYECTOS ---
+
+def get_project_kardex(company_id, project_id):
+    """
+    Obtiene el estado logístico detallado de un proyecto.
+    [MEJORA] Incluye Categoría y Contratista en el histórico de consumo.
+    """
+    # 1. Stock en Mano (En Custodia)
+    query_on_hand = """
+        SELECT 
+            p.sku, p.name, pc.name as category, -- <--- Nueva Columna
+            w.name as warehouse, 
+            l.path as location, 
+            SUM(sq.quantity) as qty,
+            (SUM(sq.quantity) * p.standard_price) as value,
+            u.name as uom
+        FROM stock_quants sq
+        JOIN products p ON sq.product_id = p.id
+        LEFT JOIN product_categories pc ON p.category_id = pc.id -- <--- Join Categoría
+        LEFT JOIN uom u ON p.uom_id = u.id
+        JOIN locations l ON sq.location_id = l.id
+        JOIN warehouses w ON l.warehouse_id = w.id
+        WHERE sq.project_id = %s AND sq.quantity > 0
+        GROUP BY p.id, pc.name, w.name, l.path, u.name
+        ORDER BY w.name, p.name
+    """
+    on_hand = execute_query(query_on_hand, (project_id,), fetchall=True)
+
+    # 2. Consumo Histórico (Liquidado / Instalado)
+    # Agrupamos por la Contratista que originó la salida (w_src.name)
+    query_consumed = """
+        SELECT 
+            p.sku, p.name, pc.name as category,
+            w_src.name as contractor, -- <--- El dato que faltaba
+            SUM(sm.quantity_done) as qty,
+            SUM(sm.quantity_done * sm.price_unit) as value,
+            u.name as uom
+        FROM stock_moves sm
+        JOIN products p ON sm.product_id = p.id
+        LEFT JOIN product_categories pc ON p.category_id = pc.id
+        LEFT JOIN uom u ON p.uom_id = u.id
+        
+        -- Joins para saber de DÓNDE salió (Contratista)
+        LEFT JOIN locations l_src ON sm.location_src_id = l_src.id
+        LEFT JOIN warehouses w_src ON l_src.warehouse_id = w_src.id
+        
+        JOIN locations l_dest ON sm.location_dest_id = l_dest.id
+        
+        WHERE sm.project_id = %s 
+          AND sm.state = 'done' 
+          AND l_dest.category IN ('CLIENTE', 'CONTRATA CLIENTE')
+          
+        GROUP BY p.id, pc.name, u.name, w_src.name
+        ORDER BY w_src.name, p.name
+    """
+    consumed = execute_query(query_consumed, (project_id,), fetchall=True)
+
+    return {
+        "on_hand": [dict(r) for r in on_hand],
+        "consumed": [dict(r) for r in consumed]
+    }
+
+def get_warehouses_kpi_summary(company_id):
+    """
+    Obtiene lista de almacenes con KPIs (Valorizado Total y Cantidad de SKUs distintos con stock).
+    """
+    query = """
+        SELECT 
+            w.id, w.name, wc.name as category,
+            COUNT(DISTINCT sq.product_id) as items_count,
+            COALESCE(SUM(sq.quantity * p.standard_price), 0) as total_value
+        FROM warehouses w
+        JOIN warehouse_categories wc ON w.category_id = wc.id
+        LEFT JOIN locations l ON w.id = l.warehouse_id AND l.type = 'internal'
+        LEFT JOIN stock_quants sq ON l.id = sq.location_id AND sq.quantity > 0
+        LEFT JOIN products p ON sq.product_id = p.id
+        WHERE w.company_id = %s AND w.status = 'activo'
+        GROUP BY w.id, w.name, wc.name
+        ORDER BY wc.name, w.name
+    """
+    results = execute_query(query, (company_id,), fetchall=True)
+    return results
+
+def get_stock_on_hand_filtered_sorted(company_id, warehouse_id=None, filters={}, sort_by='product_name', ascending=True):
+    """ 
+    Obtiene el stock detallado por lote/serie y PROYECTO.
+    [CORREGIDO] Ahora incluye la columna 'sq.notes' para que las notas persistan al recargar.
+    """
+    base_query = """
+    WITH ReservedStock AS (
+        SELECT 
+            sm.product_id, 
+            sm.location_src_id, 
+            sml.lot_id, 
+            sm.project_id,
+            SUM(
+                CASE 
+                    WHEN sml.id IS NOT NULL THEN sml.qty_done 
+                    ELSE sm.product_uom_qty 
+                END
+            ) as reserved_qty
+        FROM stock_moves sm
+        JOIN pickings p ON sm.picking_id = p.id
+        LEFT JOIN stock_move_lines sml ON sm.id = sml.move_id
+        WHERE p.state = 'listo' AND p.company_id = %s
+        GROUP BY sm.product_id, sm.location_src_id, sml.lot_id, sm.project_id
+    )
+    SELECT
+        p.id as product_id, 
+        w.id as warehouse_id, 
+        l.id as location_id, 
+        sl.id as lot_id,
+        sq.project_id,
+
+        p.sku, 
+        p.name as product_name, 
+        pc.name as category_name,
+        w.name as warehouse_name, 
+        l.name as location_name, 
+        
+        sl.name as lot_name,
+        proj.name as project_name,
+        
+        sq.quantity as physical_quantity, 
+        u.name as uom_name,
+
+        sq.notes, 
+        
+        COALESCE(rs.reserved_qty, 0) as reserved_quantity,
+        (sq.quantity - COALESCE(rs.reserved_qty, 0)) as available_quantity,
+        
+        COALESCE(sl.name, '---') as lot_name_ordered
+        
+    FROM stock_quants sq
+    JOIN products p ON sq.product_id = p.id
+    JOIN locations l ON sq.location_id = l.id
+    JOIN warehouses w ON l.warehouse_id = w.id
+    LEFT JOIN product_categories pc ON p.category_id = pc.id
+    LEFT JOIN stock_lots sl ON sq.lot_id = sl.id
+    LEFT JOIN uom u ON p.uom_id = u.id
+    LEFT JOIN projects proj ON sq.project_id = proj.id
+    
+    LEFT JOIN ReservedStock rs ON 
+        sq.product_id = rs.product_id 
+        AND sq.location_id = rs.location_src_id 
+        AND (
+            (sq.lot_id = rs.lot_id AND sq.lot_id IS NOT NULL)
+            OR
+            (sq.lot_id IS NULL AND rs.lot_id IS NULL AND 
+             (sq.project_id = rs.project_id OR (sq.project_id IS NULL AND rs.project_id IS NULL)))
+        )
+
+    WHERE l.type = 'internal' AND p.company_id = %s AND sq.quantity > 0.001
+    """
+    
+    params = [company_id, company_id]
+    where_clauses = []
+
+    filter_map = {
+        'warehouse_name': 'w.name','location_name': 'l.name', 'sku': 'p.sku', 'product_name': 'p.name',
+        'category_name': 'pc.name', 'lot_name': 'sl.name', 'uom_name': 'u.name',
+        'warehouse_id': 'w.id', 'location_id': 'l.id', 
+        'project_name': 'proj.name'
+    }
+    
+    for key, value in filters.items():
+        db_column = filter_map.get(key)
+        if db_column and value is not None and value != "":
+            if key in ['warehouse_id', 'location_id']:
+                where_clauses.append(f"{db_column} = %s"); params.append(value)
+            elif key == 'lot_name' and value == '-':
+                where_clauses.append("sl.id IS NULL")
+            else:
+                where_clauses.append(f"{db_column} ILIKE %s"); params.append(f"%{value}%")
+
+    if where_clauses:
+        base_query += " AND " + " AND ".join(where_clauses)
+
+    sort_map = {
+        'warehouse_name': 'w.name', 'location_name': 'l.name', 'sku': 'p.sku',
+        'product_name': 'p.name', 'category_name': 'pc.name', 'lot_name': 'lot_name_ordered',
+        'physical_quantity': 'physical_quantity', 'reserved_quantity': 'reserved_quantity', 
+        'available_quantity': 'available_quantity', 'uom_name': 'u.name', 
+        'project_name': 'proj.name'
+    }
+    order_by_col_key = sort_by if sort_by else 'sku'
+    order_by_col = sort_map.get(order_by_col_key, 'p.sku')
+    direction = "ASC" if ascending else "DESC"
+    
+    if order_by_col in ['pc.name', 'u.name', 'lot_name_ordered', 'l.name', 'proj.name']:
+         order_by_clause = f"COALESCE({order_by_col}, 'zzzz')"
+    else:
+         order_by_clause = order_by_col
+         
+    base_query += f" ORDER BY {order_by_clause} {direction}, p.sku ASC, lot_name_ordered ASC"
+    
+    return execute_query(base_query, tuple(params), fetchall=True)
+
+def get_product_reservations(product_id, location_id, lot_id=None):
+    """
+    Devuelve una lista enriquecida de operaciones 'listo' que reservan stock.
+    [CORREGIDO] Prioriza 'date_transfer' que es la fecha obligatoria en Operaciones.
+    """
+    params = [product_id, location_id]
+    
+    select_clause = """
+        SELECT 
+            p.name as picking_name,
+            p.custom_operation_type as op_type,
+            pt.code as type_code,
+            
+            -- [CORRECCIÓN] Prioridad de Fechas:
+            -- 1. date_transfer (Fecha de Traslado - Obligatoria en Operaciones)
+            -- 2. attention_date (Fecha de Atención - Usada en Liquidaciones)
+            -- 3. scheduled_date (Fecha de Creación - Fallback)
+            COALESCE(
+                TO_CHAR(p.date_transfer, 'DD/MM/YYYY'), 
+                TO_CHAR(p.attention_date, 'DD/MM/YYYY'), 
+                TO_CHAR(p.scheduled_date, 'DD/MM/YYYY')
+            ) as attention_date,
+            
+            p.responsible_user,
+            
+            COALESCE(proj.name, 'Stock General') as project_name,
+            COALESCE(part.name, 'Uso Interno') as partner_name,
+            COALESCE(l_dest.path, w_dest.name, 'Desconocido') as dest_location,
+            
+            SUM(sm.product_uom_qty) as reserved_qty
+    """
+
+    # El resto de la función (JOINS, WHERE, etc.) se mantiene IGUAL
+    joins_clause = """
+        FROM stock_moves sm
+        JOIN pickings p ON sm.picking_id = p.id
+        JOIN picking_types pt ON p.picking_type_id = pt.id
+        LEFT JOIN locations l_dest ON sm.location_dest_id = l_dest.id
+        LEFT JOIN warehouses w_dest ON l_dest.warehouse_id = w_dest.id
+        LEFT JOIN projects proj ON p.project_id = proj.id
+        LEFT JOIN partners part ON p.partner_id = part.id
+    """
+
+    where_clause = """
+        WHERE sm.product_id = %s
+          AND sm.location_src_id = %s
+          AND p.state = 'listo'
+          AND sm.state != 'cancelled'
+    """
+
+    # [CORRECCIÓN] Asegurar que date_transfer esté en el GROUP BY
+    group_by_clause = """
+        GROUP BY 
+            p.name, p.custom_operation_type, pt.code, 
+            p.date_transfer, p.attention_date, p.scheduled_date, p.responsible_user,
+            proj.name, part.name, l_dest.path, w_dest.name
+    """
+
+    if lot_id is not None:
+        joins_clause += " JOIN stock_move_lines sml ON sm.id = sml.move_id"
+        where_clause += " AND sml.lot_id = %s"
+        params.append(lot_id)
+        select_clause = select_clause.replace("SUM(sm.product_uom_qty)", "SUM(sml.qty_done)")
+    
+    query = f"{select_clause} {joins_clause} {where_clause} {group_by_clause} ORDER BY p.scheduled_date ASC"
+    
+    return execute_query(query, tuple(params), fetchall=True)
+
+# --- NUEVAS CONSULTAS PARA DASHBOARD GERENCIAL ---
+
+def get_top_projects_statistics(company_id, limit=5):
+    """
+    Obtiene el Top 5 Proyectos con mayor valor en custodia,
+    incluyendo su avance de liquidación.
+    """
+    query = """
+        WITH ProjectStock AS (
+            SELECT p.id, COALESCE(SUM(sq.quantity * prod.standard_price), 0) as stock_val
+            FROM projects p
+            LEFT JOIN stock_quants sq ON p.id = sq.project_id
+            LEFT JOIN products prod ON sq.product_id = prod.id
+            WHERE p.company_id = %s AND p.status = 'active'
+            GROUP BY p.id
+        ),
+        ProjectConsumed AS (
+            SELECT sm.project_id, COALESCE(SUM(sm.quantity_done * sm.price_unit), 0) as liq_val
+            FROM stock_moves sm
+            JOIN locations l_dest ON sm.location_dest_id = l_dest.id
+            WHERE sm.state = 'done' AND l_dest.category IN ('CLIENTE', 'CONTRATA CLIENTE')
+              AND sm.project_id IS NOT NULL
+            GROUP BY sm.project_id
+        )
+        SELECT 
+            p.id, p.name,
+            COALESCE(ps.stock_val, 0) as stock_value,
+            COALESCE(pc.liq_val, 0) as liquidated_value
+        FROM projects p
+        LEFT JOIN ProjectStock ps ON p.id = ps.id
+        LEFT JOIN ProjectConsumed pc ON p.id = pc.project_id
+        WHERE p.company_id = %s
+        ORDER BY stock_value DESC -- Priorizamos donde hay más dinero "parado"
+        LIMIT %s
+    """
+    results = execute_query(query, (company_id, company_id, limit), fetchall=True)
+    
+    data = []
+    for r in results:
+        s = r['stock_value']; l = r['liquidated_value']
+        total = s + l
+        progress = (l / total) if total > 0 else 0.0
+        data.append({
+            "id": r['id'], "name": r['name'],
+            "stock_value": s, "liquidated_value": l, "progress": progress
+        })
+    return data
+
+def get_ownership_distribution(company_id):
+    """
+    Calcula valor total agrupado por Propiedad (Propio vs Consignado).
+    """
+    query = """
+        SELECT 
+            p.ownership,
+            COUNT(sq.id) as items_count,
+            SUM(sq.quantity * p.standard_price) as total_value
+        FROM stock_quants sq
+        JOIN products p ON sq.product_id = p.id
+        JOIN locations l ON sq.location_id = l.id
+        WHERE l.type = 'internal' AND p.company_id = %s AND sq.quantity > 0
+        GROUP BY p.ownership
+    """
+    results = execute_query(query, (company_id,), fetchall=True)
+    
+    data = []
+    for r in results:
+        label = "Propio" if r['ownership'] == 'owned' else "Consignado"
+        data.append({"type": label, "value": r['total_value'], "count": r['items_count']})
+    return data
+
+def get_total_liquidated_value_global(company_id):
+    """ KPI Global: ¿Cuánto dinero hemos liquidado en total histórico? """
+    query = """
+        SELECT COALESCE(SUM(sm.quantity_done * sm.price_unit), 0) as total
+        FROM stock_moves sm
+        JOIN pickings p ON sm.picking_id = p.id
+        JOIN picking_types pt ON p.picking_type_id = pt.id
+        WHERE p.company_id = %s 
+          AND p.state = 'done' 
+          AND pt.code = 'OUT' -- Solo salidas (consumos)
+    """
+    res = execute_query(query, (company_id,), fetchone=True)
+    return res['total'] if res else 0.0
+
+# --- NUEVAS CONSULTAS PARA INTELIGENCIA DE INVENTARIO ---
+
+def get_top_products_by_value(company_id, limit=5):
+    """
+    Ranking de productos que representan mayor valor inmovilizado (Pareto).
+    """
+    query = """
+        SELECT 
+            p.name, p.sku,
+            SUM(sq.quantity * p.standard_price) as total_value
+        FROM stock_quants sq
+        JOIN products p ON sq.product_id = p.id
+        JOIN locations l ON sq.location_id = l.id
+        WHERE l.type = 'internal' AND p.company_id = %s AND sq.quantity > 0
+        GROUP BY p.id
+        ORDER BY total_value DESC
+        LIMIT %s
+    """
+    results = execute_query(query, (company_id, limit), fetchall=True)
+    return [dict(r) for r in results]
+
+def get_value_by_category(company_id):
+    """
+    Valor del inventario agrupado por Categoría de Producto.
+    """
+    query = """
+        SELECT 
+            COALESCE(pc.name, 'Sin Categoría') as category_name,
+            SUM(sq.quantity * p.standard_price) as total_value
+        FROM stock_quants sq
+        JOIN products p ON sq.product_id = p.id
+        LEFT JOIN product_categories pc ON p.category_id = pc.id
+        JOIN locations l ON sq.location_id = l.id
+        WHERE l.type = 'internal' AND p.company_id = %s AND sq.quantity > 0
+        GROUP BY pc.name
+        ORDER BY total_value DESC
+    """
+    results = execute_query(query, (company_id,), fetchall=True)
+    return [dict(r) for r in results]
+
+def get_value_by_region(company_id):
+    """
+    [NUEVO] Agrupa el valor en custodia por Departamento (Mapa de Calor).
+    """
+    query = """
+        SELECT 
+            -- Si el campo está vacío, lo agrupamos como 'Sin Región'
+            COALESCE(NULLIF(p.department, ''), 'Sin Región') as region,
+            COUNT(DISTINCT p.id) as projects_count,
+            SUM(sq.quantity * prod.standard_price) as total_value
+        FROM stock_quants sq
+        JOIN products prod ON sq.product_id = prod.id
+        JOIN projects p ON sq.project_id = p.id
+        WHERE p.company_id = %s 
+          AND p.status = 'active'
+          AND sq.quantity > 0
+        GROUP BY region
+        ORDER BY total_value DESC
+    """
+    results = execute_query(query, (company_id,), fetchall=True)
+    return [dict(r) for r in results]
+
+def get_warehouse_ranking_by_category(company_id, category_name, limit=10):
+    """
+    Obtiene el valor total de stock agrupado por Almacén, filtrado por Categoría.
+    Útil para: Top Almacenes Principales y Top Contratistas.
+    """
+    query = """
+        SELECT 
+            w.name,
+            COUNT(DISTINCT sq.product_id) as sku_count,
+            COALESCE(SUM(sq.quantity * prod.standard_price), 0) as total_value
+        FROM stock_quants sq
+        JOIN products prod ON sq.product_id = prod.id
+        JOIN locations l ON sq.location_id = l.id
+        JOIN warehouses w ON l.warehouse_id = w.id
+        JOIN warehouse_categories wc ON w.category_id = wc.id
+        WHERE p.company_id = %s 
+          AND l.type = 'internal'
+          AND wc.name = %s
+          AND sq.quantity > 0
+        GROUP BY w.id, w.name
+        ORDER BY total_value DESC
+        LIMIT %s
+    """
+    # Nota: en la query usé 'p.company_id' pero el join es 'prod'. Corrigiendo alias:
+    query = query.replace("p.company_id", "prod.company_id")
+    
+    results = execute_query(query, (company_id, category_name, limit), fetchall=True)
+    return [dict(r) for r in results]
+
+def get_material_flow_series(company_id, days=30):
+    """
+    [MEJORADO] Soporta parámetro 'days' y corrige valorización de despachos.
+    """
+    # 1. Generar serie de fechas dinámica
+    dates_query = f"""
+        SELECT to_char(d, 'YYYY-MM-DD') as day 
+        FROM generate_series(CURRENT_DATE - INTERVAL '{days} days', CURRENT_DATE, '1 day') d
+    """
+    
+    # 2. Query Despachado (Principal -> Contrata)
+    # FIX: Si price_unit es 0, usamos standard_price del producto
+    query_dispatch = f"""
+        SELECT to_char(p.date_done, 'YYYY-MM-DD') as day, 
+               SUM(sm.quantity_done * COALESCE(NULLIF(sm.price_unit, 0), prod.standard_price)) as val
+        FROM stock_moves sm
+        JOIN products prod ON sm.product_id = prod.id
+        JOIN pickings p ON sm.picking_id = p.id
+        JOIN locations l_src ON sm.location_src_id = l_src.id
+        JOIN warehouses w_src ON l_src.warehouse_id = w_src.id
+        JOIN warehouse_categories wc_src ON w_src.category_id = wc_src.id
+        WHERE p.company_id = %s 
+          AND p.state = 'done'
+          AND wc_src.name ILIKE '%%PRINCIPAL%%' -- Flexible
+          AND p.date_done >= CURRENT_DATE - INTERVAL '{days} days'
+        GROUP BY day
+    """
+    
+    # 3. Query Liquidado (Consumo final)
+    query_liquidated = f"""
+        SELECT to_char(p.date_done, 'YYYY-MM-DD') as day, 
+               SUM(sm.quantity_done * COALESCE(NULLIF(sm.price_unit, 0), prod.standard_price)) as val
+        FROM stock_moves sm
+        JOIN products prod ON sm.product_id = prod.id
+        JOIN pickings p ON sm.picking_id = p.id
+        JOIN locations l_dest ON sm.location_dest_id = l_dest.id
+        WHERE p.company_id = %s 
+          AND p.state = 'done'
+          AND l_dest.category IN ('CLIENTE', 'CONTRATA CLIENTE')
+          AND p.date_done >= CURRENT_DATE - INTERVAL '{days} days'
+        GROUP BY day
+    """
+    
+    dates = [r['day'] for r in execute_query(dates_query, (), fetchall=True)]
+    dispatch_data = {r['day']: r['val'] for r in execute_query(query_dispatch, (company_id,), fetchall=True)}
+    liquidated_data = {r['day']: r['val'] for r in execute_query(query_liquidated, (company_id,), fetchall=True)}
+    
+    result = []
+    for d in dates:
+        # Recortar fecha para mostrar solo DD/MM (e.g., "2023-11-25" -> "25/11")
+        display_day = f"{d[8:]}/{d[5:7]}" 
+        result.append({
+            "day": display_day,
+            "dispatch": dispatch_data.get(d, 0.0),
+            "liquidated": liquidated_data.get(d, 0.0)
+        })
+    return result
+
+def get_abc_stats(company_id):
+    """
+    Clasificación ABC simple basada en valor total actual.
+    A: Top 80% del valor. B: Siguiente 15%. C: Último 5%.
+    """
+    # Obtener todos los productos con stock > 0 ordenados por valor total
+    query = """
+        SELECT p.sku, SUM(sq.quantity * p.standard_price) as total_val
+        FROM stock_quants sq JOIN products p ON sq.product_id = p.id
+        WHERE p.company_id = %s AND sq.quantity > 0
+        GROUP BY p.id ORDER BY total_val DESC
+    """
+    rows = execute_query(query, (company_id,), fetchall=True)
+    
+    total_inventory_val = sum(r['total_val'] for r in rows)
+    if total_inventory_val == 0: return {"A": 0, "B": 0, "C": 0}
+    
+    accumulated = 0
+    counts = {"A": 0, "B": 0, "C": 0}
+    
+    for r in rows:
+        accumulated += r['total_val']
+        perc = accumulated / total_inventory_val
+        if perc <= 0.80: counts["A"] += 1
+        elif perc <= 0.95: counts["B"] += 1
+        else: counts["C"] += 1
+            
+    return counts
+
+def get_reverse_logistics_rate(company_id):
+    """
+    Tasa de Devolución = (Valor Retirado / Valor Despachado) en los últimos 30 días.
+    [CORREGIDO] Arreglado el JOIN de almacén en q_out.
+    """
+    # 1. Valor Retirado (IN desde Obras/Devoluciones)
+    q_ret = """
+        SELECT COALESCE(SUM(sm.quantity_done * sm.price_unit), 0) as val
+        FROM stock_moves sm 
+        JOIN pickings p ON sm.picking_id = p.id
+        JOIN picking_types pt ON p.picking_type_id = pt.id
+        WHERE p.company_id = %s 
+          AND p.state = 'done' 
+          AND (pt.code = 'RET' OR p.custom_operation_type ILIKE '%%Devoluci%%')
+          AND p.date_done >= CURRENT_DATE - INTERVAL '30 days'
+    """
+    val_ret = execute_query(q_ret, (company_id,), fetchone=True)['val']
+    
+    # 2. Valor Despachado (OUT a Obras desde Principal)
+    q_out = """
+        SELECT COALESCE(SUM(sm.quantity_done * sm.price_unit), 0) as val
+        FROM stock_moves sm 
+        JOIN pickings p ON sm.picking_id = p.id
+        -- [FIX] JOIN CORRECTO: Move -> Location Src -> Warehouse
+        JOIN locations l_src ON sm.location_src_id = l_src.id
+        JOIN warehouses w_src ON l_src.warehouse_id = w_src.id
+        JOIN warehouse_categories wc ON w_src.category_id = wc.id
+        
+        WHERE p.company_id = %s 
+          AND p.state = 'done' 
+          AND wc.name = 'ALMACEN PRINCIPAL'
+          AND p.date_done >= CURRENT_DATE - INTERVAL '30 days'
+    """
+    val_out = execute_query(q_out, (company_id,), fetchone=True)['val']
+    
+    # Evitar división por cero
+    rate = (val_ret / val_out * 100) if val_out > 0 else 0.0
+    return rate

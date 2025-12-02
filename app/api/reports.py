@@ -21,31 +21,90 @@ async def get_dashboard_kpis(
     auth: AuthDependency,
     company_id: int = Query(...)
 ):
-    """ Obtiene TODOS los KPIs y datos de gráficos para el Dashboard. """
     if "nav.dashboard.view" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
     
     try:
-        pending_kpis_raw = db.get_dashboard_kpis(company_id)
-        value_kpis_raw = db.get_inventory_value_kpis(company_id)
-        
-        ots_pendientes_result = db.execute_query(
-            "SELECT COUNT(*) as count FROM work_orders WHERE phase != 'Liquidado' AND company_id = %s",
-            (company_id,), fetchone=True
+        results = await asyncio.gather(
+            asyncio.to_thread(db.get_dashboard_kpis, company_id),           # 0
+            asyncio.to_thread(db.get_inventory_value_kpis, company_id),     # 1
+            asyncio.to_thread(db.get_operations_throughput, company_id),    # 2
+            asyncio.to_thread(db.get_inventory_aging, company_id),          # 3
+            asyncio.to_thread(db.get_top_projects_statistics, company_id),  # 4
+            asyncio.to_thread(db.get_ownership_distribution, company_id),   # 5
+            asyncio.to_thread(db.get_total_liquidated_value_global, company_id), # 6
+            asyncio.to_thread(db.execute_query, "SELECT COUNT(*) as c FROM work_orders WHERE phase != 'Liquidado' AND company_id=%s", (company_id,), fetchone=True), # 7
+            
+            # --- NUEVAS LLAMADAS ---
+            asyncio.to_thread(db.get_top_products_by_value, company_id),    # 8
+            asyncio.to_thread(db.get_value_by_category, company_id),         # 9
+            asyncio.to_thread(db.get_value_by_region, company_id), # 10: Geo Data
+            # 11. Top Almacenes Principales
+            asyncio.to_thread(db.get_warehouse_ranking_by_category, company_id, "ALMACEN PRINCIPAL", 5),
+            # 12. Top Contratistas
+            asyncio.to_thread(db.get_warehouse_ranking_by_category, company_id, "CONTRATISTA", 10),
+            # --- NUEVAS ---
+            asyncio.to_thread(db.get_material_flow_series, company_id), # 13
+            asyncio.to_thread(db.get_abc_stats, company_id),            # 14
+            asyncio.to_thread(db.get_reverse_logistics_rate, company_id)# 15
         )
-        ots_pendientes = ots_pendientes_result['count'] if ots_pendientes_result else 0
+        
+        # 2. Desempaquetar
+        kpis_counts = results[0]
+        inv_values = results[1]
+        throughput = results[2]
+        aging = results[3]
+        top_projects = results[4]
+        ownership_stats = results[5]
+        total_liquidated = results[6]
+        ots_pendientes = results[7]['c'] if results[7] else 0
+        top_products = results[8]
+        val_by_cat = results[9]
+        geo_data = results[10]
+        top_wh = results[11]
+        top_cont = results[12]
+        flow_data = results[13]
+        abc_data = results[14]
+        ret_rate = results[15]
 
-        throughput_raw = db.get_operations_throughput(company_id)
-        throughput_chart = [{"day": day.strftime("%a"), "count": count} for day, count in throughput_raw]
+        # 3. Calcular desglose Propio/Consignado para KPIs financieros rápidos
+        # (Usamos ownership_stats para no hacer otra query)
+        own_val = sum(x['value'] for x in ownership_stats if x['type'] == 'Propio')
+        cons_val = sum(x['value'] for x in ownership_stats if x['type'] == 'Consignado')
 
-        aging_chart = db.get_inventory_aging(company_id, tracked_only=True)
-
+        # 4. Construir Respuesta
         response = schemas.DashboardResponse(
-            pending_kpis=schemas.DashboardKPIs(**pending_kpis_raw),
-            value_kpis=schemas.InventoryValueKPIs(**value_kpis_raw),
-            pending_ots=ots_pendientes,
-            throughput_chart=throughput_chart,
-            aging_chart=aging_chart
+            # KPIs Financieros Planos
+            total_inventory_value=inv_values['total'],
+            own_inventory_value=own_val,
+            consigned_inventory_value=cons_val,
+            total_liquidated_value=total_liquidated,
+
+            # [FIX CRÍTICO] Pasamos el dict original para que el frontend lea 'pri' y 'tec'
+            value_kpis=inv_values, 
+            
+            # KPIs Operativos Planos
+            pending_receptions=kpis_counts.get('IN', 0),
+            pending_transfers=kpis_counts.get('INT', 0),
+            pending_liquidations=ots_pendientes,
+
+            # Gráficos
+            throughput_chart=[{"day": day.strftime("%a"), "count": count} for day, count in throughput],
+            aging_chart=aging,
+            
+            # Nuevas Secciones
+            top_projects=top_projects,
+            ownership_chart=ownership_stats,
+            # Nuevos campos
+            top_products=top_products,
+            value_by_category=val_by_cat,
+            geo_heatmap=geo_data,
+            # Nuevos
+            top_warehouses=top_wh,
+            top_contractors=top_cont,
+            material_flow=flow_data,
+            abc_stats=abc_data,
+            return_rate=ret_rate
         )
         return response
         
@@ -381,8 +440,25 @@ async def get_stock_detail_report(
     filters = {k: v for k, v in filters.items() if v is not None and v != ""}
 
     try:
-        stock_data = db.get_stock_summary_filtered_sorted(company_id=company_id, filters=filters)
+        stock_data = await asyncio.to_thread(
+            db.get_stock_on_hand_filtered_sorted, 
+            company_id=company_id, 
+            filters=filters
+        )
+        
+        # --- 🕵️‍♂️ INICIO DEL ESPÍA ---
+        if stock_data:
+            print(f"\n[DEBUG API] Primera fila cruda de DB: {dict(stock_data[0])}")
+            # Verificamos si las claves existen
+            row = dict(stock_data[0])
+            print(f"   -> Tiene 'lot_name'? {row.get('lot_name')}")
+            print(f"   -> Tiene 'project_name'? {row.get('project_name')}")
+        else:
+            print("\n[DEBUG API] La DB no devolvió resultados.")
+        # --- FIN DEL ESPÍA ---
+
         return [dict(row) for row in stock_data]
+
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al generar reporte detallado: {e}")
@@ -512,3 +588,42 @@ async def get_stock_for_products_list(
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al consultar stock múltiple: {e}")
+    
+@router.get("/project-kardex/{project_id}")
+def get_project_kardex_report(project_id: int, auth: AuthDependency, company_id: int = Query(...)):
+    """
+    Devuelve el resumen de stock y consumo de un proyecto específico.
+    """
+    try:
+        data = db.get_project_kardex(company_id, project_id)
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generando reporte: {str(e)}")
+
+@router.get("/warehouses-kpi", response_model=List[dict])
+async def get_warehouses_kpi(
+    auth: AuthDependency,
+    company_id: int = Query(...)
+):
+    """ Obtiene resumen de almacenes para el Hub de Inventario. """
+    try:
+        data = await asyncio.to_thread(db.get_warehouses_kpi_summary, company_id)
+        return [dict(row) for row in data]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error obteniendo KPIs de almacenes: {e}")
+    
+@router.get("/chart/flow", response_model=List[schemas.FlowDataPoint])
+async def get_flow_chart_data(
+    auth: AuthDependency,
+    company_id: int = Query(...),
+    days: int = Query(30) # Parámetro nuevo
+):
+    """Endpoint específico para refrescar el gráfico de líneas."""
+    if "nav.dashboard.view" not in auth.permissions:
+        raise HTTPException(status_code=403, detail="No autorizado")
+    
+    try:
+        data = await asyncio.to_thread(db.get_material_flow_series, company_id, days)
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

@@ -4,7 +4,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from typing import Annotated
 from app import database as db
 from app import security
-from app.security import TokenData # Importamos la clase
+from app.security import TokenData 
 
 router = APIRouter()
 
@@ -13,10 +13,9 @@ async def login_for_access_token(
     form_data: Annotated[OAuth2PasswordRequestForm, Depends()]
 ):
     """
-    Endpoint de login. Recibe 'username' y 'password' de un formulario.
+    Endpoint de login. Genera el token JWT con Roles y Compañías.
     """
-    # 1. Validar al usuario contra la BD (usando tu función existente)
-    # Nota: Tu función valida con SHA256. La nuestra lo soporta.
+    # 1. Validar al usuario contra la BD
     user_data, permissions_set = db.validate_user_and_get_permissions(
         form_data.username, form_data.password
     )
@@ -28,23 +27,28 @@ async def login_for_access_token(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # --- ¡CAMBIO! Obtener compañías permitidas ---
+    # 2. Obtener compañías permitidas
     allowed_companies = db.get_user_companies(user_data['id'])
-    # Convertir a lista de dicts simple para el token (o endpoint 'me')
-    companies_list = [dict(c) for c in allowed_companies]
+    
+    # --- CORRECCIÓN CRÍTICA ---
+    # Extraemos SOLO los IDs (List[int]) para que security.py pueda validarlos rápido.
+    company_ids = [c['id'] for c in allowed_companies]
 
-    # 2. Crear el token JWT con los datos del usuario
+    # 3. Crear el token JWT con los datos EXACTOS que espera security.py
     token_data_to_encode = {
         "sub": user_data['username'],
         "user_id": user_data['id'],
         "full_name": user_data['full_name'],
-        "permissions": list(permissions_set), # Convertir el set a lista
-        "allowed_companies": companies_list
+        "permissions": list(permissions_set),
+        
+        # --- Claves que faltaban o estaban mal nombradas ---
+        "role": user_data.get('role_name'), # security.py busca "role"
+        "companies": company_ids            # security.py busca "companies" (List[int])
     }
     
+    # 4. Generar y devolver el token
     access_token = security.create_access_token(data=token_data_to_encode)
 
-    # 3. Devolver el token
     return {"access_token": access_token, "token_type": "bearer"}
 
 @router.get("/me")
@@ -52,7 +56,7 @@ async def read_users_me(
     current_user_data: Annotated[TokenData, Depends(security.get_current_user_data)]
 ):
     """
-    Endpoint protegido que devuelve la información del usuario basada en el token.
+    Endpoint protegido que devuelve la información del usuario.
+    Sirve para verificar que el token se está decodificando bien.
     """
-    # Los datos ya vienen validados desde get_current_user_data
     return current_user_data

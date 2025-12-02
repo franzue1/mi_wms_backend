@@ -1,4 +1,5 @@
 # app/schemas.py
+
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 from datetime import datetime, date
@@ -157,17 +158,49 @@ class StockReportResponse(BaseModel):
         from_attributes = True
 
 # --- Schemas para Operaciones (Pickings) ---
+# 1. Modelo simplificado para las líneas dentro del paquete de creación
+class StockMoveRequest(BaseModel):
+    product_id: int
+    quantity: float
+    price_unit: Optional[float] = 0.0
+    # Nota: No enviamos 'id' ni 'state' porque son nuevos.
+    # Tampoco 'location_src/dest' porque los heredaremos de la cabecera por defecto.
+
+# 2. Modelo "Paquete Completo"
+class PickingFullCreateRequest(BaseModel):
+    # Datos Obligatorios
+    company_id: int
+    picking_type_id: int
+    responsible_user: str
+    
+    # Datos de Cabecera (Opcionales / Editables)
+    partner_id: Optional[int] = None
+    partner_ref: Optional[str] = None
+    purchase_order: Optional[str] = None
+    date_transfer: Optional[date] = None
+    custom_operation_type: Optional[str] = None
+    project_id: Optional[int] = None
+    
+    # IDs de Ubicación seleccionados en UI (Si no se envían, se usan defaults del tipo)
+    location_src_id: Optional[int] = None
+    location_dest_id: Optional[int] = None
+
+    # La Lista de Productos (La parte "Lazy")
+    moves: List[StockMoveRequest] = []
+
 class StockMoveResponse(BaseModel):
-    """ Schema para una línea de movimiento (stock_move) """
     id: int
     product_id: int
     sku: str
-    name: str # product name
+    name: str 
     product_uom_qty: float
+    quantity_done: float # <-- A veces faltaba este en la definición base
     tracking: str
     uom_name: Optional[str] = None
     price_unit: Optional[float] = None
     cost_at_adjustment: Optional[float] = None
+    project_id: Optional[int] = None      # <--- AGREGAR
+    project_name: Optional[str] = None    # <--- AGREGAR
 
     class Config:
         from_attributes = True
@@ -191,6 +224,8 @@ class PickingResponse(BaseModel):
     date_transfer: Optional[date] = None
     service_act_number: Optional[str] = None
     attention_date: Optional[date] = None
+    project_id: Optional[int] = None
+    project_name: Optional[str] = None
     # Lista de líneas de movimiento
     moves: List[StockMoveResponse] = []
 
@@ -209,6 +244,7 @@ class WorkOrderBase(BaseModel):
     address: Optional[str] = None
     service_type: Optional[str] = None
     job_type: Optional[str] = None
+    project_id: Optional[int] = None
 
 class WorkOrderCreate(WorkOrderBase):
     pass
@@ -222,6 +258,7 @@ class WorkOrderResponse(WorkOrderBase):
     location_src_path: Optional[str] = None
     service_act_number: Optional[str] = None
     attention_date_str: Optional[str] = None
+    project_name: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -284,24 +321,89 @@ class InventoryValueKPIs(BaseModel):
     pri: float = 0.0 # Almacen Principal
     tec: float = 0.0 # Contratista
 
-class ThroughputDataPoint(BaseModel):
-    # Usamos string para la fecha (ej. "Mon", "Tue") o un objeto date
-    day: str
-    count: int
-
 class AgingDataPoint(BaseModel):
     # Usamos un dict { "0-30 días": 10, "+90 días": 5 }
     # Pydantic puede manejar un Dict[str, float]
     pass # Usaremos un Dict[str, float] directamente
 
+# --- Schemas para Dashboard (VERSIÓN CORREGIDA Y FINAL) ---
+
+# Sub-modelos para listas
+class ProjectKPI(BaseModel):
+    id: int
+    name: str
+    stock_value: float
+    liquidated_value: float
+    progress: float
+
+class OwnershipKPI(BaseModel):
+    type: str
+    value: float
+    count: int
+
+class TopProductKPI(BaseModel):
+    name: str
+    sku: str
+    total_value: float
+
+class CategoryKPI(BaseModel):
+    category_name: str
+    total_value: float
+
+class RegionKPI(BaseModel):
+    region: str
+    projects_count: int
+    total_value: float
+
+class WarehouseKPI(BaseModel):
+    name: str
+    sku_count: int
+    total_value: float
+
+class FlowDataPoint(BaseModel):
+    day: str
+    dispatch: float
+    liquidated: float
+
+class ThroughputDataPoint(BaseModel):
+    day: str
+    count: int
+
+# Modelo Principal (Plano y Completo)
 class DashboardResponse(BaseModel):
-    # Los KPIs que ya teníamos
-    pending_kpis: DashboardKPIs
-    value_kpis: InventoryValueKPIs
+    # 1. KPIs Financieros (Aplanados)
+    total_inventory_value: float = 0.0
+    own_inventory_value: float = 0.0
+    consigned_inventory_value: float = 0.0
+    total_liquidated_value: float = 0.0
     
-    pending_ots: int = 0
+    # [FIX] Agregamos el desglose de almacenes aquí para que pase al frontend
+    value_kpis: Optional[dict] = {} # Para pasar 'pri' y 'tec' si se necesita, o aplanarlos también
+
+    # 2. KPIs Operativos (Aplanados)
+    pending_receptions: int = 0
+    pending_transfers: int = 0
+    pending_liquidations: int = 0
+
+    # 3. Gráficos y Listas
     throughput_chart: List[ThroughputDataPoint] = []
-    aging_chart: Dict[str, float] = {} # ej: {"0-30 días": 10.0, ...}
+    aging_chart: Dict[str, float] = {}
+    
+    # 4. Nuevas Secciones
+    top_projects: List[ProjectKPI] = []
+    ownership_chart: List[OwnershipKPI] = []
+    top_products: List[TopProductKPI] = []
+    value_by_category: List[CategoryKPI] = []
+    geo_heatmap: List[RegionKPI] = []
+    top_warehouses: List[WarehouseKPI] = []
+    top_contractors: List[WarehouseKPI] = []
+    material_flow: List[FlowDataPoint] = []
+    abc_stats: Dict[str, int] = {}
+    return_rate: float = 0.0
+
+    class Config:
+        from_attributes = True
+
 
 # --- Schema para Reporte de Antigüedad ---
 
@@ -458,23 +560,32 @@ class KardexDetailResponse(BaseModel):
 class StockDetailResponse(BaseModel):
     """
     Schema para el Reporte de Stock Detallado (por Serie/Lote).
-    Corresponde a la Pestaña 2 de la vista de reportes.
     """
     product_id: int
     location_id: int
     lot_id: Optional[int] = None
+    warehouse_id: int
     warehouse_name: str
     location_name: str
     sku: str
     product_name: str
     category_name: Optional[str] = None
-    lot_name: Optional[str] = None
+    
+    lot_name: Optional[str] = None 
+    project_name: Optional[str] = None
+    project_id: Optional[int] = None
+
     physical_quantity: float
     reserved_quantity: float
+    available_quantity: float
     uom_name: Optional[str] = None
+    
+    # --- [FIX] AGREGAR ESTE CAMPO ---
+    notes: Optional[str] = None 
+    # --------------------------------
 
     class Config:
-        from_attributes = True # Para que funcione con los objetos de la BD
+        from_attributes = True
 
 class LiquidationDropdowns(BaseModel):
     """
@@ -510,5 +621,58 @@ class StockCheckRequest(BaseModel):
     location_id: int
     product_ids: List[int]
 
+class MovePriceUpdate(BaseModel):
+    price_unit: float
 
-    
+# --- JERARQUÍA DE PROYECTOS ---
+
+class DirectionCreate(BaseModel):
+    name: str
+    code: Optional[str] = None
+
+class ManagementCreate(BaseModel):
+    name: str
+    direction_id: int # Ahora requiere dirección padre
+    code: Optional[str] = None
+
+class MacroProjectCreate(BaseModel):
+    name: str
+    management_id: int
+    code: Optional[str] = None
+
+# Actualizamos ProjectCreate para usar la nueva jerarquía
+class ProjectCreate(BaseModel):
+    name: str
+    macro_project_id: int
+    code: Optional[str] = None
+    address: Optional[str] = None
+    # --- NUEVOS CAMPOS GEOGRÁFICOS Y FINANCIEROS ---
+    department: Optional[str] = None
+    province: Optional[str] = None
+    district: Optional[str] = None
+    budget: Optional[float] = 0.0
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+
+class ProjectUpdate(BaseModel):
+    name: Optional[str] = None
+    code: Optional[str] = None
+    address: Optional[str] = None
+    status: Optional[str] = None
+    phase: Optional[str] = None
+    macro_project_id: Optional[int] = None
+    # --- NUEVOS CAMPOS (Todos opcionales para update) ---
+    department: Optional[str] = None
+    province: Optional[str] = None
+    district: Optional[str] = None
+    budget: Optional[float] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+
+# En schemas.py
+class StockNoteUpdate(BaseModel):
+    product_id: int
+    location_id: int
+    lot_id: Optional[int] = None
+    project_id: Optional[int] = None
+    notes: str
