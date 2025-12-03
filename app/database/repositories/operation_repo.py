@@ -1643,27 +1643,46 @@ def get_project_stock_in_location(company_id, location_id, project_id):
     """
     return execute_query(query, (location_id, project_id, company_id), fetchall=True)
 
-def update_stock_quant_notes(product_id, location_id, notes, lot_id=None, project_id=None):
+def update_stock_quant_notes(product_id, location_id, notes, lot_id=None, project_id=None, apply_to_group=False):
     """
-    Actualiza la nota de un registro de stock específico.
+    Actualiza la nota de stock.
+    [MEJORA] Si apply_to_group=True, actualiza TODOS los registros de ese producto/ubicación
+    (útil para limpiar notas en vista resumen de productos seriados).
     """
-    # Construir condiciones para encontrar el quant exacto
-    lot_clause = "lot_id = %s" if lot_id else "lot_id IS NULL"
-    proj_clause = "project_id = %s" if project_id else "project_id IS NULL"
-    
     params = [notes, product_id, location_id]
-    if lot_id: params.append(lot_id)
-    if project_id: params.append(project_id)
     
+    # Filtros Base (Siempre obligatorios)
+    where_conditions = ["product_id = %s", "location_id = %s"]
+    
+    if not apply_to_group:
+        # --- MODO ESTRICTO (Edición puntual) ---
+        # Solo actualiza la fila exacta (Lote específico o Proyecto específico)
+        
+        if lot_id:
+            where_conditions.append("lot_id = %s")
+            params.append(lot_id)
+        else:
+            where_conditions.append("lot_id IS NULL")
+            
+        if project_id:
+            where_conditions.append("project_id = %s")
+            params.append(project_id)
+        else:
+            where_conditions.append("project_id IS NULL")
+            
+    else:
+        # --- MODO GRUPO (Edición masiva desde Resumen) ---
+        # No filtramos por lot_id ni project_id.
+        # Actualizamos TODO lo que haya de este producto en esta ubicación.
+        # Esto permite "limpiar" o "etiquetar" todo el lote de series de un golpe.
+        pass
+
     query = f"""
         UPDATE stock_quants 
         SET notes = %s 
-        WHERE product_id = %s 
-          AND location_id = %s 
-          AND {lot_clause} 
-          AND {proj_clause}
+        WHERE {' AND '.join(where_conditions)}
     """
+    
     execute_commit_query(query, tuple(params))
     return True
-
 

@@ -957,19 +957,18 @@ async def get_picking_serials(picking_id: int, auth: AuthDependency):
 
 @router.post("/{picking_id}/mark-ready", status_code=200)
 async def mark_picking_ready(picking_id: int, auth: AuthDependency):
-    if "operations.can_edit" not in auth.permissions:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
+    # --- [CAMBIO DE PERMISO] ---
+    # Ahora requiere un permiso específico, separado de editar y validar.
+    if "operations.can_mark_ready" not in auth.permissions:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tienes permiso para reservar stock (Marcar como Listo).")
+    # ---------------------------
     
     try:
-        # [AUDIT FIX] Ya no llamamos a check_stock_for_picking aquí fuera.
-        # La validación es atómica dentro de mark_picking_as_ready.
-        
+        # ... (el resto de la lógica sigue igual: db.mark_picking_as_ready...)
         db.mark_picking_as_ready(picking_id)
-        
         return {"message": "Albarán marcado como 'listo'. Stock reservado correctamente."}
 
     except ValueError as ve:
-        # Capturamos errores de stock insuficiente o validación
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         traceback.print_exc()
@@ -986,8 +985,9 @@ async def validate_picking(picking_id: int, tracking_data: schemas.ValidateReque
 
 @router.post("/{picking_id}/return-to-draft", status_code=200)
 async def return_picking_to_draft(picking_id: int, auth: AuthDependency):
-    if "operations.can_edit" not in auth.permissions:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
+    # Antes verificaba 'can_edit', ahora requiere el permiso específico.
+    if "operations.can_reset_to_draft" not in auth.permissions:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tienes permiso para revertir operaciones.")
     success, message = db.return_picking_to_draft(picking_id)
     if not success:
         raise HTTPException(status_code=400, detail=message)
@@ -1149,8 +1149,6 @@ async def get_project_inventory(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al obtener stock de proyecto: {e}")
     
-# En api/pickings.py
-
 @router.put("/stock/notes", status_code=200)
 async def update_stock_notes(
     data: schemas.StockNoteUpdate, 
@@ -1167,7 +1165,8 @@ async def update_stock_notes(
             data.location_id, 
             data.notes, 
             data.lot_id, 
-            data.project_id
+            data.project_id,
+            data.apply_to_group
         )
         return {"message": "Nota actualizada"}
     except Exception as e:

@@ -676,3 +676,4 @@ class StockNoteUpdate(BaseModel):
     lot_id: Optional[int] = None
     project_id: Optional[int] = None
     notes: str
+    apply_to_group: bool = False

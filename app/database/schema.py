@@ -594,7 +594,14 @@ def create_initial_data(conn):
             "operations.tab.int.view": "Ver pestaña Transferencias",
             "operations.tab.ret.view": "Ver pestaña Retiros",
             "operations.can_create": "Crear nuevas Operaciones",
-            "operations.can_edit": "Editar Operaciones (Borrador)", "operations.can_validate": "Validar Operaciones (Pasar a 'Hecho')",
+            "operations.can_edit": "Editar Operaciones (Borrador)",
+
+
+            "operations.can_mark_ready": "Marcar como Listo (Reservar Stock)",
+
+
+            "operations.can_validate": "Validar Operaciones (Pasar a 'Hecho')",
+            "operations.can_reset_to_draft": "Regresar Operaciones a Borrador",
             "operations.can_import_export": "Importar/Exportar Operaciones",
             "liquidaciones.can_view": "Ver lista de Liquidaciones", "liquidaciones.can_create": "Registrar nuevas OTs",
             "liquidaciones.can_edit": "Guardar cambios en Liquidaciones", "liquidaciones.can_liquidate": "Validar y Liquidar OTs",
