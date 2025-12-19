@@ -209,9 +209,13 @@ async def create_company(company_data: CompanyCreate, auth: AuthDependency):
     
     try:
         new_company = await asyncio.to_thread(
-            db.create_company, company_data.name, company_data.country_code
+            db.create_company, 
+            company_data.name, 
+            company_data.country_code,
+            auth.user_id  # <--- ¡NUEVO ARGUMENTO!
         )
         return dict(new_company)
+
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:

@@ -25,17 +25,31 @@ def init_db_pool():
     if DATABASE_URL is None:
         raise ValueError("No se pudo conectar: DATABASE_URL no está configurada.")
 
-    print(f"DEBUG URL: {repr(DATABASE_URL)}")
+    # print(f"DEBUG URL: {repr(DATABASE_URL)}") # <--- Comenta esto en producción por seguridad
 
     try:
-        db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=DATABASE_URL)
+        # Definimos argumentos base
+        pool_args = {
+            "minconn": 1,
+            "maxconn": 10,
+            "dsn": DATABASE_URL
+        }
+
+        # --- CORRECCIÓN DE SEGURIDAD PARA RENDER/SUPABASE ---
+        # Si NO estamos en localhost, forzamos SSL
+        if "localhost" not in DATABASE_URL and "127.0.0.1" not in DATABASE_URL:
+            print(" -> Forzando SSL para conexión remota...")
+            pool_args["sslmode"] = "require"
+        # ----------------------------------------------------
+
+        db_pool = psycopg2.pool.SimpleConnectionPool(**pool_args)
         
         # Probar conexión
         conn = db_pool.getconn()
         if "localhost" in DATABASE_URL:
             print(" -> Pool de BD (Local) Creado.")
         else:
-            print(" -> Pool de BD (Producción) Creado.")
+            print(" -> Pool de BD (Producción + SSL) Creado.")
         db_pool.putconn(conn)
 
     except psycopg2.OperationalError as e:

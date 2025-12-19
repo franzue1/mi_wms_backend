@@ -1,3 +1,5 @@
+#backend/app/database/repositories/security_repo.py
+
 import hashlib
 import traceback
 import psycopg2.extras
@@ -12,45 +14,49 @@ def check_password(hashed_password, plain_password):
     """Verifica si la contraseña coincide con el hash."""
     return hashed_password == hash_password(plain_password)
 
-
 def validate_user_and_get_permissions(username, plain_password):
     """
-    Valida al usuario y, si tiene éxito, devuelve sus detalles y un set de permisos.
-    Devuelve: (user_data, permissions_set) o (None, None)
+    Valida al usuario y devuelve sus detalles (INCLUYENDO EL NOMBRE DEL ROL).
     """
     try:
-        user = execute_query("SELECT * FROM users WHERE username =  %s", (username,), fetchone=True)
+        # --- [CORRECCIÓN CRÍTICA] JOIN con Roles para obtener 'role_name' ---
+        query = """
+            SELECT u.*, r.name as role_name 
+            FROM users u
+            LEFT JOIN roles r ON u.role_id = r.id
+            WHERE u.username = %s
+        """
+        user = execute_query(query, (username,), fetchone=True)
+        # --------------------------------------------------------------------
         
         if not user:
             print(f"[AUTH] Fallo: Usuario '{username}' no encontrado.")
-            return None, None # Usuario no encontrado
+            return None, None 
         
         if not user['is_active']:
             print(f"[AUTH] Fallo: Usuario '{username}' está inactivo.")
-            return None, None # Usuario inactivo
+            return None, None 
 
-        # Verificar la contraseña
+        # Verificar contraseña
         if not check_password(user['hashed_password'], plain_password):
             print(f"[AUTH] Fallo: Contraseña incorrecta para '{username}'.")
-            return None, None # Contraseña incorrecta
+            return None, None 
         
-        # ¡Éxito! Cargar permisos
-        print(f"[AUTH] Éxito: Usuario '{username}' validado. Cargando permisos...")
-        user_data = dict(user)
+        # ¡Éxito!
+        print(f"[AUTH] Éxito: Usuario '{username}' (Rol: {user['role_name']}) validado.")
+        user_data = dict(user) # Ahora user_data tiene 'role_name'
         role_id = user_data['role_id']
         
         permissions = execute_query(
             """SELECT p.key
                FROM role_permissions rp
                JOIN permissions p ON rp.permission_id = p.id
-               WHERE rp.role_id =  %s""",
+               WHERE rp.role_id = %s""",
             (role_id,),
             fetchall=True
         )
         
-        # Convertir la lista de diccionarios en un set de strings para búsquedas rápidas
         permissions_set = {perm['key'] for perm in permissions}
-        print(f" -> {len(permissions_set)} permisos cargados.")
         
         return user_data, permissions_set
 
@@ -58,7 +64,6 @@ def validate_user_and_get_permissions(username, plain_password):
         print(f"[ERROR] en validate_user_and_get_permissions: {e}")
         traceback.print_exc()
         return None, None
-
 
 def create_user(username, plain_password, full_name, role_id, company_ids=None):
     """
@@ -330,15 +335,12 @@ def get_user_companies(user_id):
     """
     return execute_query(query, (user_id,), fetchall=True)
 
-def create_company(name: str, country_code: str = "PE"):
+def create_company(name: str, country_code: str = "PE", creator_user_id: int = None):
     """
-    Crea una nueva compañía e inicializa TODA su infraestructura base:
-    - Categorías
-    - Ubicaciones Virtuales
-    - Almacén Principal (y sus ubicaciones)
-    - Tipos de Operación (incluyendo ADJ)
+    Crea una nueva compañía e inicializa su infraestructura base.
+    [MEJORA] Si se pasa creator_user_id, asigna automáticamente la compañía a ese usuario.
     """
-    print(f" -> [DB] Iniciando transacción para crear compañía: {name} ({country_code})")
+    print(f" -> [DB] Iniciando creación de compañía: {name} ({country_code}) por Usuario ID: {creator_user_id}")
 
     conn = None
     try:
@@ -354,6 +356,15 @@ def create_company(name: str, country_code: str = "PE"):
             new_company = cursor.fetchone()
             new_company_id = new_company['id']
 
+            # --- [NUEVO] VINCULAR AL CREADOR ---
+            if creator_user_id:
+                cursor.execute(
+                    "INSERT INTO user_companies (user_id, company_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                    (creator_user_id, new_company_id)
+                )
+                print(f" -> [DB] Compañía {new_company_id} asignada al creador {creator_user_id}.")
+            # -----------------------------------
+
             # 2. Categorías de Almacén
             wh_categories = [(new_company_id, "ALMACEN PRINCIPAL"), (new_company_id, "CONTRATISTA")]
             cursor.executemany("INSERT INTO warehouse_categories (company_id, name) VALUES (%s, %s) ON CONFLICT (company_id, name) DO NOTHING", wh_categories)
@@ -365,8 +376,7 @@ def create_company(name: str, country_code: str = "PE"):
             # 4. Categoría de Producto
             cursor.execute("INSERT INTO product_categories (company_id, name) VALUES (%s, %s) ON CONFLICT (company_id, name) DO NOTHING", (new_company_id, 'General'))
 
-            # 5. Crear Ubicaciones Virtuales (¡NUEVO E IMPORTANTE!)
-            # Estas son necesarias para que funcionen los tipos de operación
+            # 5. Ubicaciones Virtuales
             virtual_locs = [
                 (new_company_id, "Proveedores", "PA/Vendors", "vendor", "PROVEEDOR"),
                 (new_company_id, "Clientes", "PA/Customers", "customer", "CLIENTE"),
@@ -378,35 +388,23 @@ def create_company(name: str, country_code: str = "PE"):
                 ON CONFLICT (company_id, path) DO NOTHING
             """, virtual_locs)
 
-            # 6. Crear Almacén Principal por Defecto (¡NUEVO!)
-            # Buscamos el ID de la categoría que acabamos de crear
+            # 6. Almacén Principal
             cursor.execute("SELECT id FROM warehouse_categories WHERE company_id = %s AND name = 'ALMACEN PRINCIPAL'", (new_company_id,))
             main_wh_cat = cursor.fetchone()
             
             main_wh_id = None
             if main_wh_cat:
-                # Usamos el helper interno para crear el almacén y sus ubicaciones (Stock, Averiados)
-                # Generamos un código único simple (ej: PRI-ID)
                 wh_code = f"PRI-{new_company_id}" 
-                
-                # Nota: _create_warehouse_with_cursor DEBE estar definido en este archivo (lo revisamos antes)
                 _create_warehouse_with_cursor(
-                    cursor, 
-                    "Almacén Principal", 
-                    wh_code, 
-                    main_wh_cat['id'], 
-                    new_company_id, 
+                    cursor, "Almacén Principal", wh_code, main_wh_cat['id'], new_company_id, 
                     "", "", "", "", "", "activo"
                 )
-                
-                # Recuperar el ID del almacén recién creado para usarlo en el ADJ
                 cursor.execute("SELECT id FROM warehouses WHERE company_id = %s AND code = %s", (new_company_id, wh_code))
                 wh_row = cursor.fetchone()
                 if wh_row: main_wh_id = wh_row['id']
 
-            # 7. Crear Tipo de Operación 'ADJ' (Ajuste de Inventario) (¡CRÍTICO!)
+            # 7. Tipo de Operación ADJ
             if main_wh_id:
-                # Buscar ubicación de ajuste
                 cursor.execute("SELECT id FROM locations WHERE company_id = %s AND category = 'AJUSTE'", (new_company_id,))
                 adj_loc_row = cursor.fetchone()
                 
@@ -417,9 +415,8 @@ def create_company(name: str, country_code: str = "PE"):
                         VALUES (%s, %s, 'ADJ', %s, %s, %s) 
                         ON CONFLICT (company_id, name) DO NOTHING
                     """, (new_company_id, "Ajustes de Inventario", main_wh_id, adj_loc_id, adj_loc_id))
-                    print(f" -> Tipo de operación ADJ creado para cia {new_company_id}")
 
-            # 8. Crear Socios por defecto (Varios)
+            # 8. Socios por defecto
             cursor.execute("SELECT id FROM partner_categories WHERE name = 'Proveedor Cliente' AND company_id = %s", (new_company_id,))
             cat_cl_id = cursor.fetchone()['id']
             cursor.execute("SELECT id FROM partner_categories WHERE name = 'Proveedor Externo' AND company_id = %s", (new_company_id,))

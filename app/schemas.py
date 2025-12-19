@@ -639,6 +639,7 @@ class MacroProjectCreate(BaseModel):
     name: str
     management_id: int
     code: Optional[str] = None
+    cost_center: Optional[str] = None  # <--- [NUEVO] Agregado aquí
 
 # Actualizamos ProjectCreate para usar la nueva jerarquía
 class ProjectCreate(BaseModel):

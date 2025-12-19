@@ -1,3 +1,5 @@
+#backend/app/database/repositories/product_repo.py
+
 import traceback
 import psycopg2.extras
 from ..core import get_db_connection, return_db_connection, execute_query, execute_commit_query
@@ -272,18 +274,36 @@ def get_products_count(company_id, filters={}):
 
 def upsert_product_from_import(company_id, sku, name, category_id, uom_id, tracking, ownership, price):
     """
-    Inserta o actualiza un producto (UPSERT).
+    Inserta o actualiza un producto (UPSERT) basado en (company_id, sku).
     """
     conn = None
     
-    query = """... (tu query gigante) ..."""
+    # Consulta SQL correcta y completa
+    query = """
+        INSERT INTO products (
+            company_id, sku, name, category_id, uom_id, tracking, ownership, standard_price
+        ) 
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (company_id, sku) 
+        DO UPDATE SET
+            name = EXCLUDED.name,
+            category_id = EXCLUDED.category_id,
+            uom_id = EXCLUDED.uom_id,
+            tracking = EXCLUDED.tracking,
+            ownership = EXCLUDED.ownership,
+            standard_price = EXCLUDED.standard_price
+        RETURNING (xmax = 0) AS inserted -- Truco de Postgres para saber si fue insert (True) o update (False)
+    """
+    
     params = (company_id, sku, name, category_id, uom_id, tracking, ownership, price)
 
     try:
-        conn = get_db_connection() # <-- Usar helper
+        conn = get_db_connection()
         with conn.cursor() as cursor:
             cursor.execute(query, params)
-            was_inserted = cursor.fetchone()[0]
+            result = cursor.fetchone()
+            was_inserted = result[0] if result else False
+            
             conn.commit()
             return "created" if was_inserted else "updated"
 
@@ -293,7 +313,7 @@ def upsert_product_from_import(company_id, sku, name, category_id, uom_id, track
         raise e
         
     finally:
-        if conn: return_db_connection(conn) # <-- Usar helper
+        if conn: return_db_connection(conn)
 
 def search_storable_products_by_term(company_id: int, search_term: str):
     """

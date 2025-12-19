@@ -61,6 +61,7 @@ def create_schema(conn):
             management_id INTEGER REFERENCES managements(id),
             name TEXT NOT NULL,
             code TEXT,
+            cost_center TEXT,
             description TEXT,
             client_name TEXT,
             status TEXT DEFAULT 'active',
@@ -75,7 +76,7 @@ def create_schema(conn):
             company_id INTEGER NOT NULL REFERENCES companies(id),
             macro_project_id INTEGER REFERENCES macro_projects(id),
             name TEXT NOT NULL, 
-            code TEXT, 
+            code TEXT,
             address TEXT, 
             
             -- Ubigeo
@@ -372,10 +373,13 @@ def create_initial_data(conn):
     mgmt_id = row['id']
 
     # C. Macro Proyecto Base (Contrato Marco)
-    cursor.execute(
-        "INSERT INTO macro_projects (company_id, management_id, name, code) VALUES (%s, %s, %s, %s) ON CONFLICT (company_id, name) DO NOTHING RETURNING id",
-        (default_company_id, mgmt_id, "Contrato Marco 2025", "M-2025")
-    )
+    cursor.execute("""
+        INSERT INTO macro_projects (company_id, management_id, name, code, cost_center) 
+        VALUES (%s, %s, %s, %s, %s) 
+        ON CONFLICT (company_id, name) DO NOTHING 
+        RETURNING id
+    """, (default_company_id, mgmt_id, "Contrato Marco 2025", "M-2025", "CC-001-2025")) # <--- Valor de ejemplo
+    
     row = cursor.fetchone()
     if not row: 
         cursor.execute("SELECT id FROM macro_projects WHERE company_id=%s AND name=%s", (default_company_id, "Contrato Marco 2025"))
@@ -595,11 +599,7 @@ def create_initial_data(conn):
             "operations.tab.ret.view": "Ver pestaña Retiros",
             "operations.can_create": "Crear nuevas Operaciones",
             "operations.can_edit": "Editar Operaciones (Borrador)",
-
-
             "operations.can_mark_ready": "Marcar como Listo (Reservar Stock)",
-
-
             "operations.can_validate": "Validar Operaciones (Pasar a 'Hecho')",
             "operations.can_reset_to_draft": "Regresar Operaciones a Borrador",
             "operations.can_import_export": "Importar/Exportar Operaciones",
