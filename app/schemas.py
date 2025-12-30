@@ -153,6 +153,7 @@ class StockReportResponse(BaseModel):
     physical_quantity: float
     reserved_quantity: float
     available_quantity: float
+    notes: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -482,6 +483,7 @@ class UserBase(BaseModel):
 class UserCreate(UserBase):
     password: str # Contraseña en texto plano
     company_ids: List[int] = []
+    warehouse_ids: List[int] = []
 
 class UserUpdate(BaseModel):
     full_name: Optional[str] = None
@@ -489,12 +491,14 @@ class UserUpdate(BaseModel):
     is_active: Optional[bool] = None
     password: Optional[str] = None # Para cambiar la contraseña (opcional)
     company_ids: List[int] = []
+    warehouse_ids: List[int] = []
 
 class UserResponse(UserBase):
     id: int
     role_name: Optional[str] = None # Campo del JOIN
     # NOTA: 'hashed_password' se omite intencionalmente por seguridad
     company_ids: List[int] = []
+    warehouse_ids: List[int] = [] # <--- [AGREGAR] Para que el admin pueda leerlo al editar
 
     class Config:
         from_attributes = True

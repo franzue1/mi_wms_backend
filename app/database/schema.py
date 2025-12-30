@@ -273,6 +273,13 @@ def create_schema(conn):
             PRIMARY KEY (user_id, company_id)
         );
     """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS user_warehouses (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    warehouse_id INTEGER NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+    PRIMARY KEY (user_id, warehouse_id)
+    );
+    """)
     cursor.execute("CREATE TABLE IF NOT EXISTS permissions (id SERIAL PRIMARY KEY, key TEXT UNIQUE NOT NULL, description TEXT);")
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS role_permissions (
@@ -307,7 +314,8 @@ def create_schema(conn):
         
         # D. SERIES Y TRAZABILIDAD
         "CREATE INDEX IF NOT EXISTS idx_sml_move_id ON stock_move_lines (move_id);",
-        "CREATE INDEX IF NOT EXISTS idx_lots_product ON stock_lots (product_id);"
+        "CREATE INDEX IF NOT EXISTS idx_lots_product ON stock_lots (product_id);",
+        "CREATE INDEX IF NOT EXISTS idx_user_warehouses_user ON user_warehouses(user_id);"
     ]
 
     for idx_sql in indices:

@@ -65,7 +65,7 @@ def validate_user_and_get_permissions(username, plain_password):
         traceback.print_exc()
         return None, None
 
-def create_user(username, plain_password, full_name, role_id, company_ids=None):
+def create_user(username, plain_password, full_name, role_id, company_ids=None, warehouse_ids=None):
     """
     Crea un usuario y asigna sus compañías permitidas.
     """
@@ -104,7 +104,14 @@ def create_user(username, plain_password, full_name, role_id, company_ids=None):
                 cursor.executemany(query_rel, values)
                 print(f" -> Asignadas {len(values)} compañías al usuario {username}.")
 
-            # 4. Confirmar todo
+            # 4. [NUEVO] Insertar Relación con Almacenes
+            if warehouse_ids and isinstance(warehouse_ids, list) and len(warehouse_ids) > 0:
+                values = [(new_user_id, int(w_id)) for w_id in warehouse_ids]
+                query_wh = "INSERT INTO user_warehouses (user_id, warehouse_id) VALUES (%s, %s)"
+                cursor.executemany(query_wh, values)
+                print(f" -> Asignados {len(values)} almacenes al usuario {username}.")
+
+            # 5. Confirmar todo
             conn.commit()
             return new_user_id
 
@@ -116,8 +123,7 @@ def create_user(username, plain_password, full_name, role_id, company_ids=None):
     finally:
         if conn: return_db_connection(conn)
 
-
-def update_user(user_id, full_name, role_id, is_active, new_password=None, company_ids=None):
+def update_user(user_id, full_name, role_id, is_active, new_password=None, company_ids=None, warehouse_ids=None):
     """
     Actualiza datos del usuario y sus compañías.
     Si 'company_ids' es None, no se tocan las compañías.
@@ -159,12 +165,19 @@ def update_user(user_id, full_name, role_id, is_active, new_password=None, compa
 
             # 2. Actualizar Compañías
             if company_ids is not None:
-                # ... (resto de tu lógica de compañías, que está bien) ...
                 cursor.execute("DELETE FROM user_companies WHERE user_id = %s", (user_id,))
                 if company_ids:
                     values = [(user_id, int(c_id)) for c_id in company_ids]
                     query_rel = "INSERT INTO user_companies (user_id, company_id) VALUES (%s, %s)"
                     cursor.executemany(query_rel, values)
+
+            # 3. [NUEVO] Actualizar Almacenes
+            if warehouse_ids is not None:
+                cursor.execute("DELETE FROM user_warehouses WHERE user_id = %s", (user_id,))
+                if warehouse_ids:
+                    values = [(user_id, int(w_id)) for w_id in warehouse_ids]
+                    query_wh = "INSERT INTO user_warehouses (user_id, warehouse_id) VALUES (%s, %s)"
+                    cursor.executemany(query_wh, values)
 
             conn.commit()
             return True
@@ -198,20 +211,19 @@ def get_users_for_admin():
             users_rows = cursor.fetchall()
             
             final_users = []
-            
-            # 2. Para cada usuario, obtener sus compañías
             for u_row in users_rows:
                 user_dict = dict(u_row)
                 
-                query_companies = "SELECT company_id FROM user_companies WHERE user_id = %s"
-                cursor.execute(query_companies, (user_dict['id'],))
-                company_rows = cursor.fetchall()
+                # Traer Compañías
+                cursor.execute("SELECT company_id FROM user_companies WHERE user_id = %s", (user_dict['id'],))
+                user_dict['company_ids'] = [row['company_id'] for row in cursor.fetchall()]
                 
-                # Convertir a una lista simple de enteros [1, 2, 5]
-                user_dict['company_ids'] = [row['company_id'] for row in company_rows]
+                # [NUEVO] Traer Almacenes
+                cursor.execute("SELECT warehouse_id FROM user_warehouses WHERE user_id = %s", (user_dict['id'],))
+                user_dict['warehouse_ids'] = [row['warehouse_id'] for row in cursor.fetchall()]
+                
                 final_users.append(user_dict)
-                print(f"[DEBUG DB] Usuario '{user_dict['username']}' companies: {user_dict['company_ids']}")
-                
+            
             return final_users
 
     except Exception as e:
@@ -221,7 +233,6 @@ def get_users_for_admin():
         # --- ¡CORRECCIÓN CRÍTICA AQUÍ! ---
         if conn:
             return_db_connection(conn) # <-- Usa el helper, NO db_pool.putconn
-
 
 def get_user_by_username(username: str):
     """

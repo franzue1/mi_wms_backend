@@ -34,7 +34,8 @@ async def create_user(user: schemas.UserCreate, auth: AuthDependency):
             plain_password=user.password,
             full_name=user.full_name,
             role_id=user.role_id,
-            company_ids=user.company_ids  # <--- ¡FALTABA ESTA LÍNEA!
+            company_ids=user.company_ids,
+            warehouse_ids=user.warehouse_ids  # <--- [NUEVO] ¡Conectado!
         )
         
         # Recargar usuario para devolverlo completo
@@ -61,7 +62,8 @@ async def update_user(user_id: int, user: schemas.UserUpdate, auth: AuthDependen
             role_id=user.role_id,
             is_active=user.is_active,
             new_password=user.password,
-            company_ids=user.company_ids  # <--- ¡FALTABA ESTA LÍNEA!
+            company_ids=user.company_ids,
+            warehouse_ids=user.warehouse_ids  # <--- [NUEVO] ¡Conectado!
         )
         
         # Recargar usuario

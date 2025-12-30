@@ -1686,3 +1686,213 @@ def update_stock_quant_notes(product_id, location_id, notes, lot_id=None, projec
     execute_commit_query(query, tuple(params))
     return True
 
+# ==============================================================================
+# --- NUEVAS FUNCIONES PARA IMPORTACIÓN/EXPORTACIÓN DE AJUSTES (SMART LOGIC) ---
+# ==============================================================================
+
+def get_adjustments_for_export(company_id):
+    """
+    Obtiene data plana de ajustes para CSV.
+    Detecta si es entrada o salida basándose en la ubicación origen.
+    """
+    query = """
+        SELECT 
+            p.name as referencia,
+            p.adjustment_reason as razon,
+            TO_CHAR(p.scheduled_date, 'DD/MM/YYYY') as fecha,
+            p.responsible_user as usuario,
+            p.notes as notas,
+            p.state as estado,
+            
+            -- Ubicación Real (La que no es virtual)
+            CASE 
+                WHEN l_src.category = 'AJUSTE' THEN COALESCE(l_dest.path, w_dest.name)
+                ELSE COALESCE(l_src.path, w_src.name)
+            END as ubicacion,
+            
+            prod.sku,
+            prod.name as producto,
+            
+            -- Cantidad (Positiva o Negativa según flujo)
+            CASE 
+                WHEN l_src.category = 'AJUSTE' THEN sm.quantity_done -- Entrada (+10)
+                ELSE -sm.quantity_done -- Salida (-10)
+            END as cantidad,
+            
+            sm.price_unit as costo_unitario,
+
+            -- [NUEVO] Concatenar series separadas por comas
+            (
+                SELECT string_agg(sl.name, ', ')
+                FROM stock_move_lines sml
+                JOIN stock_lots sl ON sml.lot_id = sl.id
+                WHERE sml.move_id = sm.id
+            ) as series
+
+        FROM stock_moves sm
+        JOIN pickings p ON sm.picking_id = p.id
+        JOIN picking_types pt ON p.picking_type_id = pt.id
+        JOIN products prod ON sm.product_id = prod.id
+        
+        LEFT JOIN locations l_src ON sm.location_src_id = l_src.id
+        LEFT JOIN locations l_dest ON sm.location_dest_id = l_dest.id
+        LEFT JOIN warehouses w_src ON l_src.warehouse_id = w_src.id
+        LEFT JOIN warehouses w_dest ON l_dest.warehouse_id = w_dest.id
+        
+        WHERE p.company_id = %s 
+          AND pt.code = 'ADJ' 
+          AND p.state != 'cancelled'
+        ORDER BY p.id DESC, prod.sku ASC
+    """
+    return execute_query(query, (company_id,), fetchall=True)
+
+def import_smart_adjustments_transaction(company_id, user_name, rows):
+    """
+    [LÓGICA INTELIGENTE v3 - DEBUG] Importa ajustes masivos.
+    Soporta Series (qty=1) y Lotes (qty=total).
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        
+        # 1. Configuración Previa
+        cursor.execute("SELECT id, warehouse_id FROM picking_types WHERE code='ADJ' AND company_id=%s LIMIT 1", (company_id,))
+        pt = cursor.fetchone()
+        if not pt: raise ValueError("No existe configuración de 'Ajustes' (Picking Type ADJ).")
+        
+        cursor.execute("SELECT id FROM locations WHERE category='AJUSTE' AND company_id=%s LIMIT 1", (company_id,))
+        loc_virtual = cursor.fetchone()
+        if not loc_virtual: raise ValueError("No existe ubicación virtual 'AJUSTE'.")
+        virtual_id = loc_virtual['id']
+
+        # 2. Agrupar filas
+        from collections import defaultdict
+        grouped_rows = defaultdict(list)
+        
+        for i, row in enumerate(rows):
+            ref = row.get('referencia') or f"IMP-{datetime.now().strftime('%Y%m%d-%H%M')}"
+            grouped_rows[ref].append({'data': row, 'line': i + 2})
+
+        total_created = 0
+        
+        # 3. Procesar Grupos
+        for ref, lines in grouped_rows.items():
+            first_row = lines[0]['data']
+            reason = first_row.get('razon')
+            if not reason or not reason.strip():
+                raise ValueError(f"Fila {lines[0]['line']}: La 'razon' es OBLIGATORIA.")
+            
+            notes = first_row.get('notas', '')
+
+            # Generar nombre
+            cursor.execute("SELECT wt.code FROM warehouses wt WHERE id = %s", (pt['warehouse_id'],))
+            wh_code = cursor.fetchone()['code']
+            prefix = f"{wh_code}/ADJ/"
+            cursor.execute("SELECT COUNT(*) FROM pickings WHERE name LIKE %s", (f"{prefix}%",))
+            count = cursor.fetchone()[0]
+            new_name = f"{prefix}{str(count + 1 + total_created).zfill(5)}"
+
+            # Crear Cabecera
+            cursor.execute("""
+                INSERT INTO pickings (
+                    company_id, name, picking_type_id, state, responsible_user, 
+                    adjustment_reason, notes, custom_operation_type,
+                    location_src_id, location_dest_id, scheduled_date
+                ) VALUES (%s, %s, %s, 'draft', %s, %s, %s, 'Ajuste de Inventario', %s, %s, NOW())
+                RETURNING id
+            """, (company_id, new_name, pt['id'], user_name, reason, notes, virtual_id, virtual_id))
+            
+            picking_id = cursor.fetchone()[0]
+            print(f"[IMPORT] Creado Ajuste ID: {picking_id} - Ref: {ref}")
+            
+            # Procesar Líneas
+            for line_info in lines:
+                row = line_info['data']
+                sku = row.get('sku')
+                qty_str = row.get('cantidad')
+                loc_path = row.get('ubicacion')
+                cost_str = row.get('costo', '0')
+                
+                # Búsqueda flexible de la columna series
+                serials_str = row.get('series') or row.get('serie') or row.get('serial') or row.get('lote') or ''
+
+                if not sku or not qty_str or not loc_path:
+                    raise ValueError(f"Fila {line_info['line']}: Faltan datos (SKU, Cantidad, Ubicación).")
+
+                # Buscar Producto
+                cursor.execute("SELECT id, standard_price, tracking FROM products WHERE sku = %s AND company_id = %s", (sku, company_id))
+                prod = cursor.fetchone()
+                if not prod: raise ValueError(f"Fila {line_info['line']}: SKU '{sku}' no existe.")
+                
+                # Buscar Ubicación Real
+                cursor.execute("SELECT id FROM locations WHERE (path = %s OR name = %s) AND company_id = %s AND type='internal'", (loc_path, loc_path, company_id))
+                loc_real = cursor.fetchone()
+                if not loc_real: raise ValueError(f"Fila {line_info['line']}: Ubicación '{loc_path}' no encontrada o no es interna.")
+                
+                real_id = loc_real['id']
+                qty = float(qty_str)
+                cost = float(cost_str) if cost_str and float(cost_str) > 0 else (prod['standard_price'] or 0)
+
+                if qty >= 0:
+                    src, dest = virtual_id, real_id
+                    final_qty = qty
+                else:
+                    src, dest = real_id, virtual_id
+                    final_qty = abs(qty)
+
+                cursor.execute("""
+                    INSERT INTO stock_moves (
+                        picking_id, product_id, product_uom_qty, quantity_done, 
+                        location_src_id, location_dest_id, price_unit, cost_at_adjustment, state
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'draft')
+                    RETURNING id
+                """, (picking_id, prod['id'], final_qty, final_qty, src, dest, cost, cost))
+                
+                move_id = cursor.fetchone()[0]
+
+                # --- CARGA DE SERIES ---
+                tracking_type = prod['tracking']
+                print(f" -> Proc. SKU {sku} (Tracking: {tracking_type}). Series Raw: '{serials_str}'")
+
+                if tracking_type != 'none' and serials_str:
+                    raw_vals = [s.strip() for s in re.split(r'[;,\n]', serials_str) if s.strip()]
+                    
+                    if not raw_vals: continue
+
+                    if tracking_type == 'serial':
+                        # Para series: La cantidad de códigos debe coincidir con la cantidad numérica
+                        if len(raw_vals) != int(final_qty):
+                            raise ValueError(f"Fila {line_info['line']}: SKU '{sku}' requiere {int(final_qty)} series, se indicaron {len(raw_vals)}.")
+                        
+                        for sn in raw_vals:
+                            lot_id = create_lot(cursor, prod['id'], sn)
+                            cursor.execute("INSERT INTO stock_move_lines (move_id, lot_id, qty_done) VALUES (%s, %s, 1)", (move_id, lot_id))
+                            
+                    elif tracking_type == 'lot':
+                        # Para lotes: Si hay 1 solo código, le asignamos toda la cantidad
+                        if len(raw_vals) == 1:
+                            lot_id = create_lot(cursor, prod['id'], raw_vals[0])
+                            cursor.execute("INSERT INTO stock_move_lines (move_id, lot_id, qty_done) VALUES (%s, %s, %s)", (move_id, lot_id, final_qty))
+                        else:
+                            # Si hay múltiples lotes, asumimos 1 unidad por lote (o fallamos porque es ambiguo en CSV simple)
+                            # Para simplificar, distribuimos 1 a 1 y validamos cantidad
+                            if len(raw_vals) != int(final_qty):
+                                 print(f"[WARN] Lotes múltiples para '{sku}'. Se asignará 1 unidad a cada lote listado.")
+                            
+                            for sn in raw_vals:
+                                lot_id = create_lot(cursor, prod['id'], sn)
+                                cursor.execute("INSERT INTO stock_move_lines (move_id, lot_id, qty_done) VALUES (%s, %s, 1)", (move_id, lot_id))
+
+            total_created += 1
+
+        conn.commit()
+        return total_created
+
+    except Exception as e:
+        if conn: conn.rollback()
+        print(f"Error import transaction: {e}")
+        raise e
+    finally:
+        if conn: return_db_connection(conn)
+

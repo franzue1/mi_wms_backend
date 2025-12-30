@@ -129,21 +129,76 @@ async def get_stock_summary_report(
     location_id: Optional[int] = None,
     sku: Optional[str] = None,
     product_name: Optional[str] = None,
-    category_name: Optional[str] = None
+    category_name: Optional[str] = None,
+    # [NUEVO] Agregar location_name
+    location_name: Optional[str] = None,
+    
+    # Paginación
+    skip: int = 0,
+    limit: int = 50,
+    sort_by: str = 'sku',
+    ascending: bool = True
 ):
-    """ Obtiene el reporte de stock resumido (agrupado por producto/ubicación). """
     if "reports.stock.view" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
     
-    filters = { "warehouse_id": warehouse_id,"location_id": location_id, "sku": sku, "product_name": product_name, "category_name": category_name }
+    filters = { 
+        "warehouse_id": warehouse_id,
+        "location_id": location_id,
+        "sku": sku, 
+        "product_name": product_name, 
+        "category_name": category_name,
+        # [NUEVO] Mapear el filtro
+        "location_name": location_name
+    }
     filters = {k: v for k, v in filters.items() if v is not None}
 
     try:
-        stock_data = db.get_stock_summary_filtered_sorted(company_id=company_id, filters=filters)
+        stock_data = await asyncio.to_thread(
+            db.get_stock_summary_filtered_sorted, 
+            company_id=company_id, 
+            filters=filters,
+            sort_by=sort_by, 
+            ascending=ascending, 
+            limit=limit, 
+            offset=skip
+        )
         return [dict(row) for row in stock_data]
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al generar reporte de stock: {e}")
 
+@router.get("/stock-summary/count", response_model=int)
+async def get_stock_summary_count(
+    auth: AuthDependency,
+    company_id: int = Query(...),
+    warehouse_id: Optional[int] = None,
+    location_id: Optional[int] = None,
+    sku: Optional[str] = None,
+    product_name: Optional[str] = None,
+    category_name: Optional[str] = None,
+    # [NUEVO]
+    location_name: Optional[str] = None
+):
+    if "reports.stock.view" not in auth.permissions:
+        raise HTTPException(status_code=403, detail="No autorizado")
+
+    filters = { 
+        "warehouse_id": warehouse_id, 
+        "location_id": location_id, 
+        "sku": sku, 
+        "product_name": product_name, 
+        "category_name": category_name,
+        # [NUEVO]
+        "location_name": location_name
+    }
+    filters = {k: v for k, v in filters.items() if v is not None}
+
+    try:
+        return await asyncio.to_thread(db.get_stock_summary_count, company_id, filters)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error al contar resumen: {e}")
 
 @router.get("/aging", response_model=List[schemas.AgingDetailResponse])
 async def get_aging_report(
@@ -429,22 +484,34 @@ async def get_stock_detail_report(
     sku: Optional[str] = None,
     product_name: Optional[str] = None,
     category_name: Optional[str] = None,
-    location_id: Optional[int] = None # Filtro extra de ubicación
+    location_id: Optional[int] = None,
+    # [NUEVO] Filtros de texto adicionales
+    location_name: Optional[str] = None,
+    lot_name: Optional[str] = None,
+    project_name: Optional[str] = None,
+
+    # Paginación y Orden
+    skip: int = 0,
+    limit: int = 50,
+    sort_by: str = 'sku',
+    ascending: bool = True
 ):
     """ 
-    Obtiene el reporte de stock detallado (por serie/lote).
-    Corresponde a la Pestaña 2 (db.get_stock_on_hand_filtered_sorted).
+    Obtiene el reporte de stock detallado PAGINADO.
     """
     if "reports.stock.view" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
     
-    # Adaptamos los filtros del frontend a los de la función de BD
     filters = { 
         "warehouse_id": warehouse_id, 
         "location_id": location_id,
         "sku": sku, 
         "product_name": product_name, 
-        "category_name": category_name 
+        "category_name": category_name,
+        # [NUEVO]
+        "location_name": location_name,
+        "lot_name": lot_name,
+        "project_name": project_name
     }
     filters = {k: v for k, v in filters.items() if v is not None and v != ""}
 
@@ -452,26 +519,53 @@ async def get_stock_detail_report(
         stock_data = await asyncio.to_thread(
             db.get_stock_on_hand_filtered_sorted, 
             company_id=company_id, 
-            filters=filters
+            filters=filters,
+            sort_by=sort_by,
+            ascending=ascending,
+            limit=limit,
+            offset=skip
         )
-        
-        # --- 🕵️‍♂️ INICIO DEL ESPÍA ---
-        if stock_data:
-            print(f"\n[DEBUG API] Primera fila cruda de DB: {dict(stock_data[0])}")
-            # Verificamos si las claves existen
-            row = dict(stock_data[0])
-            print(f"   -> Tiene 'lot_name'? {row.get('lot_name')}")
-            print(f"   -> Tiene 'project_name'? {row.get('project_name')}")
-        else:
-            print("\n[DEBUG API] La DB no devolvió resultados.")
-        # --- FIN DEL ESPÍA ---
-
         return [dict(row) for row in stock_data]
 
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al generar reporte detallado: {e}")
 
+@router.get("/stock-detail/count", response_model=int)
+async def get_stock_detail_count(
+    auth: AuthDependency,
+    company_id: int = Query(...),
+    warehouse_id: Optional[int] = None,
+    sku: Optional[str] = None,
+    product_name: Optional[str] = None,
+    category_name: Optional[str] = None,
+    location_id: Optional[int] = None,
+    # [NUEVO]
+    location_name: Optional[str] = None,
+    lot_name: Optional[str] = None,
+    project_name: Optional[str] = None
+):
+    if "reports.stock.view" not in auth.permissions:
+        raise HTTPException(status_code=403, detail="No autorizado")
+
+    filters = { 
+        "warehouse_id": warehouse_id, "location_id": location_id,
+        "sku": sku, "product_name": product_name, "category_name": category_name,
+        # [NUEVO]
+        "location_name": location_name,
+        "lot_name": lot_name,
+        "project_name": project_name
+    }
+    filters = {k: v for k, v in filters.items() if v is not None and v != ""}
+
+    try:
+        count = await asyncio.to_thread(
+            db.get_stock_on_hand_count, company_id, warehouse_id, filters
+        )
+        return count
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error al contar stock: {e}")
 
 # --- ENDPOINTS FALTANTES PARA EXPORTAR CSV ---
 
@@ -503,33 +597,39 @@ def _generate_csv_response(data: List[dict], headers_map: dict, filename: str) -
 async def export_stock_summary_csv(
     auth: AuthDependency,
     company_id: int = Query(...),
-    # Reutilizamos los mismos filtros que el reporte
     warehouse_id: Optional[int] = None,
+    location_id: Optional[int] = None, # Agregado
     sku: Optional[str] = None,
     product_name: Optional[str] = None,
-    category_name: Optional[str] = None
+    category_name: Optional[str] = None,
+    # [NUEVO] Filtro de texto
+    location_name: Optional[str] = None
 ):
     """ Exporta el reporte de stock resumido a CSV. """
     if "reports.stock.view" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
-    filters = { "warehouse_id": warehouse_id, "sku": sku, "product_name": product_name, "category_name": category_name }
+    filters = { 
+        "warehouse_id": warehouse_id, "location_id": location_id,
+        "sku": sku, "product_name": product_name, "category_name": category_name,
+        "location_name": location_name
+    }
     filters = {k: v for k, v in filters.items() if v is not None}
     
     try:
-        # 1. Obtener los datos (igual que el endpoint /stock-summary)
+        # 1. Obtener datos (Usamos la misma función del reporte, sin paginación)
         stock_data_raw = db.get_stock_summary_filtered_sorted(company_id=company_id, filters=filters)
         stock_data = [dict(row) for row in stock_data_raw]
 
-        # 2. Definir cabeceras (key_db: "Header CSV")
+        # 2. Headers
         headers_map = {
             'warehouse_name': "Almacen", 'location_name': "Ubicacion",
             'sku': "SKU", 'product_name': "Producto", 'category_name': "Categoria",
             'physical_quantity': "Fisico", 'reserved_quantity': "Reservado",
-            'available_quantity': "Disponible", 'uom_name': "UdM"
+            'available_quantity': "Disponible", 'uom_name': "UdM",
+            'notes': "Observaciones" # [AGREGADO]
         }
         
-        # 3. Generar y devolver CSV
         return _generate_csv_response(stock_data, headers_map, "stock_resumen.csv")
 
     except Exception as e:
@@ -540,38 +640,64 @@ async def export_stock_summary_csv(
 async def export_stock_detail_csv(
     auth: AuthDependency,
     company_id: int = Query(...),
-    # Reutilizamos los mismos filtros
     warehouse_id: Optional[int] = None,
+    location_id: Optional[int] = None,
     sku: Optional[str] = None,
     product_name: Optional[str] = None,
     category_name: Optional[str] = None,
-    location_id: Optional[int] = None
+    # Filtros de texto
+    location_name: Optional[str] = None,
+    lot_name: Optional[str] = None,
+    project_name: Optional[str] = None,
+    # [NUEVO] Flags de columnas dinámicas
+    include_series: bool = True,
+    include_project: bool = True
 ):
-    """ Exporta el reporte de stock detallado (Series/Lotes) a CSV. """
+    """ Exporta el reporte de stock detallado a CSV con columnas dinámicas. """
     if "reports.stock.view" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
-    filters = { "sku": sku, "product_name": product_name, "category_name": category_name, "location_id": location_id }
+    filters = { 
+        "sku": sku, "product_name": product_name, "category_name": category_name, 
+        "location_id": location_id, "warehouse_id": warehouse_id,
+        "location_name": location_name, "lot_name": lot_name, "project_name": project_name
+    }
     filters = {k: v for k, v in filters.items() if v is not None and v != ""}
     
     try:
-        # 1. Obtener los datos (igual que el endpoint /stock-detail)
+        # 1. Obtener datos
         stock_data_raw = db.get_stock_on_hand_filtered_sorted(
-            company_id=company_id, warehouse_id=warehouse_id, filters=filters
+            company_id=company_id, filters=filters
         )
         stock_data = [dict(row) for row in stock_data_raw]
 
-        # 2. Definir cabeceras
+        # 2. Construir Headers Dinámicos
+        # Definimos las columnas fijas
         headers_map = {
-            'warehouse_name': "Almacen", 'location_name': "Ubicacion",
-            'sku': "SKU", 'product_name': "Producto", 'category_name': "Categoria",
-            'lot_name': "Serie_Lote",
-            'physical_quantity': "Fisico", 'reserved_quantity': "Reservado",
-            'available_quantity': "Disponible", 'uom_name': "UdM"
+            'warehouse_name': "Almacen", 
+            'location_name': "Ubicacion",
+            'sku': "SKU", 
+            'product_name': "Producto", 
+            'category_name': "Categoria"
         }
+
+        # Agregamos dinámicamente según lo que pidió el frontend
+        if include_series:
+            headers_map['lot_name'] = "Serie_Lote"
         
-        # 3. Generar y devolver CSV
-        return _generate_csv_response(stock_data, headers_map, "stock_detalle_series.csv")
+        if include_project:
+            headers_map['project_name'] = "Obra"
+
+        # Agregamos las columnas numéricas finales
+        headers_map.update({
+            'physical_quantity': "Fisico", 
+            'reserved_quantity': "Reservado",
+            'available_quantity': "Disponible", 
+            'uom_name': "UdM",
+            'notes': "Observaciones"
+        })
+        
+        return _generate_csv_response(stock_data, headers_map, "stock_detalle.csv")
 
     except Exception as e:
         traceback.print_exc()
@@ -616,11 +742,22 @@ async def get_warehouses_kpi(
 ):
     """ Obtiene resumen de almacenes para el Hub de Inventario. """
     try:
-        data = await asyncio.to_thread(db.get_warehouses_kpi_summary, company_id)
+        # Obtenemos info del token (auth)
+        user_id = auth.user_id
+        role_name = auth.role_name # Asegúrate de que TokenData tenga este campo, o consúltalo
+        
+        # Si TokenData no tiene role_name, lo consultamos rápido:
+        if not hasattr(auth, 'role_name'):
+             user_data = await asyncio.to_thread(db.execute_query, 
+                "SELECT r.name FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id=%s", 
+                (user_id,), fetchone=True)
+             role_name = user_data['name'] if user_data else 'Usuario'
+
+        data = await asyncio.to_thread(db.get_warehouses_kpi_summary, company_id, user_id, role_name)
         return [dict(row) for row in data]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error obteniendo KPIs de almacenes: {e}")
-    
+
 @router.get("/chart/flow", response_model=List[schemas.FlowDataPoint])
 async def get_flow_chart_data(
     auth: AuthDependency,
@@ -636,3 +773,18 @@ async def get_flow_chart_data(
         return data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/filter-options", response_model=List[str])
+async def get_report_filter_options(
+    auth: AuthDependency,
+    field: str = Query(..., regex="^(location_name|category_name)$"),
+    company_id: int = Query(...),
+    warehouse_id: Optional[int] = None
+):
+    """ Devuelve lista de valores únicos para llenar dropdowns de filtro. """
+    try:
+        return await asyncio.to_thread(db.get_distinct_filter_values, company_id, field, warehouse_id)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error obteniendo opciones: {e}")
+

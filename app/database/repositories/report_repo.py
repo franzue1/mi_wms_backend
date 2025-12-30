@@ -436,33 +436,151 @@ def get_kardex_summary(company_id, date_from, date_to, product_filter=None, ware
 
 # --- STOCK SUMMARY (Reporte simple) ---
 
-def get_stock_summary_by_product(warehouse_id=None):
+def get_stock_summary_count(company_id, filters={}):
     """
-    Devuelve el stock total por producto, agrupando todas las series/lotes.
+    [CORREGIDO] Cuenta grupos de Productos + Ubicación.
+    Antes faltaba agrupar por Ubicación (l.id), por eso daba menos filas.
     """
     base_query = """
+    SELECT COUNT(*) as total FROM (
+        SELECT 1
+        FROM stock_quants sq
+        JOIN products p ON sq.product_id = p.id
+        JOIN locations l ON sq.location_id = l.id
+        JOIN warehouses w ON l.warehouse_id = w.id
+        LEFT JOIN product_categories pc ON p.category_id = pc.id
+        LEFT JOIN uom u ON p.uom_id = u.id
+        
+        WHERE l.type = 'internal' AND p.company_id = %s AND sq.quantity > 0.001
+    """
+    params = [company_id]
+    where_clauses = []
+
+    filter_map = {
+        'warehouse_name': 'w.name', 'location_name': 'l.name', 'sku': 'p.sku', 
+        'product_name': 'p.name', 'category_name': 'pc.name', 'uom_name': 'u.name',
+        'warehouse_id': 'w.id', 'location_id': 'l.id',
+        'notes': 'sq.notes'
+    }
+    
+    for key, value in filters.items():
+        db_column = filter_map.get(key)
+        if db_column and value is not None and value != "":
+            if key in ['warehouse_id', 'location_id']:
+                where_clauses.append(f"{db_column} = %s"); params.append(value)
+            else:
+                where_clauses.append(f"{db_column} ILIKE %s"); params.append(f"%{value}%")
+
+    if where_clauses:
+        base_query += " AND " + " AND ".join(where_clauses)
+
+    # [CORRECCIÓN CRÍTICA] Agregamos l.id y l.name al Group By
+    base_query += """
+    GROUP BY 
+        w.id, w.name, 
+        l.id, l.name, -- <--- ¡ESTO FALTABA!
+        p.id, p.sku, p.name, 
+        pc.id, pc.name, 
+        u.id, u.name
+    ) as subquery
+    """
+
+    res = execute_query(base_query, tuple(params), fetchone=True)
+    return res['total'] if res else 0
+
+def get_stock_summary_filtered_sorted(company_id, filters={}, sort_by='sku', ascending=True, limit=None, offset=None):
+    """ 
+    [ACTUALIZADO] Obtiene el stock resumen PAGINADO.
+    - Incluye 'MAX(sq.notes)' para mostrar la nota unificada en el resumen.
+    """
+    base_query = """
+    WITH ReservedStockSummary AS (
+        SELECT 
+            sm.product_id, sm.location_src_id,
+            SUM(sm.product_uom_qty) as reserved_qty
+        FROM stock_moves sm
+        JOIN pickings p ON sm.picking_id = p.id
+        WHERE p.state = 'listo' AND p.company_id = %s
+        GROUP BY sm.product_id, sm.location_src_id
+    )
     SELECT
-        p.sku, p.name as product_name, pc.name as category_name,
-        w.name as warehouse_name,
-        SUM(sq.quantity) as quantity,
+        p.id as product_id, 
+        w.id as warehouse_id, 
+        l.id as location_id, 
+        
+        p.sku, 
+        p.name as product_name, 
+        pc.name as category_name,
+        w.name as warehouse_name, 
+        l.name as location_name,
         u.name as uom_name,
-        -- Añadir IDs/columnas para agrupar
-        w.id, p.id, pc.id, u.id
+
+        -- [CORRECCIÓN] Recuperar la nota. 
+        -- Como unificamos notas por prod/loc, MAX devuelve la nota existente.
+        MAX(sq.notes) as notes,
+
+        SUM(sq.quantity) as physical_quantity,
+        COALESCE(MAX(rss.reserved_qty), 0) as reserved_quantity,
+        (SUM(sq.quantity) - COALESCE(MAX(rss.reserved_qty), 0)) as available_quantity
+
     FROM stock_quants sq
     JOIN products p ON sq.product_id = p.id
     JOIN locations l ON sq.location_id = l.id
     JOIN warehouses w ON l.warehouse_id = w.id
     LEFT JOIN product_categories pc ON p.category_id = pc.id
     LEFT JOIN uom u ON p.uom_id = u.id
-    WHERE sq.quantity > 0
+    LEFT JOIN ReservedStockSummary rss ON sq.product_id = rss.product_id AND sq.location_id = rss.location_src_id
+    
+    WHERE l.type = 'internal' AND p.company_id = %s AND sq.quantity > 0.001
     """
-    params = []
-    if warehouse_id:
-        base_query += " AND w.id = %s"
-        params.append(warehouse_id)
+    params = [company_id, company_id]
+    where_clauses = []
 
-    base_query += " GROUP BY w.id, w.name, p.id, p.sku, p.name, pc.id, pc.name, u.id, u.name"    
-    base_query += " ORDER BY w.name, p.name"
+    filter_map = {
+        'warehouse_name': 'w.name', 'location_name': 'l.name', 'sku': 'p.sku', 
+        'product_name': 'p.name', 'category_name': 'pc.name', 'uom_name': 'u.name',
+        'warehouse_id': 'w.id', 'location_id': 'l.id',
+        'notes': 'sq.notes' # Permitir filtrar por contenido de nota
+    }
+    for key, value in filters.items():
+        db_column = filter_map.get(key)
+        if db_column and value is not None and value != "":
+            if key in ['warehouse_id', 'location_id']:
+                where_clauses.append(f"{db_column} = %s"); params.append(value)
+            else:
+                where_clauses.append(f"{db_column} ILIKE %s"); params.append(f"%{value}%")
+
+    if where_clauses:
+        base_query += " AND " + " AND ".join(where_clauses)
+
+    base_query += """
+    GROUP BY 
+        p.id, p.sku, p.name, pc.id, pc.name, u.id, u.name, 
+        w.id, w.name, l.id, l.name
+    """
+
+    # Ordenamiento
+    sort_map = {
+        'warehouse_name': 'w.name', 'location_name': 'l.name', 'sku': 'p.sku',
+        'product_name': 'p.name', 'category_name': 'pc.name',
+        'physical_quantity': 'physical_quantity', 'reserved_quantity': 'reserved_quantity', 
+        'available_quantity': 'available_quantity'
+    }
+    order_by_col = sort_map.get(sort_by, 'p.sku')
+    direction = "ASC" if ascending else "DESC"
+    
+    if order_by_col in ['pc.name', 'u.name', 'l.name']:
+         order_by_clause = f"COALESCE({order_by_col}, 'zzzz')"
+    else:
+         order_by_clause = order_by_col
+         
+    base_query += f" ORDER BY {order_by_clause} {direction}"
+    
+    # Paginación
+    if limit is not None:
+        base_query += " LIMIT %s OFFSET %s"
+        params.extend([limit, offset])
+    
     return execute_query(base_query, tuple(params), fetchall=True)
 
 def get_full_product_kardex_data(company_id, date_from, date_to, warehouse_id=None, product_filter=None):
@@ -762,11 +880,23 @@ def get_project_kardex(company_id, project_id):
         "consumed": [dict(r) for r in consumed]
     }
 
-def get_warehouses_kpi_summary(company_id):
+def get_warehouses_kpi_summary(company_id, user_id, role_name):
     """
-    Obtiene lista de almacenes con KPIs (Valorizado Total y Cantidad de SKUs distintos con stock).
+    Obtiene lista de almacenes con KPIs, FILTRADA por permisos de usuario.
     """
-    query = """
+    params = [company_id]
+    perm_clause = ""
+
+    # Si NO es Administrador, aplicar filtro de lista blanca
+    if role_name != 'Administrador':
+        perm_clause = """
+            AND w.id IN (
+                SELECT warehouse_id FROM user_warehouses WHERE user_id = %s
+            )
+        """
+        params.append(user_id)
+
+    query = f"""
         SELECT 
             w.id, w.name, wc.name as category,
             COUNT(DISTINCT sq.product_id) as items_count,
@@ -776,17 +906,67 @@ def get_warehouses_kpi_summary(company_id):
         LEFT JOIN locations l ON w.id = l.warehouse_id AND l.type = 'internal'
         LEFT JOIN stock_quants sq ON l.id = sq.location_id AND sq.quantity > 0
         LEFT JOIN products p ON sq.product_id = p.id
-        WHERE w.company_id = %s AND w.status = 'activo'
+        WHERE w.company_id = %s AND w.status = 'activo' {perm_clause}
         GROUP BY w.id, w.name, wc.name
         ORDER BY wc.name, w.name
     """
-    results = execute_query(query, (company_id,), fetchall=True)
+    
+    results = execute_query(query, tuple(params), fetchall=True)
     return results
 
-def get_stock_on_hand_filtered_sorted(company_id, warehouse_id=None, filters={}, sort_by='product_name', ascending=True):
+def get_stock_on_hand_count(company_id, warehouse_id=None, filters={}):
+    """
+    [CORREGIDO] Cuenta grupos únicos (agrupando quants fragmentados).
+    """
+    base_query = """
+    SELECT COUNT(*) as total FROM (
+        SELECT 1
+        FROM stock_quants sq
+        JOIN products p ON sq.product_id = p.id
+        JOIN locations l ON sq.location_id = l.id
+        JOIN warehouses w ON l.warehouse_id = w.id
+        LEFT JOIN product_categories pc ON p.category_id = pc.id
+        LEFT JOIN stock_lots sl ON sq.lot_id = sl.id
+        LEFT JOIN projects proj ON sq.project_id = proj.id
+        WHERE l.type = 'internal' AND p.company_id = %s AND sq.quantity > 0.001
+    """
+    
+    params = [company_id]
+    where_clauses = []
+
+    filter_map = {
+        'warehouse_name': 'w.name','location_name': 'l.name', 'sku': 'p.sku', 'product_name': 'p.name',
+        'category_name': 'pc.name', 'lot_name': 'sl.name', 'uom_name': 'u.name',
+        'warehouse_id': 'w.id', 'location_id': 'l.id', 
+        'project_name': 'proj.name'
+    }
+    
+    for key, value in filters.items():
+        db_column = filter_map.get(key)
+        if db_column and value is not None and value != "":
+            if key in ['warehouse_id', 'location_id']:
+                where_clauses.append(f"{db_column} = %s"); params.append(value)
+            elif key == 'lot_name' and value == '-':
+                where_clauses.append("sl.id IS NULL")
+            else:
+                where_clauses.append(f"{db_column} ILIKE %s"); params.append(f"%{value}%")
+
+    if where_clauses:
+        base_query += " AND " + " AND ".join(where_clauses)
+
+    # [CLAVE] Agrupar por todo lo que define una fila única en el detalle
+    base_query += """
+        GROUP BY p.id, l.id, sl.id, proj.id
+    ) as subquery
+    """
+
+    res = execute_query(base_query, tuple(params), fetchone=True)
+    return res['total'] if res else 0
+
+def get_stock_on_hand_filtered_sorted(company_id, warehouse_id=None, filters={}, sort_by='sku', ascending=True, limit=None, offset=None):
     """ 
     Obtiene el stock detallado por lote/serie y PROYECTO.
-    [CORREGIDO] Ahora incluye la columna 'sq.notes' para que las notas persistan al recargar.
+    [CORREGIDO] Agrupa (SUM) los quants fragmentados para evitar duplicados visuales.
     """
     base_query = """
     WITH ReservedStock AS (
@@ -823,13 +1003,19 @@ def get_stock_on_hand_filtered_sorted(company_id, warehouse_id=None, filters={},
         sl.name as lot_name,
         proj.name as project_name,
         
-        sq.quantity as physical_quantity, 
+        -- [CAMBIO] Sumamos la cantidad física
+        SUM(sq.quantity) as physical_quantity, 
         u.name as uom_name,
 
-        sq.notes, 
+        -- [CAMBIO] Unificamos notas
+        MAX(sq.notes) as notes, 
         
-        COALESCE(rs.reserved_qty, 0) as reserved_quantity,
-        (sq.quantity - COALESCE(rs.reserved_qty, 0)) as available_quantity,
+        -- Reservas (usamos MAX o SUM dependiendo de la lógica, aquí SUM de la CTE agrupada externa es complejo, 
+        -- pero como ya agrupamos la CTE por las mismas claves, un MAX es seguro o un SUM si hubiera multiples matches, 
+        -- pero el LEFT JOIN es 1:1 gracias al GROUP BY de abajo)
+        COALESCE(MAX(rs.reserved_qty), 0) as reserved_quantity,
+        
+        (SUM(sq.quantity) - COALESCE(MAX(rs.reserved_qty), 0)) as available_quantity,
         
         COALESCE(sl.name, '---') as lot_name_ordered
         
@@ -862,7 +1048,7 @@ def get_stock_on_hand_filtered_sorted(company_id, warehouse_id=None, filters={},
         'warehouse_name': 'w.name','location_name': 'l.name', 'sku': 'p.sku', 'product_name': 'p.name',
         'category_name': 'pc.name', 'lot_name': 'sl.name', 'uom_name': 'u.name',
         'warehouse_id': 'w.id', 'location_id': 'l.id', 
-        'project_name': 'proj.name'
+        'project_name': 'proj.name', 'location_name': 'l.name'
     }
     
     for key, value in filters.items():
@@ -877,6 +1063,14 @@ def get_stock_on_hand_filtered_sorted(company_id, warehouse_id=None, filters={},
 
     if where_clauses:
         base_query += " AND " + " AND ".join(where_clauses)
+
+    # [CLAVE] Agregamos el GROUP BY para fusionar filas fragmentadas
+    base_query += """
+    GROUP BY 
+        p.id, w.id, l.id, sl.id, sq.project_id,
+        p.sku, p.name, pc.name, w.name, l.name, 
+        sl.name, proj.name, u.name, lot_name_ordered
+    """
 
     sort_map = {
         'warehouse_name': 'w.name', 'location_name': 'l.name', 'sku': 'p.sku',
@@ -895,6 +1089,11 @@ def get_stock_on_hand_filtered_sorted(company_id, warehouse_id=None, filters={},
          order_by_clause = order_by_col
          
     base_query += f" ORDER BY {order_by_clause} {direction}, p.sku ASC, lot_name_ordered ASC"
+    
+    # --- PAGINACIÓN ---
+    if limit is not None:
+        base_query += " LIMIT %s OFFSET %s"
+        params.extend([limit, offset])
     
     return execute_query(base_query, tuple(params), fetchall=True)
 
@@ -1267,3 +1466,36 @@ def get_reverse_logistics_rate(company_id):
     # Evitar división por cero
     rate = (val_ret / val_out * 100) if val_out > 0 else 0.0
     return rate
+
+def get_distinct_filter_values(company_id, field, warehouse_id=None):
+    """
+    Obtiene valores únicos para los filtros de dropdown (Ubicación, Categoría).
+    Solo devuelve valores que realmente tienen stock > 0.
+    """
+    column_map = {
+        'location_name': 'l.name',
+        'category_name': 'pc.name'
+    }
+    
+    db_col = column_map.get(field)
+    if not db_col: return []
+
+    query = f"""
+        SELECT DISTINCT {db_col} as value
+        FROM stock_quants sq
+        JOIN locations l ON sq.location_id = l.id
+        JOIN products p ON sq.product_id = p.id
+        LEFT JOIN product_categories pc ON p.category_id = pc.id
+        WHERE l.type = 'internal' AND p.company_id = %s AND sq.quantity > 0.001
+    """
+    params = [company_id]
+
+    if warehouse_id:
+        query += " AND l.warehouse_id = %s"
+        params.append(warehouse_id)
+    
+    query += f" ORDER BY {db_col}"
+    
+    res = execute_query(query, tuple(params), fetchall=True)
+    return [r['value'] for r in res if r['value']]
+
