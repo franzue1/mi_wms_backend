@@ -880,6 +880,7 @@ def get_project_kardex(company_id, project_id):
         "consumed": [dict(r) for r in consumed]
     }
 
+
 def get_warehouses_kpi_summary(company_id, user_id, role_name):
     """
     Obtiene lista de almacenes con KPIs, FILTRADA por permisos de usuario.

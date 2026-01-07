@@ -76,22 +76,19 @@ def create_schema(conn):
             company_id INTEGER NOT NULL REFERENCES companies(id),
             macro_project_id INTEGER REFERENCES macro_projects(id),
             name TEXT NOT NULL, 
-            code TEXT,
-            address TEXT, 
             
-            -- Ubigeo
-            department TEXT,
-            province TEXT,
-            district TEXT,
+            -- [CAMBIO] Agregamos NOT NULL para obligar a tener PEP
+            code TEXT NOT NULL, 
             
-            -- Gestión
-            start_date DATE,
-            end_date DATE,
+            address TEXT,
+            department TEXT, province TEXT, district TEXT,
+            start_date DATE, end_date DATE,
             status TEXT DEFAULT 'active',
             phase TEXT DEFAULT 'Sin Iniciar',
             budget REAL DEFAULT 0,
             
-            UNIQUE(company_id, name)
+            -- Restricción de unicidad compuesta
+            UNIQUE(macro_project_id, code)
         );
     """)
 
@@ -327,8 +324,6 @@ def create_schema(conn):
     conn.commit()
     print("Esquema V3 (Optimizado) verificado exitosamente.")
 
-
-# <--- 2. AGREGA ESTA FUNCIÓN HELPER ANTES DE create_initial_data --->
 def hash_password(password):
     """Genera un hash SHA-256 para la contraseña (Helper local para seed data)."""
     return hashlib.sha256(password.encode('utf-8')).hexdigest()
@@ -405,7 +400,7 @@ def create_initial_data(conn):
         cursor.execute("""
             INSERT INTO projects (company_id, macro_project_id, name, code, phase, status) 
             VALUES (%s, %s, %s, %s, %s, 'active')
-            ON CONFLICT (company_id, name) DO UPDATE SET phase = EXCLUDED.phase
+            ON CONFLICT (macro_project_id, code) DO NOTHING -- [CAMBIO] Conflicto por PEP
         """, (default_company_id, macro_id, p_name, p_code, p_phase))
 
 

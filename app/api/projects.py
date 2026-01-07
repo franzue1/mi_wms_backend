@@ -144,10 +144,20 @@ def get_projects(
     search: Optional[str] = None,
     direction_id: Optional[int] = None,
     management_id: Optional[int] = None,
+    
+    # [NUEVOS PARÁMETROS PARA FILTROS]
+    f_code: Optional[str] = None,
+    f_macro: Optional[str] = None,
+    f_dept: Optional[str] = None,
+    f_prov: Optional[str] = None,
+    f_dist: Optional[str] = None,
+    f_dir: Optional[str] = None,  # <--- Nuevo param
+    f_mgmt: Optional[str] = None, # <--- Nuevo param
+
     limit: int = 100,
     skip: int = 0,
-    sort_by: Optional[str] = None,   # <--- Nuevo
-    ascending: bool = True           # <--- Nuevo
+    sort_by: Optional[str] = None,
+    ascending: bool = True
 ):
     verify_access(auth, company_id)
     return [dict(r) for r in db.get_projects(
@@ -155,11 +165,21 @@ def get_projects(
         status=status, 
         search=search, 
         direction_id=direction_id, 
-        management_id=management_id, 
+        management_id=management_id,
+        
+        # Pasamos los filtros al repo
+        filter_code=f_code,
+        filter_macro=f_macro,
+        filter_dept=f_dept,
+        filter_prov=f_prov,
+        filter_dist=f_dist,
+        filter_direction=f_dir,
+        filter_management=f_mgmt,
+
         limit=limit, 
         offset=skip,
-        sort_by=sort_by,       # <---
-        ascending=ascending    # <---
+        sort_by=sort_by,
+        ascending=ascending
     )]
 
 @router.get("/count", response_model=int)
@@ -169,10 +189,29 @@ def get_projects_count(
     status: Optional[str] = None,
     search: Optional[str] = None,
     direction_id: Optional[int] = None,
-    management_id: Optional[int] = None
+    management_id: Optional[int] = None,
+    
+    # [NUEVO] Recibir los filtros granulares
+    f_code: Optional[str] = None,
+    f_macro: Optional[str] = None,
+    f_dept: Optional[str] = None,
+    f_prov: Optional[str] = None,
+    f_dist: Optional[str] = None
 ):
     verify_access(auth, company_id)
-    return db.get_projects_count(company_id, status, search, direction_id, management_id)
+    return db.get_projects_count(
+        company_id, 
+        status, 
+        search, 
+        direction_id, 
+        management_id,
+        # Pasar al repo
+        filter_code=f_code,
+        filter_macro=f_macro,
+        filter_dept=f_dept,
+        filter_prov=f_prov,
+        filter_dist=f_dist
+    )
 
 @router.post("/", status_code=201)
 def create_project(auth: AuthDependency, project: schemas.ProjectCreate, company_id: int = Query(...)):
@@ -219,10 +258,7 @@ def delete_project(auth: AuthDependency, project_id: int):
 # --- IMPORTAR / EXPORTAR ---
 
 @router.get("/export/csv", response_class=StreamingResponse)
-async def export_projects_csv(
-    auth: AuthDependency,
-    company_id: int = Query(...)
-):
+async def export_projects_csv(auth: AuthDependency,company_id: int = Query(...)):
     verify_access(auth, company_id)
     
     try:
@@ -272,6 +308,143 @@ async def export_projects_csv(
         
     except Exception as e:
         raise HTTPException(500, detail=f"Error exportando: {e}")
+
+@router.get("/hierarchy/export-flat", response_class=StreamingResponse)
+async def export_hierarchy_flat(
+    auth: AuthDependency,
+    company_id: int = Query(...)
+):
+    """
+    Genera un CSV plano con la estructura completa.
+    [CORRECCIÓN DEFINITIVA] Usamos lineterminator='\n' para evitar el doble salto de línea
+    que genera filas en blanco en Excel/Windows.
+    """
+    verify_access(auth, company_id)
+    
+    try:
+        # 1. Obtener datos
+        hierarchy_data = db.get_hierarchy_flat(company_id)
+        
+        # 2. Generar CSV
+        output = io.StringIO(newline='') 
+        
+        # [TRUCO] Forzamos '\n'. 
+        # Si usáramos el default, en algunos entornos se convierte en \r\r\n (doble salto).
+        # Al usar '\n', Excel lo lee bien y evitamos el salto extra.
+        writer = csv.writer(output, delimiter=';', lineterminator='\n') 
+        
+        # Headers
+        headers = [
+            "Dirección", "Cód. Dir", 
+            "Gerencia", "Cód. Ger", 
+            "Proyecto (Macro)", "Cód. Proy", "Centro de Costo"
+        ]
+        writer.writerow(headers)
+        
+        # Rows (con limpieza de datos para evitar saltos ocultos dentro del texto)
+        for row in hierarchy_data:
+            def clean(val):
+                # .strip() elimina espacios y saltos de línea (\n) al inicio/final del dato
+                return str(val).strip() if val else ""
+
+            writer.writerow([
+                clean(row.get('dir_name')),
+                clean(row.get('dir_code')),
+                clean(row.get('mgmt_name')),
+                clean(row.get('mgmt_code')),
+                clean(row.get('macro_name')),
+                clean(row.get('macro_code')),
+                clean(row.get('cost_center'))
+            ])
+            
+        output.seek(0)
+        
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=jerarquia_proyectos.csv"}
+        )
+        
+    except Exception as e:
+        print(f"Error exportando jerarquía: {e}")
+        raise HTTPException(500, detail=f"Error exportando: {str(e)}")
+
+@router.post("/hierarchy/import-flat", response_model=dict)
+async def import_hierarchy_flat(
+    auth: AuthDependency,
+    company_id: int = Query(...),
+    file: UploadFile = File(...)
+):
+    """
+    Importa una estructura jerárquica desde un CSV plano.
+    Columnas esperadas: 
+    'Dirección', 'Cód. Dir', 'Gerencia', 'Cód. Ger', 'Proyecto (Macro)', 'Cód. Proy', 'Centro de Costo'
+    """
+    verify_access(auth, company_id)
+    
+    try:
+        content = await file.read()
+        decoded = content.decode('utf-8-sig')
+        
+        # Detectar delimitador
+        first_line = decoded.split('\n')[0]
+        delimiter = ';' if ';' in first_line else ','
+        
+        reader = csv.DictReader(io.StringIO(decoded), delimiter=delimiter)
+        
+        # Normalizar headers (quitar tildes, espacios, lower)
+        # Mapeo flexible para que el usuario no sufra con nombres exactos
+        def normalize_header(h):
+            return h.lower().replace('ó', 'o').replace('é', 'e').replace('.', '').strip()
+            
+        header_map = {normalize_header(h): h for h in reader.fieldnames or []}
+        
+        # Mapeo de nuestras claves internas a las columnas del CSV
+        # Clave Interna : Posibles nombres en el CSV
+        key_mapping = {
+            'dir_name': ['direccion', 'direction', 'area'],
+            'dir_code': ['cod dir', 'cod direccion', 'codigo direccion'],
+            'mgmt_name': ['gerencia', 'management', 'departamento'],
+            'mgmt_code': ['cod ger', 'cod gerencia', 'codigo gerencia'],
+            'macro_name': ['proyecto (macro)', 'proyecto', 'macro', 'project'],
+            'macro_code': ['cod proy', 'cod proyecto', 'codigo proyecto'],
+            'cost_center': ['centro de costo', 'centro costo', 'ceco', 'cc']
+        }
+        
+        rows_to_process = []
+        
+        for row in reader:
+            clean_row = {}
+            for internal_key, possible_names in key_mapping.items():
+                # Buscar cuál columna del CSV coincide con esta clave
+                csv_col = next((header_map.get(poss) for poss in possible_names if poss in header_map), None)
+                if csv_col:
+                    clean_row[internal_key] = row.get(csv_col, "").strip()
+                else:
+                    clean_row[internal_key] = "" # Si no existe columna, vacío
+            
+            # Solo agregar si al menos tiene Dirección (es la raíz obligatoria)
+            if clean_row.get('dir_name'):
+                rows_to_process.append(clean_row)
+                
+        if not rows_to_process:
+            raise ValueError("No se encontraron filas válidas con al menos una 'Dirección'.")
+
+        # Llamar al repo
+        stats = db.import_hierarchy_batch(company_id, rows_to_process)
+        
+        return {
+            "message": "Importación completada con éxito",
+            "stats": stats
+        }
+
+    except ValueError as ve:
+        # [CORRECCIÓN] Capturamos los errores de validación del repo y devolvemos 400
+        raise HTTPException(status_code=400, detail=str(ve))
+        
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error crítico en importación: {str(e)}")
 
 @router.post("/import/csv", response_model=dict)
 async def import_projects_csv(
@@ -337,15 +510,28 @@ async def import_projects_csv(
                     if not any(row.values()): continue 
                     raise ValueError("El campo 'name' es obligatorio.")
 
+                # [MEJORA] Validación Estricta del Código PEP antes de ir al DB
+                code_val = get_val('code')
+                if not code_val:
+                    raise ValueError(f"El Código PEP es obligatorio para la obra '{name}'.")
+                
+                # Validar caracteres prohibidos en el Excel (para consistencia con el Frontend)
+                import re
+                if not re.match(r"^[a-zA-Z0-9_./-]*$", code_val):
+                     raise ValueError(f"El Código PEP '{code_val}' contiene caracteres inválidos. Solo use letras, números, guiones, puntos o barras.")
+
                 # 2. Validar Proyecto (Macro)
                 macro_name_raw = get_val('macro_name') or get_val('proyecto')
                 macro_id = None
                 
-                if macro_name_raw:
-                    macro_clean = macro_name_raw.strip().upper()
-                    if macro_clean not in macros_map:
-                        raise ValueError(f"El Proyecto '{macro_name_raw}' NO EXISTE.")
-                    macro_id = macros_map[macro_clean]
+                if not macro_name_raw:
+                    raise ValueError(f"El campo 'Proyecto' (Macro) es obligatorio para la obra '{name}'.")
+                
+                macro_clean = macro_name_raw.strip().upper()
+                if macro_clean not in macros_map:
+                    raise ValueError(f"El Proyecto '{macro_name_raw}' NO EXISTE en el sistema. Créelo primero.")
+                
+                macro_id = macros_map[macro_clean]
 
                 # 3. Validar y Parsear Fechas (CRÍTICO: Devuelve None o String válido)
                 final_start = parse_date_strict(get_val('start_date'), 'start_date')
