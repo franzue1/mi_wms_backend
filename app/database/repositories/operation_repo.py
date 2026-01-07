@@ -233,10 +233,43 @@ def return_picking_to_draft(picking_id):
         if conn: return_db_connection(conn)
 
 def get_next_picking_name(picking_type_id):
-    pt = execute_query("SELECT wt.code as wh_code, pt.code as pt_code FROM picking_types pt JOIN warehouses wt ON pt.warehouse_id = wt.id WHERE pt.id = %s", (picking_type_id,), fetchone=True)
+    """
+    [BLINDADO v2] Genera el siguiente nombre de albarán.
+    Usa MAX(ID) en lugar de COUNT(*) para evitar colisiones por huecos.
+    Incluye bucle de seguridad.
+    """
+    # 1. Obtener Prefijo
+    pt = execute_query(
+        "SELECT wt.code as wh_code, pt.code as pt_code FROM picking_types pt JOIN warehouses wt ON pt.warehouse_id = wt.id WHERE pt.id = %s", 
+        (picking_type_id,), fetchone=True
+    )
     prefix = f"{pt['wh_code']}/{pt['pt_code']}/"
-    count = execute_query("SELECT COUNT(*) FROM pickings WHERE name LIKE %s", (f"{prefix}%",), fetchone=True)[0]
-    return f"{prefix}{str(count + 1).zfill(5)}"
+    
+    # 2. Buscar el último nombre REAL usado en la base de datos
+    # (Ignoramos COUNT, buscamos el string más alto o el último insertado)
+    last_res = execute_query(
+        "SELECT name FROM pickings WHERE name LIKE %s ORDER BY id DESC LIMIT 1", 
+        (f"{prefix}%",), fetchone=True
+    )
+    
+    current_sequence = 0
+    if last_res:
+        try:
+            # Extraer "00129" -> 129
+            current_sequence = int(last_res['name'].split('/')[-1])
+        except ValueError:
+            pass
+
+    # 3. Bucle de Seguridad (Collision Check)
+    # Incrementamos y verificamos disponibilidad
+    while True:
+        current_sequence += 1
+        new_name = f"{prefix}{str(current_sequence).zfill(5)}"
+        
+        # Verificación rápida de existencia
+        exists = execute_query("SELECT 1 FROM pickings WHERE name = %s", (new_name,), fetchone=True)
+        if not exists:
+            return new_name
 
 def get_next_remission_number():
     res = execute_query("SELECT remission_number FROM pickings WHERE remission_number IS NOT NULL ORDER BY remission_number DESC LIMIT 1", fetchone=True)
@@ -1136,31 +1169,48 @@ def get_adjustments(company_id):
     return execute_query(query, (company_id,), fetchall=True)
 
 def create_draft_adjustment(company_id, user_name):
-    """Crea un picking ADJ vacío."""
+    """
+    Crea un picking ADJ vacío.
+    [BLINDADO v2] Usa lógica MAX(ID) + Bucle.
+    """
     try:
         conn = get_db_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-            cursor.execute("SELECT id FROM picking_types WHERE code='ADJ' AND company_id=%s", (company_id,))
+            cursor.execute("SELECT id FROM picking_types WHERE code='ADJ' AND company_id=%s LIMIT 1", (company_id,))
             pt = cursor.fetchone()
-            cursor.execute("SELECT id FROM locations WHERE category='AJUSTE' AND company_id=%s", (company_id,))
+            cursor.execute("SELECT id FROM locations WHERE category='AJUSTE' AND company_id=%s LIMIT 1", (company_id,))
             loc = cursor.fetchone()
             
             if not pt or not loc: return None
             
-            # Helper name (sin helper de conexión, usamos cursor manual si queremos, o llamamos a la función get_next...)
-            # Para simplificar, usamos la logica aqui:
+            # --- GENERACIÓN DE NOMBRE SEGURA ---
             cursor.execute("SELECT wt.code FROM picking_types pt JOIN warehouses wt ON pt.warehouse_id = wt.id WHERE pt.id = %s", (pt['id'],))
             wh_code = cursor.fetchone()['code']
             prefix = f"{wh_code}/ADJ/"
-            cursor.execute("SELECT COUNT(*) FROM pickings WHERE name LIKE %s", (f"{prefix}%",))
-            count = cursor.fetchone()[0]
-            name = f"{prefix}{str(count + 1).zfill(5)}"
+            
+            # 1. Buscar último usado
+            cursor.execute("SELECT name FROM pickings WHERE name LIKE %s ORDER BY id DESC LIMIT 1", (f"{prefix}%",))
+            last_res = cursor.fetchone()
+            
+            current_seq = 0
+            if last_res:
+                try: current_seq = int(last_res['name'].split('/')[-1])
+                except: pass
+            
+            # 2. Bucle de Seguridad
+            while True:
+                current_seq += 1
+                new_name = f"{prefix}{str(current_seq).zfill(5)}"
+                cursor.execute("SELECT 1 FROM pickings WHERE name = %s", (new_name,))
+                if not cursor.fetchone():
+                    break
+            # -----------------------------------
             
             s_date = datetime.now()
             cursor.execute("""
                 INSERT INTO pickings (company_id, name, picking_type_id, location_src_id, location_dest_id, scheduled_date, state, responsible_user, custom_operation_type) 
                 VALUES (%s, %s, %s, %s, %s, %s, 'draft', %s, 'Ajuste de Inventario') RETURNING id
-            """, (company_id, name, pt['id'], loc['id'], loc['id'], s_date, user_name))
+            """, (company_id, new_name, pt['id'], loc['id'], loc['id'], s_date, user_name))
             
             new_id = cursor.fetchone()[0]
             conn.commit()
@@ -1529,27 +1579,21 @@ def get_project_id_by_name(project_name, company_id):
 def create_full_picking_transaction(data: dict):
     """
     [LAZY CREATION] Crea cabecera y líneas en una sola transacción atómica.
-    Si algo falla, no se guarda nada (evita huecos de numeración).
+    [BLINDADO v2] Usa lógica MAX(ID) + Bucle.
     """
     conn = None
     try:
         conn = get_db_connection()
-        # Usamos cursor normal para control manual de commit/rollback
         cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
         
         print("[DB TRANSACTION] Iniciando creación masiva de Albarán...")
 
-        # 1. Obtener configuración del tipo de picking (Defaults)
-        cursor.execute(
-            "SELECT * FROM picking_types WHERE id = %s", 
-            (data['picking_type_id'],)
-        )
+        # 1. Configuración Defaults
+        cursor.execute("SELECT * FROM picking_types WHERE id = %s", (data['picking_type_id'],))
         pt = cursor.fetchone()
         if not pt: raise ValueError("Tipo de operación no válido.")
 
-        # 2. Calcular Nombre (Secuencia)
-        # NOTA: Al hacerlo dentro de la transacción, reducimos riesgo de colisión,
-        # pero idealmente esto debería ser una secuencia de BD. Por ahora mantenemos tu lógica.
+        # --- GENERACIÓN DE NOMBRE SEGURA ---
         wh_id = pt['warehouse_id']
         cursor.execute(
             "SELECT wt.code as wh_code, pt.code as pt_code FROM picking_types pt JOIN warehouses wt ON pt.warehouse_id = wt.id WHERE pt.id = %s", 
@@ -1558,12 +1602,25 @@ def create_full_picking_transaction(data: dict):
         codes = cursor.fetchone()
         prefix = f"{codes['wh_code']}/{codes['pt_code']}/"
         
-        cursor.execute("SELECT COUNT(*) FROM pickings WHERE name LIKE %s", (f"{prefix}%",))
-        count = cursor.fetchone()[0]
-        new_name = f"{prefix}{str(count + 1).zfill(5)}"
+        # Buscar último
+        cursor.execute("SELECT name FROM pickings WHERE name LIKE %s ORDER BY id DESC LIMIT 1", (f"{prefix}%",))
+        last_res = cursor.fetchone()
+        
+        current_seq = 0
+        if last_res:
+            try: current_seq = int(last_res['name'].split('/')[-1])
+            except: pass
 
-        # 3. Determinar Ubicaciones Finales
-        # Si la UI mandó ubicación, úsala. Si no, usa el default del tipo.
+        # Bucle de Seguridad
+        while True:
+            current_seq += 1
+            new_name = f"{prefix}{str(current_seq).zfill(5)}"
+            cursor.execute("SELECT 1 FROM pickings WHERE name = %s", (new_name,))
+            if not cursor.fetchone():
+                break
+        # -----------------------------------
+
+        # 3. Ubicaciones
         final_src = data.get('location_src_id') or pt['default_location_src_id']
         final_dest = data.get('location_dest_id') or pt['default_location_dest_id']
 
@@ -1588,12 +1645,9 @@ def create_full_picking_transaction(data: dict):
         ))
         new_picking_id = cursor.fetchone()[0]
 
-        # 5. Insertar Líneas (Bucle eficiente)
+        # 5. Insertar Líneas
         if data.get('moves'):
-            moves_values = []
-            # Preparamos los valores para un executemany o inserción individual
             for m in data['moves']:
-                # Validar datos básicos
                 qty = float(m['quantity'])
                 if qty <= 0: continue 
                 
@@ -1609,9 +1663,8 @@ def create_full_picking_transaction(data: dict):
                     data.get('partner_id'), data.get('project_id')
                 ))
 
-        # 6. Confirmar todo (COMMIT)
         conn.commit()
-        print(f"[DB TRANSACTION] Éxito. Creado ID {new_picking_id}")
+        print(f"[DB TRANSACTION] Éxito. Creado ID {new_picking_id} Name {new_name}")
         return new_picking_id
 
     except Exception as e:
@@ -1748,8 +1801,9 @@ def get_adjustments_for_export(company_id):
 
 def import_smart_adjustments_transaction(company_id, user_name, rows):
     """
-    [LÓGICA INTELIGENTE v3 - DEBUG] Importa ajustes masivos.
-    Soporta Series (qty=1) y Lotes (qty=total).
+    [LÓGICA INTELIGENTE v6 - SECUENCIA MATEMÁTICA] 
+    Calcula el máximo ID existente una sola vez y proyecta los nuevos IDs en memoria.
+    Esto evita huecos (1, 3, 5) causados por falsos positivos en consultas DB repetitivas.
     """
     conn = None
     try:
@@ -1766,6 +1820,11 @@ def import_smart_adjustments_transaction(company_id, user_name, rows):
         if not loc_virtual: raise ValueError("No existe ubicación virtual 'AJUSTE'.")
         virtual_id = loc_virtual['id']
 
+        # Obtener prefijo del almacén
+        cursor.execute("SELECT wt.code FROM warehouses wt WHERE id = %s", (pt['warehouse_id'],))
+        wh_code = cursor.fetchone()['code']
+        prefix = f"{wh_code}/ADJ/"
+
         # 2. Agrupar filas
         from collections import defaultdict
         grouped_rows = defaultdict(list)
@@ -1773,6 +1832,30 @@ def import_smart_adjustments_transaction(company_id, user_name, rows):
         for i, row in enumerate(rows):
             ref = row.get('referencia') or f"IMP-{datetime.now().strftime('%Y%m%d-%H%M')}"
             grouped_rows[ref].append({'data': row, 'line': i + 2})
+
+        # --- CÁLCULO DE SECUENCIA MAESTRA ---
+        # Buscamos el número más alto usado actualmente en la BD para ese prefijo
+        cursor.execute(
+            "SELECT name FROM pickings WHERE name LIKE %s", 
+            (f"{prefix}%",)
+        )
+        existing_names = cursor.fetchall()
+        
+        max_sequence = 0
+        for row in existing_names:
+            try:
+                # Extraemos el número final: "PRI/ADJ/00033" -> 33
+                name_str = row[0]
+                num_part = int(name_str.split('/')[-1])
+                if num_part > max_sequence:
+                    max_sequence = num_part
+            except (ValueError, IndexError):
+                continue
+        
+        # Inicializamos el contador local en el máximo encontrado
+        current_sequence_counter = max_sequence
+        print(f"[IMPORT] Secuencia inicial detectada: {current_sequence_counter}")
+        # ------------------------------------
 
         total_created = 0
         
@@ -1785,13 +1868,10 @@ def import_smart_adjustments_transaction(company_id, user_name, rows):
             
             notes = first_row.get('notas', '')
 
-            # Generar nombre
-            cursor.execute("SELECT wt.code FROM warehouses wt WHERE id = %s", (pt['warehouse_id'],))
-            wh_code = cursor.fetchone()['code']
-            prefix = f"{wh_code}/ADJ/"
-            cursor.execute("SELECT COUNT(*) FROM pickings WHERE name LIKE %s", (f"{prefix}%",))
-            count = cursor.fetchone()[0]
-            new_name = f"{prefix}{str(count + 1 + total_created).zfill(5)}"
+            # --- ASIGNACIÓN DE NOMBRE (EN MEMORIA) ---
+            current_sequence_counter += 1
+            new_name = f"{prefix}{str(current_sequence_counter).zfill(5)}"
+            # -----------------------------------------
 
             # Crear Cabecera
             cursor.execute("""
@@ -1804,7 +1884,6 @@ def import_smart_adjustments_transaction(company_id, user_name, rows):
             """, (company_id, new_name, pt['id'], user_name, reason, notes, virtual_id, virtual_id))
             
             picking_id = cursor.fetchone()[0]
-            print(f"[IMPORT] Creado Ajuste ID: {picking_id} - Ref: {ref}")
             
             # Procesar Líneas
             for line_info in lines:
@@ -1813,8 +1892,6 @@ def import_smart_adjustments_transaction(company_id, user_name, rows):
                 qty_str = row.get('cantidad')
                 loc_path = row.get('ubicacion')
                 cost_str = row.get('costo', '0')
-                
-                # Búsqueda flexible de la columna series
                 serials_str = row.get('series') or row.get('serie') or row.get('serial') or row.get('lote') or ''
 
                 if not sku or not qty_str or not loc_path:
@@ -1851,35 +1928,26 @@ def import_smart_adjustments_transaction(company_id, user_name, rows):
                 
                 move_id = cursor.fetchone()[0]
 
-                # --- CARGA DE SERIES ---
+                # Carga de Series
                 tracking_type = prod['tracking']
-                print(f" -> Proc. SKU {sku} (Tracking: {tracking_type}). Series Raw: '{serials_str}'")
-
                 if tracking_type != 'none' and serials_str:
                     raw_vals = [s.strip() for s in re.split(r'[;,\n]', serials_str) if s.strip()]
-                    
                     if not raw_vals: continue
 
                     if tracking_type == 'serial':
-                        # Para series: La cantidad de códigos debe coincidir con la cantidad numérica
                         if len(raw_vals) != int(final_qty):
                             raise ValueError(f"Fila {line_info['line']}: SKU '{sku}' requiere {int(final_qty)} series, se indicaron {len(raw_vals)}.")
-                        
                         for sn in raw_vals:
                             lot_id = create_lot(cursor, prod['id'], sn)
                             cursor.execute("INSERT INTO stock_move_lines (move_id, lot_id, qty_done) VALUES (%s, %s, 1)", (move_id, lot_id))
                             
                     elif tracking_type == 'lot':
-                        # Para lotes: Si hay 1 solo código, le asignamos toda la cantidad
                         if len(raw_vals) == 1:
                             lot_id = create_lot(cursor, prod['id'], raw_vals[0])
                             cursor.execute("INSERT INTO stock_move_lines (move_id, lot_id, qty_done) VALUES (%s, %s, %s)", (move_id, lot_id, final_qty))
                         else:
-                            # Si hay múltiples lotes, asumimos 1 unidad por lote (o fallamos porque es ambiguo en CSV simple)
-                            # Para simplificar, distribuimos 1 a 1 y validamos cantidad
                             if len(raw_vals) != int(final_qty):
                                  print(f"[WARN] Lotes múltiples para '{sku}'. Se asignará 1 unidad a cada lote listado.")
-                            
                             for sn in raw_vals:
                                 lot_id = create_lot(cursor, prod['id'], sn)
                                 cursor.execute("INSERT INTO stock_move_lines (move_id, lot_id, qty_done) VALUES (%s, %s, 1)", (move_id, lot_id))
@@ -1895,4 +1963,5 @@ def import_smart_adjustments_transaction(company_id, user_name, rows):
         raise e
     finally:
         if conn: return_db_connection(conn)
+
 

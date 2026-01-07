@@ -1,3 +1,4 @@
+#app/api/adjustments.py
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, UploadFile, File
 from fastapi.responses import StreamingResponse
 from typing import List, Annotated
@@ -12,7 +13,7 @@ import csv
 router = APIRouter()
 AuthDependency = Annotated[TokenData, Depends(security.get_current_user_data)]
 
-# --- Helper de Filtros (Existente) ---
+# --- Helper de Filtros ---
 def _parse_adjustment_filters(request: Request) -> dict:
     filters = {}
     KNOWN_FILTER_KEYS = {'name', 'state', 'responsible_user', 'adjustment_reason', 'src_path', 'dest_path'}
@@ -22,7 +23,7 @@ def _parse_adjustment_filters(request: Request) -> dict:
             filters[key] = value
     return filters
 
-# --- Endpoints de Listado (Existentes) ---
+# --- Endpoints de Listado ---
 @router.get("/", response_model=List[schemas.AdjustmentListResponse])
 async def get_all_adjustments(
     auth: AuthDependency, company_id: int, request: Request,
@@ -59,14 +60,15 @@ async def export_adjustments_csv(auth: AuthDependency, company_id: int = Query(.
         if not data: raise HTTPException(404, "No hay datos para exportar.")
 
         output = io.StringIO(newline='')
-        # Definimos las columnas del CSV
-        fieldnames = ['referencia', 'razon', 'fecha', 'usuario', 'notas', 'estado', 
-                      'ubicacion', 'sku', 'producto', 'cantidad', 'costo_unitario']
         
-        writer = csv.DictWriter(output, fieldnames=fieldnames, delimiter=';')
+        # [CORRECCIÓN] Agregamos 'series' a las columnas para evitar ValueError
+        fieldnames = ['referencia', 'razon', 'fecha', 'usuario', 'notas', 'estado', 
+                      'ubicacion', 'sku', 'producto', 'cantidad', 'costo_unitario', 'series']
+        
+        # Usamos extrasaction='ignore' por seguridad, aunque con el campo agregado ya debería funcionar
+        writer = csv.DictWriter(output, fieldnames=fieldnames, delimiter=';', extrasaction='ignore')
         writer.writeheader()
         
-        # Convertimos los resultados de BD a diccionarios
         writer.writerows([dict(row) for row in data])
         
         output.seek(0)
@@ -88,16 +90,14 @@ async def import_adjustments_csv(
 ):
     """
     Importa ajustes masivos.
-    CSV Esperado: referencia, razon, ubicacion, sku, cantidad, notas, costo
     """
     if "adjustments.can_create" not in auth.permissions: raise HTTPException(403, "No autorizado")
 
     try:
         content = await file.read()
-        content_decoded = content.decode('utf-8-sig') # Handle BOM
+        content_decoded = content.decode('utf-8-sig') 
         file_io = io.StringIO(content_decoded)
         
-        # Detectar delimitador
         sniffer = csv.Sniffer()
         try: dialect = sniffer.sniff(content_decoded[:2048], delimiters=';,')
         except: dialect = csv.excel; dialect.delimiter = ';'
@@ -105,18 +105,15 @@ async def import_adjustments_csv(
         file_io.seek(0)
         reader = csv.DictReader(file_io, dialect=dialect)
         
-        # Normalizar cabeceras a minúsculas
         rows = [{k.lower().strip(): v.strip() for k, v in row.items() if k} for row in reader]
         
         if not rows: raise ValueError("Archivo vacío")
         
-        # Validar columnas mínimas
         required = {'sku', 'cantidad', 'ubicacion'}
         headers = set(rows[0].keys())
         if not required.issubset(headers):
             raise ValueError(f"Faltan columnas obligatorias: {required - headers}")
 
-        # Ejecutar transacción
         count = await asyncio.to_thread(db.import_smart_adjustments_transaction, company_id, auth.username, rows)
         
         return {"message": f"Se crearon {count} documentos de ajuste correctamente."}
