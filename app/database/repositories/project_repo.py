@@ -162,23 +162,27 @@ def get_projects(company_id: int, status: str = None, search: str = None,
                  filter_dept: str = None,
                  filter_prov: str = None,
                  filter_dist: str = None,
-                 filter_direction: str = None, # <--- NUEVO
-                 filter_management: str = None, # <--- NUEVO
+                 filter_direction: str = None, 
+                 filter_management: str = None,
                  
                  limit: int = 100, offset: int = 0,
                  sort_by: str = None, ascending: bool = True):
     """
-    Lista Obras con KPIs, filtros dinámicos GRANULARES y ordenamiento.
+    Lista Obras con KPIs corregidos (Stock Físico Real).
     """
     query = """
         WITH ProjectStock AS (
+            -- [CORRECCIÓN] Ahora filtramos explícitamente ubicaciones INTERNAS.
+            -- Esto evita sumar stock que ya está en manos del cliente (Liquidado).
             SELECT 
-                p.id, COALESCE(SUM(sq.quantity * prod.standard_price), 0) as stock_value
-            FROM projects p
-            LEFT JOIN stock_quants sq ON p.id = sq.project_id
-            LEFT JOIN products prod ON sq.product_id = prod.id
-            WHERE p.company_id = %s
-            GROUP BY p.id
+                sq.project_id, 
+                COALESCE(SUM(sq.quantity * prod.standard_price), 0) as stock_value
+            FROM stock_quants sq
+            JOIN locations l ON sq.location_id = l.id
+            JOIN products prod ON sq.product_id = prod.id
+            WHERE l.type = 'internal'  -- <--- EL FILTRO CLAVE
+              AND sq.quantity > 0
+            GROUP BY sq.project_id
         ),
         ProjectConsumed AS (
             SELECT 
@@ -202,11 +206,11 @@ def get_projects(company_id: int, status: str = None, search: str = None,
         LEFT JOIN macro_projects mp ON p.macro_project_id = mp.id
         LEFT JOIN managements m ON mp.management_id = m.id
         LEFT JOIN directions d ON m.direction_id = d.id
-        LEFT JOIN ProjectStock ps ON p.id = ps.id
+        LEFT JOIN ProjectStock ps ON p.id = ps.project_id  -- Join corregido por project_id
         LEFT JOIN ProjectConsumed pc ON p.id = pc.project_id
         WHERE p.company_id = %s
     """
-    params = [company_id, company_id]
+    params = [company_id]
     
     # --- FILTROS EXISTENTES ---
     if direction_id: query += " AND m.direction_id = %s"; params.append(direction_id)
@@ -421,7 +425,7 @@ def delete_project(project_id: int):
 
 def check_and_update_project_phase(project_id: int):
     """
-    [AUTOMATIZACIÓN] Revisa el stock y actualiza la fase de la obra.
+    [AUTOMATIZACIÓN - CORREGIDA] Revisa el stock y actualiza la fase de la obra.
     Se debe llamar después de cualquier movimiento de stock (IN/OUT) relacionado a un proyecto.
     """
     if not project_id: return
@@ -432,19 +436,28 @@ def check_and_update_project_phase(project_id: int):
     
     current_phase = proj['phase']
     
-    # 2. Calcular Stock Total en Custodia
-    stock_res = execute_query("SELECT SUM(quantity) as total FROM stock_quants WHERE project_id = %s", (project_id,), fetchone=True)
+    # 2. Calcular Stock Total en Custodia (SOLO INTERNO)
+    # [CORRECCIÓN CRÍTICA] Agregamos el JOIN con locations y el filtro internal.
+    # Si no hacemos esto, el stock entregado al cliente cuenta como 'En Custodia'
+    # y la obra nunca pasaría a 'Por Facturar'.
+    stock_res = execute_query("""
+        SELECT SUM(sq.quantity) as total 
+        FROM stock_quants sq
+        JOIN locations l ON sq.location_id = l.id
+        WHERE sq.project_id = %s AND l.type = 'internal'
+    """, (project_id,), fetchone=True)
+    
     total_stock = stock_res['total'] if stock_res and stock_res['total'] else 0
     
     new_phase = current_phase
 
     # 3. REGLAS DE TRANSICIÓN
     
-    # Regla A: De 'Sin Iniciar' a 'En Instalación' (Si recibe material)
+    # Regla A: De 'Sin Iniciar' a 'En Instalación' (Si recibe material en custodia)
     if current_phase == 'Sin Iniciar' and total_stock > 0:
         new_phase = 'En Instalación'
         
-    # Regla B: De 'Liquidado' a 'En Devolución' (Si le sobró material)
+    # Regla B: De 'Liquidado' a 'En Devolución' (Si le sobró material y volvió a custodia)
     elif current_phase == 'Liquidado' and total_stock > 0:
         new_phase = 'En Devolución'
         
@@ -455,12 +468,21 @@ def check_and_update_project_phase(project_id: int):
     # Regla D: De 'En Devolución' a 'Por Facturar' (Cuando termina de devolver todo)
     elif current_phase == 'En Devolución' and total_stock <= 0.001:
         new_phase = 'Por Facturar'
+        
+    # Regla E: De 'En Instalación' a 'Por Facturar' (Caso raro: liquidó todo de golpe sin pasar por 'Liquidado')
+    elif current_phase == 'En Instalación' and total_stock <= 0.001:
+        # Verificamos si hubo consumo para no regresarlo a 'Sin Iniciar' por error
+        has_consumption = execute_query(
+            "SELECT 1 FROM stock_moves WHERE project_id=%s AND state='done' LIMIT 1", 
+            (project_id,), fetchone=True
+        )
+        if has_consumption:
+            new_phase = 'Por Facturar'
 
     # 4. Aplicar cambio si hubo transición
     if new_phase != current_phase:
-        print(f"[AUTO-PHASE] Obra {project_id}: {current_phase} -> {new_phase}")
+        print(f"[AUTO-PHASE] Obra {project_id}: {current_phase} -> {new_phase} (Stock Interno: {total_stock})")
         execute_commit_query("UPDATE projects SET phase = %s WHERE id = %s", (new_phase, project_id))
-
 
 # --- IMPORTACIÓN MASIVA ---
 

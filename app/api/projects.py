@@ -258,23 +258,26 @@ def delete_project(auth: AuthDependency, project_id: int):
 # --- IMPORTAR / EXPORTAR ---
 
 @router.get("/export/csv", response_class=StreamingResponse)
-async def export_projects_csv(auth: AuthDependency,company_id: int = Query(...)):
+async def export_projects_csv(auth: AuthDependency, company_id: int = Query(...)):
     verify_access(auth, company_id)
     
     try:
-        # 1. Obtener datos (reusamos la función existente)
-        projects = db.get_projects(company_id, limit=999999) # Traer todo
+        # 1. Obtener datos (reusamos la función existente corregida)
+        projects = db.get_projects(company_id, limit=999999) 
         
-        # 2. Generar CSV en memoria
+        # 2. Generar CSV
         output = io.StringIO(newline='')
-        writer = csv.writer(output, delimiter=';')
+        # Usamos lineterminator='\n' para compatibilidad total Excel/Windows
+        writer = csv.writer(output, delimiter=';', lineterminator='\n')
         
-        # Headers
+        # Headers [MEJORADOS]
         headers = [
-            "code", "name", "macro_name", "status", "phase", 
-            "address", "department", "province", "district",
-            "budget", "start_date", "end_date", 
-            "stock_value", "liquidated_value"
+            "Código PEP", "Nombre de Obra", 
+            "Dirección", "Gerencia", "Proyecto (Macro)", # <--- JERARQUÍA COMPLETA
+            "Estado", "Fase", 
+            "Dirección Física", "Departamento", "Provincia", "Distrito",
+            "Presupuesto (S/)", "Inicio", "Fin", 
+            "En Custodia (S/)", "Liquidado (S/)"
         ]
         writer.writerow(headers)
         
@@ -283,6 +286,8 @@ async def export_projects_csv(auth: AuthDependency,company_id: int = Query(...))
             row = [
                 p.get('code') or "",
                 p.get('name'),
+                p.get('direction_name') or "",   # <--- Nuevo
+                p.get('management_name') or "",  # <--- Nuevo
                 p.get('macro_name') or "",
                 p.get('status'),
                 p.get('phase'),
@@ -290,11 +295,11 @@ async def export_projects_csv(auth: AuthDependency,company_id: int = Query(...))
                 p.get('department') or "",
                 p.get('province') or "",
                 p.get('district') or "",
-                str(p.get('budget', 0)),
-                str(p.get('start_date') or ""),
-                str(p.get('end_date') or ""),
-                str(p.get('stock_value', 0)),
-                str(p.get('liquidated_value', 0))
+                f"{float(p.get('budget', 0)):.2f}".replace('.', ','), # Formato decimal Excel (coma)
+                p.get('start_date') or "",
+                p.get('end_date') or "",
+                f"{float(p.get('stock_value', 0)):.2f}".replace('.', ','),      # Formato decimal Excel
+                f"{float(p.get('liquidated_value', 0)):.2f}".replace('.', ',')  # Formato decimal Excel
             ]
             writer.writerow(row)
             
@@ -303,7 +308,7 @@ async def export_projects_csv(auth: AuthDependency,company_id: int = Query(...))
         return StreamingResponse(
             iter([output.getvalue()]),
             media_type="text/csv",
-            headers={"Content-Disposition": "attachment; filename=obras.csv"}
+            headers={"Content-Disposition": "attachment; filename=Reporte_Obras_Completo.csv"}
         )
         
     except Exception as e:

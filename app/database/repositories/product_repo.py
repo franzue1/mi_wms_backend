@@ -435,133 +435,114 @@ def process_sku_import_list(company_id: int, raw_text: str):
 
     return final_found_list, errors
 
-# --- UNIDADES DE MEDIDA (UOM) ---
+# --- UNIDADES DE MEDIDA (UOM) - REFACTORIZADO PARA MULTI-COMPAÑÍA ---
 
-def get_uoms(): return execute_query("SELECT id, name FROM uom ORDER BY name", fetchall=True)
-
-def create_uom(name):
+def get_uoms(company_id: int):
     """
-    Crea una nueva Unidad de Medida (UOM) usando el pool de conexiones.
-    Maneja la restricción de nombre único.
+    [CORREGIDO] Obtiene UdM FILTRADAS por compañía.
     """
-    query = "INSERT INTO uom (name) VALUES (%s) RETURNING id"
-    params = (name,)
-    
-    try:
-        # 1. Llamamos a la función de escritura, pidiendo que retorne el resultado
-        result = execute_commit_query(query, params, fetchone=True)
-        
-        if result:
-            new_id = result[0] # O result['id'] si tu cursor devuelve dict
-            return new_id
-        else:
-            raise Exception("No se pudo crear la UOM o no se retornó el ID.")
-
-    except Exception as e: 
-        # 2. La lógica para detectar el error de duplicado sigue
-        #    funcionando porque execute_commit_query re-lanza el error.
-        if "uom_name_key" in str(e): 
-            raise ValueError(f"La unidad de medida '{name}' ya existe.")
-        else:
-            # Re-lanzar cualquier otro error de BD
-            raise e
-
-def update_uom(uom_id, name):
-    """
-    Actualiza el nombre de una Unidad de Medida (UOM) usando el pool de conexiones.
-    Maneja la restricción de nombre único.
-    """
-    query = "UPDATE uom SET name = %s WHERE id = %s"
-    params = (name, uom_id)
-    
-    try:
-        # 1. Llamamos a la función de escritura centralizada.
-        # No necesitamos fetchone=True para un UPDATE.
-        execute_commit_query(query, params)
-        
-    except Exception as e: 
-        # 2. La excepción de la BD es re-lanzada por execute_commit_query,
-        #    así que la capturamos aquí para manejarla.
-        if "uom_name_key" in str(e): 
-            raise ValueError(f"La unidad de medida '{name}' ya existe.")
-        else:
-            # Re-lanzar cualquier otro error de BD
-            raise e
-
-def delete_uom(uom_id):
-    """
-    Elimina una Unidad de Medida (UOM) usando el pool de conexiones.
-    Maneja errores de integridad referencial (foreign key).
-    """
-    query = "DELETE FROM uom WHERE id = %s"
-    params = (uom_id,)
-    
-    try:
-        # 1. Usamos la función centralizada de escritura
-        # No se necesita fetchone=True para un DELETE
-        execute_commit_query(query, params)
-        
-        # 2. Si no hubo error, la eliminación fue exitosa
-        return True, "Unidad de medida eliminada."
-        
-    except Exception as e:
-        # 3. execute_commit_query re-lanza el error de la BD,
-        #    así que podemos inspeccionarlo aquí.
-        
-        # Detectar error de llave foránea
-        if "violates foreign key constraint" in str(e):
-            return False, "No se puede eliminar: Esta UdM está asignada a uno o más productos."
-        
-        # Cualquier otro error
-        print(f"[DB-ERROR] delete_uom: {e}")
-        return False, f"Error al eliminar: {e}"
-    
-def get_uom_id_by_name(name):
-    """Busca el ID de una unidad de medida por su nombre exacto."""
-    if not name or not name.strip(): return None
-    result = execute_query("SELECT id FROM uom WHERE name =  %s", (name,), fetchone=True)
-    return result['id'] if result else None
-
-def get_product_categories(company_id: int):
-    """Obtiene categorías de producto FILTRADAS POR COMPAÑÍA."""
     return execute_query(
-        "SELECT id, name FROM product_categories WHERE company_id = %s ORDER BY name", 
+        "SELECT id, name FROM uom WHERE company_id = %s ORDER BY name", 
         (company_id,), 
         fetchall=True
     )
 
-def create_product_category(name: str, company_id: int):
-    """Crea una categoría de producto PARA UNA COMPAÑÍA."""
+def create_uom(name: str, company_id: int):
+    """
+    [CORREGIDO] Crea una UdM asociada a una compañía.
+    """
+    query = "INSERT INTO uom (name, company_id) VALUES (%s, %s) RETURNING id"
+    params = (name, company_id)
+    
     try:
-        new_item = execute_commit_query(
-            "INSERT INTO product_categories (name, company_id) VALUES (%s, %s) RETURNING id, name",
-            (name, company_id),
-            fetchone=True
-        )
-        return new_item
+        result = execute_commit_query(query, params, fetchone=True)
+        if result:
+            return result[0]
+        else:
+            raise Exception("No se pudo crear la UOM.")
+
+    except Exception as e: 
+        if "uom_company_id_name_key" in str(e) or "unique constraint" in str(e): 
+            raise ValueError(f"La unidad '{name}' ya existe en esta compañía.")
+        else:
+            raise e
+
+def update_uom(uom_id: int, name: str, company_id: int):
+    """
+    [CORREGIDO] Actualiza UdM verificando la compañía.
+    """
+    query = "UPDATE uom SET name = %s WHERE id = %s AND company_id = %s"
+    params = (name, uom_id, company_id)
+    
+    try:
+        execute_commit_query(query, params)
+    except Exception as e: 
+        if "unique constraint" in str(e): 
+            raise ValueError(f"La unidad '{name}' ya existe.")
+        else:
+            raise e
+
+def delete_uom(uom_id: int, company_id: int):
+    """
+    [CORREGIDO] Elimina UdM verificando la compañía.
+    """
+    query = "DELETE FROM uom WHERE id = %s AND company_id = %s"
+    params = (uom_id, company_id)
+    
+    try:
+        execute_commit_query(query, params)
+        return True, "Unidad de medida eliminada."
     except Exception as e:
-        if "product_categories_company_id_name_key" in str(e): # Error de duplicado
-            raise ValueError(f"La categoría '{name}' ya existe para esta compañía.")
+        if "violates foreign key constraint" in str(e):
+            return False, "No se puede eliminar: Está asignada a productos."
+        print(f"[DB-ERROR] delete_uom: {e}")
+        return False, f"Error al eliminar: {e}"
+    
+def get_uom_id_by_name(name, company_id):
+    """
+    [CORREGIDO] Busca ID por nombre Y compañía.
+    """
+    if not name or not name.strip(): return None
+    result = execute_query(
+        "SELECT id FROM uom WHERE name = %s AND company_id = %s", 
+        (name, company_id), 
+        fetchone=True
+    )
+    return result['id'] if result else None
+
+# --- CATEGORÍAS (Ya estaban bien, solo las incluimos para completar) ---
+
+def get_product_categories(company_id: int):
+    return execute_query(
+        "SELECT id, name FROM product_categories WHERE company_id = %s ORDER BY name", 
+        (company_id,), fetchall=True
+    )
+
+def create_product_category(name: str, company_id: int):
+    try:
+        return execute_commit_query(
+            "INSERT INTO product_categories (name, company_id) VALUES (%s, %s) RETURNING id, name",
+            (name, company_id), fetchone=True
+        )
+    except Exception as e:
+        if "unique constraint" in str(e):
+            raise ValueError(f"La categoría '{name}' ya existe.")
         raise e
 
 def update_product_category(category_id: int, name: str, company_id: int):
-    """Actualiza una categoría de producto, verificando la compañía."""
     try:
-        updated_item = execute_commit_query(
+        updated = execute_commit_query(
             "UPDATE product_categories SET name = %s WHERE id = %s AND company_id = %s RETURNING id, name",
-            (name, category_id, company_id),
-            fetchone=True
+            (name, category_id, company_id), fetchone=True
         )
-        if not updated_item:
-            raise ValueError("Categoría no encontrada o no pertenece a esta compañía.")
-        return updated_item
+        if not updated: raise ValueError("No encontrada o sin permisos.")
+        return updated
     except Exception as e:
-        if "product_categories_company_id_name_key" in str(e):
-            raise ValueError(f"El nombre '{name}' ya existe (duplicado).")
+        if "unique constraint" in str(e):
+            raise ValueError(f"El nombre '{name}' ya existe.")
         raise e
  
 def delete_product_category(category_id: int, company_id: int):
-    """Elimina una categoría de producto, verificando la compañía."""
     try:
         execute_commit_query(
             "DELETE FROM product_categories WHERE id = %s AND company_id = %s",
@@ -569,16 +550,13 @@ def delete_product_category(category_id: int, company_id: int):
         )
         return True, "Categoría eliminada."
     except Exception as e:
-        # (Si falla por FK, e.g. un producto la usa, aquí se captura)
         if "foreign key constraint" in str(e):
-            return False, "Error: Esta categoría ya está siendo usada por productos."
-        return False, f"Error inesperado: {e}"
+            return False, "Error: Esta categoría tiene productos asociados."
+        return False, f"Error: {e}"
 
-def get_category_id_by_name(name):
-    """Busca el ID de una categoría de producto por su nombre exacto."""
-    if not name or not name.strip(): return None
-    result = execute_query("SELECT id FROM product_categories WHERE name =  %s", (name,), fetchone=True)
-    return result['id'] if result else None
-
+def get_category_id_by_name(name, company_id): # Agregado company_id por consistencia
+    if not name: return None
+    res = execute_query("SELECT id FROM product_categories WHERE name = %s AND company_id = %s", (name, company_id), fetchone=True)
+    return res['id'] if res else None
 
 

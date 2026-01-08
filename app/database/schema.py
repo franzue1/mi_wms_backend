@@ -100,8 +100,16 @@ def create_schema(conn):
             name TEXT NOT NULL, UNIQUE (company_id, name)
         );
     """)
-    cursor.execute("CREATE TABLE IF NOT EXISTS uom (id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL);")
     
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS uom (
+            id SERIAL PRIMARY KEY, 
+            company_id INTEGER NOT NULL REFERENCES companies(id),
+            name TEXT NOT NULL, 
+            UNIQUE (company_id, name)
+        );
+    """)
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS warehouse_categories (
             id SERIAL PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id),
@@ -473,27 +481,35 @@ def create_initial_data(conn):
     # --- Categoría de Producto (Ahora con company_id) ---
     cursor.execute(
         "INSERT INTO product_categories (company_id, name) VALUES (%s, %s) ON CONFLICT (company_id, name) DO NOTHING RETURNING id", 
-        (default_company_id, 'General')
+        (default_company_id, 'GENERAL')
     )
     general_cat_id_row = cursor.fetchone()
     if general_cat_id_row:
         general_cat_id = general_cat_id_row['id']
     else:
-        cursor.execute("SELECT id FROM product_categories WHERE name = %s AND company_id = %s", ('General', default_company_id))
+        cursor.execute("SELECT id FROM product_categories WHERE name = %s AND company_id = %s", ('GENERAL', default_company_id))
         general_cat_id_row = cursor.fetchone()
-        if not general_cat_id_row: raise Exception("No se pudo crear o encontrar la categoría 'General'")
+        if not general_cat_id_row: raise Exception("No se pudo crear o encontrar la categoría 'GENERAL'")
         general_cat_id = general_cat_id_row['id']
 
     # --- FIN DE LA CORRECCIÓN ---
 
-    cursor.execute("INSERT INTO uom (name) VALUES (%s) ON CONFLICT (name) DO NOTHING RETURNING id", ('Unidades',))
+    cursor.execute("""
+        INSERT INTO uom (company_id, name) 
+        VALUES (%s, %s) 
+        ON CONFLICT (company_id, name) DO NOTHING 
+        RETURNING id
+    """, (default_company_id, 'UNIDADES'))
+    
     uom_unidades_id_row = cursor.fetchone()
+    
     if uom_unidades_id_row:
         uom_unidades_id = uom_unidades_id_row['id']
     else:
-        cursor.execute("SELECT id FROM uom WHERE name = %s", ('Unidades',))
+        # Si ya existía, buscamos filtrando por compañía
+        cursor.execute("SELECT id FROM uom WHERE name = %s AND company_id = %s", ('UNIDADES', default_company_id))
         uom_unidades_id_row = cursor.fetchone()
-        if not uom_unidades_id_row: raise Exception("No se pudo crear o encontrar la UdM 'Unidades'")
+        if not uom_unidades_id_row: raise Exception("No se pudo crear o encontrar la UdM 'UNIDADES'")
         uom_unidades_id = uom_unidades_id_row['id']
 
     products_to_create = [

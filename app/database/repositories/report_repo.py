@@ -823,44 +823,59 @@ def get_data_for_export(company_id, export_type='headers'):
 def get_project_kardex(company_id, project_id):
     """
     Obtiene el estado logístico detallado de un proyecto.
-    [MEJORA] Incluye Categoría y Contratista en el histórico de consumo.
+    [CORREGIDO FINAL] Filtra l.type = 'internal' para evitar contar stock 
+    que ya está en manos del cliente (Ubicación Externa) como 'En Custodia'.
     """
     # 1. Stock en Mano (En Custodia)
     query_on_hand = """
         SELECT 
-            p.sku, p.name, pc.name as category, -- <--- Nueva Columna
-            w.name as warehouse, 
-            l.path as location, 
+            p.sku, 
+            p.name, 
+            COALESCE(pc.name, 'Sin Categoría') as category,
+            
+            COALESCE(w.name, 'Ubicación Virtual / Tránsito') as warehouse, 
+            COALESCE(l.path, 'Sin Ubicación') as location, 
+            
             SUM(sq.quantity) as qty,
             (SUM(sq.quantity) * p.standard_price) as value,
             u.name as uom
+            
         FROM stock_quants sq
         JOIN products p ON sq.product_id = p.id
-        LEFT JOIN product_categories pc ON p.category_id = pc.id -- <--- Join Categoría
+        LEFT JOIN product_categories pc ON p.category_id = pc.id
         LEFT JOIN uom u ON p.uom_id = u.id
-        JOIN locations l ON sq.location_id = l.id
-        JOIN warehouses w ON l.warehouse_id = w.id
-        WHERE sq.project_id = %s AND sq.quantity > 0
-        GROUP BY p.id, pc.name, w.name, l.path, u.name
-        ORDER BY w.name, p.name
+        
+        -- LEFT JOIN para ver todo, pero luego filtraremos por tipo
+        LEFT JOIN locations l ON sq.location_id = l.id
+        LEFT JOIN warehouses w ON l.warehouse_id = w.id
+        
+        WHERE sq.project_id = %s 
+          AND sq.quantity > 0
+          AND l.type = 'internal'  -- <--- ¡ESTE FILTRO ES LA CLAVE!
+          
+        GROUP BY p.id, p.sku, p.name, pc.name, w.name, l.path, u.name, p.standard_price
+        ORDER BY w.name NULLS LAST, p.name
     """
     on_hand = execute_query(query_on_hand, (project_id,), fetchall=True)
 
     # 2. Consumo Histórico (Liquidado / Instalado)
-    # Agrupamos por la Contratista que originó la salida (w_src.name)
+    # (Esta parte no cambia, ya está correcta)
     query_consumed = """
         SELECT 
-            p.sku, p.name, pc.name as category,
-            w_src.name as contractor, -- <--- El dato que faltaba
+            p.sku, 
+            p.name, 
+            COALESCE(pc.name, 'Sin Categoría') as category,
+            COALESCE(w_src.name, 'Origen Externo') as contractor,
+            
             SUM(sm.quantity_done) as qty,
             SUM(sm.quantity_done * sm.price_unit) as value,
             u.name as uom
+            
         FROM stock_moves sm
         JOIN products p ON sm.product_id = p.id
         LEFT JOIN product_categories pc ON p.category_id = pc.id
         LEFT JOIN uom u ON p.uom_id = u.id
         
-        -- Joins para saber de DÓNDE salió (Contratista)
         LEFT JOIN locations l_src ON sm.location_src_id = l_src.id
         LEFT JOIN warehouses w_src ON l_src.warehouse_id = w_src.id
         
@@ -870,8 +885,8 @@ def get_project_kardex(company_id, project_id):
           AND sm.state = 'done' 
           AND l_dest.category IN ('CLIENTE', 'CONTRATA CLIENTE')
           
-        GROUP BY p.id, pc.name, u.name, w_src.name
-        ORDER BY w_src.name, p.name
+        GROUP BY p.id, p.sku, p.name, pc.name, u.name, w_src.name
+        ORDER BY w_src.name NULLS LAST, p.name
     """
     consumed = execute_query(query_consumed, (project_id,), fetchall=True)
 
@@ -879,7 +894,6 @@ def get_project_kardex(company_id, project_id):
         "on_hand": [dict(r) for r in on_hand],
         "consumed": [dict(r) for r in consumed]
     }
-
 
 def get_warehouses_kpi_summary(company_id, user_id, role_name):
     """
@@ -1172,21 +1186,31 @@ def get_top_projects_statistics(company_id, limit=5):
     """
     Obtiene el Top 5 Proyectos con mayor valor en custodia,
     incluyendo su avance de liquidación.
+    [CORREGIDO] Filtra l.type='internal' para que los montos coincidan
+    con las tarjetas y reportes detallados.
     """
     query = """
         WITH ProjectStock AS (
-            SELECT p.id, COALESCE(SUM(sq.quantity * prod.standard_price), 0) as stock_val
-            FROM projects p
-            LEFT JOIN stock_quants sq ON p.id = sq.project_id
-            LEFT JOIN products prod ON sq.product_id = prod.id
-            WHERE p.company_id = %s AND p.status = 'active'
-            GROUP BY p.id
+            SELECT 
+                sq.project_id as id, 
+                COALESCE(SUM(sq.quantity * prod.standard_price), 0) as stock_val
+            FROM stock_quants sq
+            JOIN products prod ON sq.product_id = prod.id
+            JOIN locations l ON sq.location_id = l.id
+            JOIN projects p ON sq.project_id = p.id -- Join para filtrar por company
+            WHERE p.company_id = %s 
+              AND p.status = 'active'
+              AND l.type = 'internal' -- <--- FILTRO DE CONSISTENCIA
+            GROUP BY sq.project_id
         ),
         ProjectConsumed AS (
-            SELECT sm.project_id, COALESCE(SUM(sm.quantity_done * sm.price_unit), 0) as liq_val
+            SELECT 
+                sm.project_id, 
+                COALESCE(SUM(sm.quantity_done * sm.price_unit), 0) as liq_val
             FROM stock_moves sm
             JOIN locations l_dest ON sm.location_dest_id = l_dest.id
-            WHERE sm.state = 'done' AND l_dest.category IN ('CLIENTE', 'CONTRATA CLIENTE')
+            WHERE sm.state = 'done' 
+              AND l_dest.category IN ('CLIENTE', 'CONTRATA CLIENTE') 
               AND sm.project_id IS NOT NULL
             GROUP BY sm.project_id
         )
@@ -1197,20 +1221,26 @@ def get_top_projects_statistics(company_id, limit=5):
         FROM projects p
         LEFT JOIN ProjectStock ps ON p.id = ps.id
         LEFT JOIN ProjectConsumed pc ON p.id = pc.project_id
-        WHERE p.company_id = %s
-        ORDER BY stock_value DESC -- Priorizamos donde hay más dinero "parado"
+        WHERE p.company_id = %s AND p.status = 'active'
+        -- Solo mostramos si tienen movimiento (stock o liquidado > 0)
+        AND (COALESCE(ps.stock_val, 0) > 0 OR COALESCE(pc.liq_val, 0) > 0)
+        ORDER BY stock_value DESC
         LIMIT %s
     """
     results = execute_query(query, (company_id, company_id, limit), fetchall=True)
     
     data = []
     for r in results:
-        s = r['stock_value']; l = r['liquidated_value']
+        s = float(r['stock_value'])
+        l = float(r['liquidated_value'])
         total = s + l
         progress = (l / total) if total > 0 else 0.0
         data.append({
-            "id": r['id'], "name": r['name'],
-            "stock_value": s, "liquidated_value": l, "progress": progress
+            "id": r['id'], 
+            "name": r['name'],
+            "stock_value": s, 
+            "liquidated_value": l, 
+            "progress": progress
         })
     return data
 

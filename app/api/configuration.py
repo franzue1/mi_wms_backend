@@ -16,6 +16,7 @@ def check_config_permission(auth: AuthDependency):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
 # --- Categorías de Producto ---
+# (Estos endpoints estaban BIEN, los mantenemos igual)
 
 @router.get("/product-categories", response_model=List[schemas.ConfigResponse], dependencies=[Depends(check_config_permission)])
 async def get_product_categories(company_id: int = Query(...)):
@@ -51,38 +52,38 @@ async def delete_product_category(category_id: int, company_id: int = Query(...)
         raise HTTPException(status_code=400, detail=message)
     return {"message": message}
 
-# --- Unidades de Medida (UoM) ---
-# (Estas son GLOBALES, por lo que NO necesitan company_id)
+# --- Unidades de Medida (UoM) - REFACTORIZADO A MULTI-COMPAÑÍA ---
 
 @router.get("/uoms", response_model=List[schemas.ConfigResponse], dependencies=[Depends(check_config_permission)])
-async def get_uoms():
-    data = await asyncio.to_thread(db.get_uoms)
+async def get_uoms(company_id: int = Query(...)): # [CORREGIDO] Agregado company_id
+    data = await asyncio.to_thread(db.get_uoms, company_id)
     return [dict(row) for row in data]
 
 @router.post("/uoms", response_model=schemas.ConfigResponse, status_code=201, dependencies=[Depends(check_config_permission)])
-async def create_uom(uom: schemas.ConfigCreate):
+async def create_uom(uom: schemas.ConfigCreate, company_id: int = Query(...)): # [CORREGIDO] Agregado company_id
     try:
-        new_id = await asyncio.to_thread(db.create_uom, uom.name)
+        new_id = await asyncio.to_thread(db.create_uom, uom.name, company_id)
         return {"id": new_id, "name": uom.name}
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
 
 @router.put("/uoms/{uom_id}", response_model=schemas.ConfigResponse, dependencies=[Depends(check_config_permission)])
-async def update_uom(uom_id: int, uom: schemas.ConfigCreate):
+async def update_uom(uom_id: int, uom: schemas.ConfigCreate, company_id: int = Query(...)): # [CORREGIDO] Agregado company_id
     try:
-        await asyncio.to_thread(db.update_uom, uom_id, uom.name)
+        await asyncio.to_thread(db.update_uom, uom_id, uom.name, company_id)
         return {"id": uom_id, "name": uom.name}
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
 
 @router.delete("/uoms/{uom_id}", status_code=200, dependencies=[Depends(check_config_permission)])
-async def delete_uom(uom_id: int):
-    success, message = await asyncio.to_thread(db.delete_uom, uom_id)
+async def delete_uom(uom_id: int, company_id: int = Query(...)): # [CORREGIDO] Agregado company_id
+    success, message = await asyncio.to_thread(db.delete_uom, uom_id, company_id)
     if not success:
         raise HTTPException(status_code=400, detail=message)
     return {"message": message}
 
 # --- Categorías de Almacén ---
+# (Estos ya estaban bien, los mantenemos igual)
 
 @router.get("/warehouse-categories", response_model=List[schemas.ConfigResponse], dependencies=[Depends(check_config_permission)])
 async def get_warehouse_categories(company_id: int = Query(...)):
@@ -118,5 +119,3 @@ async def delete_warehouse_category(category_id: int, company_id: int = Query(..
 async def get_partner_categories(company_id: int = Query(...)):
     data = await asyncio.to_thread(db.get_partner_categories, company_id)
     return [dict(row) for row in data]
-
-# (Omitimos POST, PUT, DELETE para partner_categories por ahora, pero seguirían el mismo patrón)
