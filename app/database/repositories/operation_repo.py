@@ -172,16 +172,14 @@ def mark_picking_as_ready(picking_id):
             if not p: raise ValueError("El albarán no existe.")
             if p['state'] != 'draft': raise ValueError(f"Estado inválido: {p['state']}. Debe estar en borrador.")
 
-            # --- [FIX CRÍTICO] SINCRONIZACIÓN DE PROYECTO ---
-            # Si la cabecera tiene proyecto (ej. Devolución de Obra),
-            # forzamos a que las líneas hereden ese proyecto antes de verificar stock.
-            if p['project_id']:
-                cursor.execute("""
-                    UPDATE stock_moves 
-                    SET project_id = %s 
-                    WHERE picking_id = %s AND (project_id IS NULL OR project_id != %s)
-                """, (p['project_id'], picking_id, p['project_id']))
-            # -----------------------------------------------
+            # --- [FIX DEFINITIVO] SINCRONIZACIÓN ABSOLUTA DE PROYECTO ---
+            # Actualizamos SIEMPRE. Si p['project_id'] es None, las líneas pasan a None (Stock General).
+            # Esto corrige el bug de "volver a borrador -> cambiar a sin proyecto".
+            cursor.execute("""
+                UPDATE stock_moves 
+                SET project_id = %s 
+                WHERE picking_id = %s
+            """, (p['project_id'], picking_id))
 
             # 2. Validación de Integridad
             cursor.execute("SELECT COUNT(*) as count FROM stock_moves WHERE picking_id = %s", (picking_id,))
@@ -682,9 +680,9 @@ def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_track
             if r['category'] == 'PROVEEDOR': v_loc = r['id']
             elif r['category'] == 'CLIENTE': c_loc = r['id']
 
-    # 2. Asegurar project_id en moves
-    if project_id:
-        cursor.execute("UPDATE stock_moves SET project_id = %s WHERE picking_id = %s", (project_id, picking_id))
+    # 2. Asegurar project_id en moves (CORREGIDO)
+    # Sincronizamos incondicionalmente. Si project_id es None, limpiamos las líneas.
+    cursor.execute("UPDATE stock_moves SET project_id = %s WHERE picking_id = %s", (project_id, picking_id))
 
     # 3. Obtener Movimientos con datos de Tracking del Producto
     # --- CAMBIO AQUÍ: AGREGAR p.ownership A LA CONSULTA ---

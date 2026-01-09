@@ -895,21 +895,25 @@ def get_project_kardex(company_id, project_id):
         "consumed": [dict(r) for r in consumed]
     }
 
-def get_warehouses_kpi_summary(company_id, user_id, role_name):
+def get_warehouses_kpi_paginated(company_id, user_id, role_name, search=None, limit=12, offset=0):
     """
-    Obtiene lista de almacenes con KPIs, FILTRADA por permisos de usuario.
+    [OPTIMIZADO] Obtiene lista paginada de almacenes con KPIs.
     """
     params = [company_id]
-    perm_clause = ""
+    where_clauses = ["w.company_id = %s", "w.status = 'activo'"]
 
-    # Si NO es Administrador, aplicar filtro de lista blanca
+    # Filtro de Permisos
     if role_name != 'Administrador':
-        perm_clause = """
-            AND w.id IN (
-                SELECT warehouse_id FROM user_warehouses WHERE user_id = %s
-            )
-        """
+        where_clauses.append("w.id IN (SELECT warehouse_id FROM user_warehouses WHERE user_id = %s)")
         params.append(user_id)
+
+    # Filtro de Búsqueda
+    if search:
+        where_clauses.append("(w.name ILIKE %s OR wc.name ILIKE %s)")
+        term = f"%{search}%"
+        params.extend([term, term])
+
+    where_sql = " AND ".join(where_clauses)
 
     query = f"""
         SELECT 
@@ -921,13 +925,41 @@ def get_warehouses_kpi_summary(company_id, user_id, role_name):
         LEFT JOIN locations l ON w.id = l.warehouse_id AND l.type = 'internal'
         LEFT JOIN stock_quants sq ON l.id = sq.location_id AND sq.quantity > 0
         LEFT JOIN products p ON sq.product_id = p.id
-        WHERE w.company_id = %s AND w.status = 'activo' {perm_clause}
+        WHERE {where_sql}
         GROUP BY w.id, w.name, wc.name
         ORDER BY wc.name, w.name
+        LIMIT %s OFFSET %s
     """
+    # Añadir limit y offset a params al final
+    params.extend([limit, offset])
     
     results = execute_query(query, tuple(params), fetchall=True)
     return results
+
+def get_warehouses_kpi_count(company_id, user_id, role_name, search=None):
+    """Cuenta el total de almacenes que coinciden con los filtros."""
+    params = [company_id]
+    where_clauses = ["w.company_id = %s", "w.status = 'activo'"]
+
+    if role_name != 'Administrador':
+        where_clauses.append("w.id IN (SELECT warehouse_id FROM user_warehouses WHERE user_id = %s)")
+        params.append(user_id)
+
+    if search:
+        where_clauses.append("(w.name ILIKE %s OR wc.name ILIKE %s)")
+        term = f"%{search}%"
+        params.extend([term, term])
+
+    where_sql = " AND ".join(where_clauses)
+
+    query = f"""
+        SELECT COUNT(DISTINCT w.id) as total
+        FROM warehouses w
+        JOIN warehouse_categories wc ON w.category_id = wc.id
+        WHERE {where_sql}
+    """
+    res = execute_query(query, tuple(params), fetchone=True)
+    return res['total'] if res else 0
 
 def get_stock_on_hand_count(company_id, warehouse_id=None, filters={}):
     """

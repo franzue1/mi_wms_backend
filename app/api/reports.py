@@ -735,28 +735,41 @@ def get_project_kardex_report(project_id: int, auth: AuthDependency, company_id:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generando reporte: {str(e)}")
 
-@router.get("/warehouses-kpi", response_model=List[dict])
+@router.get("/warehouses-kpi", response_model=Dict) # Cambiado return type a Dict para devolver {data, total}
 async def get_warehouses_kpi(
     auth: AuthDependency,
-    company_id: int = Query(...)
+    company_id: int = Query(...),
+    search: Optional[str] = None,
+    limit: int = 12,
+    skip: int = 0
 ):
-    """ Obtiene resumen de almacenes para el Hub de Inventario. """
+    """ [PAGINADO] Obtiene resumen de almacenes para el Hub. """
     try:
-        # Obtenemos info del token (auth)
         user_id = auth.user_id
-        role_name = auth.role_name # Asegúrate de que TokenData tenga este campo, o consúltalo
-        
-        # Si TokenData no tiene role_name, lo consultamos rápido:
-        if not hasattr(auth, 'role_name'):
+        # Obtener rol si no está en token
+        role_name = auth.role_name
+        if not hasattr(auth, 'role_name') or not role_name:
              user_data = await asyncio.to_thread(db.execute_query, 
                 "SELECT r.name FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id=%s", 
                 (user_id,), fetchone=True)
              role_name = user_data['name'] if user_data else 'Usuario'
 
-        data = await asyncio.to_thread(db.get_warehouses_kpi_summary, company_id, user_id, role_name)
-        return [dict(row) for row in data]
+        # Ejecutar en paralelo count y data
+        results = await asyncio.gather(
+            asyncio.to_thread(db.get_warehouses_kpi_paginated, company_id, user_id, role_name, search, limit, skip),
+            asyncio.to_thread(db.get_warehouses_kpi_count, company_id, user_id, role_name, search)
+        )
+        
+        data = results[0]
+        total = results[1]
+
+        return {
+            "items": [dict(row) for row in data],
+            "total": total
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error obteniendo KPIs de almacenes: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error obteniendo KPIs: {e}")
 
 @router.get("/chart/flow", response_model=List[schemas.FlowDataPoint])
 async def get_flow_chart_data(

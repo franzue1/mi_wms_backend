@@ -321,6 +321,23 @@ def create_schema(conn):
         "CREATE INDEX IF NOT EXISTS idx_sml_move_id ON stock_move_lines (move_id);",
         "CREATE INDEX IF NOT EXISTS idx_lots_product ON stock_lots (product_id);",
         "CREATE INDEX IF NOT EXISTS idx_user_warehouses_user ON user_warehouses(user_id);"
+
+        # --- [NUEVO] ÍNDICES CRÍTICOS PARA REPORTES (ANTI-TIMEOUT) ---
+        
+        # 1. Acelera el cálculo de KPIs (Suma de Stock por Ubicación)
+        # Evita leer toda la tabla para sumar cantidades.
+        "CREATE INDEX IF NOT EXISTS idx_sq_loc_prod_qty ON stock_quants (location_id, product_id, quantity);",
+
+        # 2. Acelera la conexión Almacén -> Ubicaciones Internas
+        # Vital para filtrar solo lo que es propiedad de la empresa.
+        "CREATE INDEX IF NOT EXISTS idx_loc_wh_type ON locations (warehouse_id, type);",
+
+        # 3. Acelera el cálculo de Valorizado (Precio * Cantidad)
+        # Permite acceder al precio sin cargar toda la ficha del producto.
+        "CREATE INDEX IF NOT EXISTS idx_prod_price ON products (id, standard_price);",
+
+        # 4. Acelera el listado inicial de Almacenes en el Hub
+        "CREATE INDEX IF NOT EXISTS idx_wh_company_status ON warehouses (company_id, status);"
     ]
 
     for idx_sql in indices:
