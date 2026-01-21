@@ -1,4 +1,4 @@
-#backend/app/database/repositories/product_repo.py
+# backend/app/database/repositories/product_repo.py
 
 import traceback
 import psycopg2.extras
@@ -121,19 +121,15 @@ def delete_product(product_id):
     """
     Elimina un producto y sus datos asociados (quants, lots)
     SÓLO SI no tiene movimientos de stock.
-    Usa el pool, pero maneja la transacción manualmente.
+    [CORREGIDO] Ya no usa 'global db_pool'. Usa get_db_connection() directo.
     """
-    global db_pool
-    if not db_pool:
-        print("[WARN] El Pool de BD no está inicializado. Intentando inicializar ahora...")
-        init_db_pool()
-        if not db_pool:
-            raise Exception("Fallo crítico: No se pudo inicializar el pool de BD.")
-
-    conn = None # 1. Definimos la conexión fuera del try
+    
+    # [ELIMINADO] global db_pool y su validación manual
+    
+    conn = None 
     try:
         # 2. Obtenemos UNA conexión del pool para toda la transacción
-        conn = get_db_connection()
+        conn = get_db_connection() # <-- Esto ya maneja la inicialización si hace falta
         conn.cursor_factory = psycopg2.extras.DictCursor
 
         # Usamos un cursor para toda la operación
@@ -153,7 +149,7 @@ def delete_product(product_id):
             # Si move_count == 0, procedemos a borrar todo
             cursor.execute("DELETE FROM stock_quants WHERE product_id = %s", (product_id,))
             cursor.execute("DELETE FROM stock_lots WHERE product_id = %s", (product_id,))
-            cursor.execute("DELETE FROM stock_moves WHERE product_id = %s", (product_id,)) # (Aunque ya sabemos que son 0)
+            # cursor.execute("DELETE FROM stock_moves WHERE product_id = %s", (product_id,)) # (Ya sabemos que son 0, innecesario)
             cursor.execute("DELETE FROM products WHERE id = %s", (product_id,))
             
             # 3. Si todos los DELETEs fueron bien, hacemos COMMIT
@@ -558,5 +554,3 @@ def get_category_id_by_name(name, company_id): # Agregado company_id por consist
     if not name: return None
     res = execute_query("SELECT id FROM product_categories WHERE name = %s AND company_id = %s", (name, company_id), fetchone=True)
     return res['id'] if res else None
-
-

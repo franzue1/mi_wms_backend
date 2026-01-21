@@ -499,6 +499,7 @@ class UserResponse(UserBase):
     # NOTA: 'hashed_password' se omite intencionalmente por seguridad
     company_ids: List[int] = []
     warehouse_ids: List[int] = [] # <--- [AGREGAR] Para que el admin pueda leerlo al editar
+    must_change_password: bool = False # <--- [NUEVO] Para que el Admin lo vea
 
     class Config:
         from_attributes = True
@@ -674,7 +675,6 @@ class ProjectUpdate(BaseModel):
     start_date: Optional[date] = None
     end_date: Optional[date] = None
 
-# En schemas.py
 class StockNoteUpdate(BaseModel):
     product_id: int
     location_id: int
@@ -682,3 +682,14 @@ class StockNoteUpdate(BaseModel):
     project_id: Optional[int] = None
     notes: str
     apply_to_group: bool = False
+
+# --- Schemas para Autenticación y Cambio de Password ---
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str
+    must_change_password: bool = False # <--- [NUEVO CAMPO CRÍTICO]
+
+class PasswordChangeRequest(BaseModel):
+    old_password: str
+    new_password: str

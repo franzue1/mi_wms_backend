@@ -22,3 +22,4 @@ from .repositories.operation_repo import *
 from .repositories.work_order_repo import *
 from .repositories.report_repo import *
 from .repositories.project_repo import *
+from .repositories.operation_repo import *

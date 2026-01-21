@@ -236,13 +236,16 @@ async def create_full_picking(
 
 # --- 2. Endpoints de Import/Export (Antes que /{id}) ---
 
+# app/api/pickings.py
+
 @router.get("/export/csv", response_class=StreamingResponse)
 async def export_pickings_csv(
     auth: AuthDependency,
     company_id: int = Query(...),
-    export_type: str = Query("headers", enum=["headers", "full"])
+    export_type: str = Query("headers", enum=["headers", "full"]),
+    selected_ids: Optional[List[int]] = Query(None) # <--- 1. NUEVO PARÁMETRO
 ):
-    verify_company_access(auth, company_id) # <--- BLINDAJE
+    verify_company_access(auth, company_id) 
     """
     [MIGRADO] Genera y transmite un archivo CSV de las operaciones.
     Llama a la función de BD 'get_data_for_export'.
@@ -251,11 +254,19 @@ async def export_pickings_csv(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
     try:
-        # 1. Obtener los datos de la misma función que usaba Flet
-        data_to_export = db.get_data_for_export(company_id, export_type)
+        # 1. Obtener los datos (PASANDO selected_ids)
+        # Nota: Tienes que asegurarte de que tu función db.get_data_for_export acepte este argumento también.
+        data_to_export = await asyncio.to_thread(
+            db.get_data_for_export, 
+            company_id, 
+            export_type, 
+            selected_ids # <--- 2. PASAMOS LA LISTA AL REPO
+        )
         
         if not data_to_export:
-            raise HTTPException(status_code=404, detail="No hay datos para exportar.")
+            # Si se seleccionaron IDs pero no se encontraron (raro, tal vez borrados), devolvemos error
+            detail_msg = "No se encontraron registros para los IDs seleccionados." if selected_ids else "No hay datos para exportar con los filtros actuales."
+            raise HTTPException(status_code=404, detail=detail_msg)
 
         # 2. Definir las cabeceras (la misma lógica que tenías en Flet)
         headers = []

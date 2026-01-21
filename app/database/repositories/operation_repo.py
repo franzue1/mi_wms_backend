@@ -1962,4 +1962,106 @@ def import_smart_adjustments_transaction(company_id, user_name, rows):
     finally:
         if conn: return_db_connection(conn)
 
+    # --- EXPORTACIÓN CSV (Agregado a operation_repo.py) ---
 
+def get_data_for_export(company_id, export_type, selected_ids=None):
+    """
+    Obtiene los datos para el CSV.
+    [MEJORA] Soporta filtrado por lista de IDs seleccionados.
+    """
+    params = [company_id]
+    filter_clause = ""
+    
+    # Lógica de Filtrado por Selección
+    if selected_ids:
+        # Usamos ANY para pasar una lista de Python a un Array de Postgres de forma segura
+        filter_clause = "AND p.id = ANY(%s)"
+        params.append(selected_ids)
+
+    if export_type == 'headers':
+        query = f"""
+            SELECT 
+                p.name as picking_name, 
+                pt.code as picking_type_code, 
+                p.state, 
+                p.custom_operation_type,
+                proj.name as project_name,
+                
+                -- Origen Legible
+                CASE WHEN l_src.type = 'internal' THEN w_src.name ELSE l_src.path END as almacen_origen,
+                l_src.path as ubicacion_origen,
+                
+                -- Destino Legible
+                CASE WHEN l_dest.type = 'internal' THEN w_dest.name ELSE l_dest.path END as almacen_destino,
+                l_dest.path as ubicacion_destino,
+                
+                p.partner_ref, 
+                p.purchase_order,
+                TO_CHAR(p.date_transfer, 'DD/MM/YYYY') as date_transfer, 
+                p.responsible_user
+
+            FROM pickings p
+            JOIN picking_types pt ON p.picking_type_id = pt.id
+            LEFT JOIN projects proj ON p.project_id = proj.id
+            LEFT JOIN locations l_src ON p.location_src_id = l_src.id
+            LEFT JOIN locations l_dest ON p.location_dest_id = l_dest.id
+            LEFT JOIN warehouses w_src ON l_src.warehouse_id = w_src.id
+            LEFT JOIN warehouses w_dest ON l_dest.warehouse_id = w_dest.id
+            
+            WHERE p.company_id = %s 
+              AND pt.code != 'ADJ'
+              {filter_clause} -- <-- Aquí entra el filtro de IDs
+            ORDER BY p.id DESC
+        """
+        
+    elif export_type == 'full':
+        query = f"""
+            SELECT 
+                p.name as picking_name, 
+                pt.code as picking_type_code, 
+                p.state, 
+                p.custom_operation_type,
+                proj.name as project_name,
+                
+                CASE WHEN l_src.type = 'internal' THEN w_src.name ELSE l_src.path END as almacen_origen,
+                l_src.path as ubicacion_origen,
+                
+                CASE WHEN l_dest.type = 'internal' THEN w_dest.name ELSE l_dest.path END as almacen_destino,
+                l_dest.path as ubicacion_destino,
+                
+                p.partner_ref, 
+                p.purchase_order,
+                TO_CHAR(p.date_transfer, 'DD/MM/YYYY') as date_transfer, 
+                p.responsible_user,
+                
+                -- Detalle de Producto
+                prod.sku as product_sku,
+                prod.name as product_name,
+                sm.product_uom_qty as quantity,
+                sm.price_unit,
+                
+                -- Series concatenadas (String Aggregation)
+                (
+                    SELECT string_agg(sl.name, ', ')
+                    FROM stock_move_lines sml
+                    JOIN stock_lots sl ON sml.lot_id = sl.id
+                    WHERE sml.move_id = sm.id
+                ) as serial
+
+            FROM pickings p
+            JOIN stock_moves sm ON sm.picking_id = p.id
+            JOIN products prod ON sm.product_id = prod.id
+            JOIN picking_types pt ON p.picking_type_id = pt.id
+            LEFT JOIN projects proj ON p.project_id = proj.id
+            LEFT JOIN locations l_src ON p.location_src_id = l_src.id
+            LEFT JOIN locations l_dest ON p.location_dest_id = l_dest.id
+            LEFT JOIN warehouses w_src ON l_src.warehouse_id = w_src.id
+            LEFT JOIN warehouses w_dest ON l_dest.warehouse_id = w_dest.id
+            
+            WHERE p.company_id = %s 
+              AND pt.code != 'ADJ'
+              {filter_clause} -- <-- Aquí entra el filtro de IDs
+            ORDER BY p.id DESC, prod.sku ASC
+        """
+    
+    return execute_query(query, tuple(params), fetchall=True)

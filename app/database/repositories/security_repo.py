@@ -19,7 +19,6 @@ def validate_user_and_get_permissions(username, plain_password):
     Valida al usuario y devuelve sus detalles (INCLUYENDO EL NOMBRE DEL ROL).
     """
     try:
-        # --- [CORRECCIÓN CRÍTICA] JOIN con Roles para obtener 'role_name' ---
         query = """
             SELECT u.*, r.name as role_name 
             FROM users u
@@ -79,12 +78,13 @@ def create_user(username, plain_password, full_name, role_id, company_ids=None, 
 
         with conn.cursor() as cursor:
             # 1. Hashear contraseña
-            hashed_pass = hash_password(plain_password) 
-            
+            hashed_pass = hash_password(plain_password)
+
             # 2. Insertar Usuario
+            # [CAMBIO] Insertamos must_change_password = TRUE implícitamente o explícitamente
             query_user = """
-                INSERT INTO users (username, hashed_password, full_name, role_id, is_active)
-                VALUES (%s, %s, %s, %s, 1) 
+                INSERT INTO users (username, hashed_password, full_name, role_id, is_active, must_change_password)
+                VALUES (%s, %s, %s, %s, 1, TRUE) 
                 RETURNING id
             """
             cursor.execute(query_user, (username, hashed_pass, full_name, role_id))
@@ -140,14 +140,14 @@ def update_user(user_id, full_name, role_id, is_active, new_password=None, compa
             # 1. Actualizar datos básicos
             if new_password:
                 hashed_pass = hash_password(new_password)
+                # [CAMBIO] Si se cambia la password aquí (reset administrativo), activamos must_change_password = TRUE
                 query = """
                     UPDATE users 
-                    SET full_name = %s, role_id = %s, is_active = %s, hashed_password = %s 
+                    SET full_name = %s, role_id = %s, is_active = %s, hashed_password = %s, must_change_password = TRUE 
                     WHERE id = %s
                 """
-                # --- ¡CORRECCIÓN AQUÍ! Usamos int(is_active) ---
                 params = (full_name, role_id, int(is_active), hashed_pass, user_id)
-                
+
                 cursor.execute(query, params)
                 print(f"[DB-RBAC] Usuario {user_id} actualizado (CON nueva contraseña).")
         
@@ -202,7 +202,7 @@ def get_users_for_admin():
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
             # 1. Obtener usuarios básicos
             query_users = """
-                SELECT u.id, u.username, u.full_name, u.is_active, r.name as role_name, u.role_id
+                SELECT u.id, u.username, u.full_name, u.is_active,u.must_change_password, r.name as role_name, u.role_id
                 FROM users u
                 LEFT JOIN roles r ON u.role_id = r.id
                 ORDER BY u.username
@@ -538,3 +538,24 @@ def get_companies():
     
     return execute_query(query, fetchall=True)
 
+def change_own_password(user_id: int, new_password: str):
+    """
+    Permite al usuario cambiar su propia contraseña y DESACTIVA el flag de cambio obligatorio.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        hashed_pass = hash_password(new_password)
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                UPDATE users 
+                SET hashed_password = %s, must_change_password = FALSE 
+                WHERE id = %s
+            """, (hashed_pass, user_id))
+            conn.commit()
+            return True
+    except Exception as e:
+        if conn: conn.rollback()
+        raise e
+    finally:
+        if conn: return_db_connection(conn)

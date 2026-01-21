@@ -265,10 +265,16 @@ def create_schema(conn):
     
     # --- 7. USUARIOS Y PERMISOS ---
     cursor.execute("CREATE TABLE IF NOT EXISTS roles (id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL, description TEXT);")
+    # [CAMBIO] Agregamos 'must_change_password' con default TRUE (1)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id SERIAL PRIMARY KEY, username TEXT UNIQUE NOT NULL, hashed_password TEXT NOT NULL,
-            full_name TEXT, role_id INTEGER NOT NULL REFERENCES roles(id), is_active INTEGER DEFAULT 1
+            id SERIAL PRIMARY KEY, 
+            username TEXT UNIQUE NOT NULL, 
+            hashed_password TEXT NOT NULL,
+            full_name TEXT, 
+            role_id INTEGER NOT NULL REFERENCES roles(id), 
+            is_active INTEGER DEFAULT 1,
+            must_change_password BOOLEAN DEFAULT TRUE 
         );
     """)
     cursor.execute("""
@@ -609,7 +615,12 @@ def create_initial_data(conn):
         cursor.execute("INSERT INTO roles (name, description) VALUES (%s, %s) ON CONFLICT (name) DO NOTHING", ("Asistente de Almacén", "Puede gestionar operaciones de almacén"))
 
         admin_pass_hashed = hash_password("admin")
-        cursor.execute("INSERT INTO users (username, hashed_password, full_name, role_id) VALUES (%s, %s, %s, %s) ON CONFLICT (username) DO NOTHING", ("admin", admin_pass_hashed, "Administrador", admin_role_id))
+        # [CAMBIO] Forzamos must_change_password = FALSE para el admin inicial
+        cursor.execute("""
+            INSERT INTO users (username, hashed_password, full_name, role_id, must_change_password) 
+            VALUES (%s, %s, %s, %s, FALSE) 
+            ON CONFLICT (username) DO NOTHING
+        """, ("admin", admin_pass_hashed, "Administrador", admin_role_id))
 
         # Primero obtenemos el ID real del admin (por si ya existía y el INSERT ignoró)
         cursor.execute("SELECT id FROM users WHERE username = %s", ("admin",))
