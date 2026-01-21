@@ -287,7 +287,7 @@ async def import_products_csv(
 
         # --- CORRECCIÓN 2: Validar categorías y UdM usando el company_id ---
         all_db_categories = {cat['name']: cat['id'] for cat in db.get_product_categories(company_id)}
-        all_db_uoms = {uom['name']: uom['id'] for uom in db.get_uoms()} # Asumiendo que UdM es global
+        all_db_uoms = {uom['name']: uom['id'] for uom in db.get_uoms(company_id)}
 
         invalid_categories = set()
         invalid_uoms = set()
