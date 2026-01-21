@@ -1463,14 +1463,14 @@ def get_draft_liquidation(wo_id):
 def get_finalized_liquidation(wo_id):
     return execute_query("SELECT id FROM pickings WHERE work_order_id = %s AND state = 'done'", (wo_id,), fetchone=True)
 
-def get_stock_summary_filtered_sorted(company_id, warehouse_id=None, filters={}, sort_by=None, ascending=True):
+def get_stock_summary_filtered_sorted(company_id, warehouse_id=None, filters={}, sort_by=None, ascending=True, limit=None, offset=None):
     """ 
-    [VERSION FINAL] Obtiene el stock total por producto Y UBICACIÓN.
-    Calcula: Físico, Reservado y Disponible.
-    Soluciona el Error 500 mapeando correctamente los IDs.
+    [CORREGIDO V2] Incluye columna 'notes' en el resumen.
+    Usa MAX(notes) para traer al menos una nota si existe en el grupo.
     """
     base_query = """
     WITH ReservedStockSummary AS (
+        -- ... (Tu CTE existente de ReservedStockSummary, sin cambios) ...
         SELECT 
             sm.product_id, sm.location_src_id,
             SUM(sm.product_uom_qty) as reserved_qty
@@ -1480,12 +1480,10 @@ def get_stock_summary_filtered_sorted(company_id, warehouse_id=None, filters={},
         GROUP BY sm.product_id, sm.location_src_id
     )
     SELECT
-        -- 1. ALIAS REQUERIDOS POR PYDANTIC (Evita el Error 500)
         p.id as product_id, 
         w.id as warehouse_id, 
         l.id as location_id, 
         
-        -- 2. Datos descriptivos
         p.sku, 
         p.name as product_name, 
         pc.name as category_name,
@@ -1493,25 +1491,31 @@ def get_stock_summary_filtered_sorted(company_id, warehouse_id=None, filters={},
         l.name as location_name,
         u.name as uom_name,
 
-        -- 3. Lógica de Stock (Físico - Reservado = Disponible)
         SUM(sq.quantity) as physical_quantity,
         COALESCE(MAX(rss.reserved_qty), 0) as reserved_quantity,
-        (SUM(sq.quantity) - COALESCE(MAX(rss.reserved_qty), 0)) as available_quantity
+        (SUM(sq.quantity) - COALESCE(MAX(rss.reserved_qty), 0)) as available_quantity,
+        
+        -- [NUEVO] Propagar notas al resumen
+        -- Si hay varias notas diferentes, tomará la "máxima" alfabéticamente. 
+        -- Suficiente para pintar el icono de amarillo.
+        MAX(sq.notes) as notes
 
     FROM stock_quants sq
+    -- ... (Resto de tus JOINs y WHEREs igual que antes) ...
     JOIN products p ON sq.product_id = p.id
     JOIN locations l ON sq.location_id = l.id
     JOIN warehouses w ON l.warehouse_id = w.id
     LEFT JOIN product_categories pc ON p.category_id = pc.id
     LEFT JOIN uom u ON p.uom_id = u.id
-    -- Join con el cálculo de reservas
     LEFT JOIN ReservedStockSummary rss ON sq.product_id = rss.product_id AND sq.location_id = rss.location_src_id
     
     WHERE l.type = 'internal' AND p.company_id = %s AND sq.quantity > 0.001
     """
+
     params = [company_id, company_id]
     where_clauses = []
 
+    # Filtros
     filter_map = {
         'warehouse_name': 'w.name', 'location_name': 'l.name', 'sku': 'p.sku', 
         'product_name': 'p.name', 'category_name': 'pc.name', 'uom_name': 'u.name',
@@ -1530,14 +1534,14 @@ def get_stock_summary_filtered_sorted(company_id, warehouse_id=None, filters={},
     if where_clauses:
         base_query += " AND " + " AND ".join(where_clauses)
 
-    # Agrupamos por los identificadores únicos y nombres. 
-    # Quitamos rss.reserved_qty de aquí porque usamos MAX() arriba.
+    # Group By
     base_query += """
     GROUP BY 
         p.id, p.sku, p.name, pc.id, pc.name, u.id, u.name, 
         w.id, w.name, l.id, l.name
     """
 
+    # Sort By
     sort_map = {
         'warehouse_name': 'w.name', 
         'location_name': 'l.name', 
@@ -1553,13 +1557,17 @@ def get_stock_summary_filtered_sorted(company_id, warehouse_id=None, filters={},
     order_by_col = sort_map.get(order_by_col_key, 'p.sku')
     direction = "ASC" if ascending else "DESC"
     
-    # Manejo de nulos en ordenamiento
     if order_by_col in ['pc.name', 'u.name', 'l.name']:
          order_by_clause = f"COALESCE({order_by_col}, 'zzzz')"
     else:
          order_by_clause = order_by_col
          
     base_query += f" ORDER BY {order_by_clause} {direction}"
+    
+    # [NUEVO] Paginación
+    if limit is not None and offset is not None:
+        base_query += " LIMIT %s OFFSET %s"
+        params.extend([limit, offset])
     
     return execute_query(base_query, tuple(params), fetchall=True)
 
