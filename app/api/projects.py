@@ -472,7 +472,35 @@ async def import_projects_csv(
         
         if not rows: raise ValueError("El archivo CSV está vacío.")
         
+        # Mapa de headers del CSV: { "nombre de obra": "Nombre de Obra", ... }
         headers_map = {h.strip().lower(): h for h in reader.fieldnames or []}
+        
+        # --- [MEJORA] DICCIONARIO DE SINÓNIMOS ---
+        # Mapea nuestra clave interna -> Posibles nombres en el CSV
+        KEY_MAPPING = {
+            'name': ['name', 'nombre', 'nombre de obra', 'obra', 'proyecto'],
+            'code': ['code', 'codigo', 'código', 'codigo pep', 'pep', 'id pep', 'código pep'],
+            'macro_name': ['macro_name', 'macro', 'proyecto (macro)', 'macro proyecto', 'contrato marco'],
+            'status': ['status', 'estado'],
+            'phase': ['phase', 'fase', 'etapa'],
+            'address': ['address', 'direccion', 'dirección', 'direccion fisica', 'ubicacion'],
+            'department': ['department', 'departamento', 'dpto', 'dpto.'],
+            'province': ['province', 'provincia', 'prov', 'prov.'],
+            'district': ['district', 'distrito', 'dist'],
+            'budget': ['budget', 'presupuesto', 'presupuesto (s/)', 'monto'],
+            'start_date': ['start_date', 'inicio', 'f. inicio', 'fecha inicio'],
+            'end_date': ['end_date', 'fin', 'f. fin', 'fecha fin', 'termino']
+        }
+
+        # Resolver qué columna del CSV corresponde a cada clave interna
+        resolved_cols = {}
+        for internal_key, synonyms in KEY_MAPPING.items():
+            # Buscamos si algún sinónimo existe en los headers del CSV
+            match = next((h for h in synonyms if h in headers_map), None)
+            if match:
+                resolved_cols[internal_key] = headers_map[match]
+
+        # ----------------------------------------
         
         macros_db = db.get_macro_projects(company_id)
         macros_map = {m['name'].strip().upper(): m['id'] for m in macros_db}
@@ -482,67 +510,60 @@ async def import_projects_csv(
         
         # --- HELPER DE FECHAS (ESTRICTO) ---
         def parse_date_strict(date_str, field_name):
-            """Convierte string a YYYY-MM-DD. Si está vacío devuelve None. Si está mal, ERROR."""
-            if not date_str or not date_str.strip(): 
-                return None # Esto se convierte en NULL en SQL (Correcto)
-            
+            if not date_str or not date_str.strip(): return None 
             d = date_str.strip()
-            # Formato ISO (2025-12-31)
-            if "-" in d:
+            if "-" in d: # 2025-12-31
                 parts = d.split("-")
                 if len(parts) == 3 and len(parts[0]) == 4: return d
-            
-            # Formato Latino (31/12/2025)
-            if "/" in d:
+            if "/" in d: # 31/12/2025
                 parts = d.split("/")
                 if len(parts) == 3: return f"{parts[2]}-{parts[1]}-{parts[0]}"
-            
-            # Si llega aquí, el formato no es válido
             raise ValueError(f"Fecha inválida en '{field_name}': '{d}'. Use YYYY-MM-DD o DD/MM/YYYY")
 
         # --- FASE 1: VALIDACIÓN ---
         for i, row in enumerate(rows):
             line_num = i + 2
             
-            def get_val(key):
-                real_key = headers_map.get(key.lower())
-                return row.get(real_key, '').strip() if real_key else ''
+            # Helper para sacar valor usando el mapa resuelto
+            def get_val(internal_key):
+                csv_header = resolved_cols.get(internal_key)
+                return row.get(csv_header, '').strip() if csv_header else ''
 
             try:
                 # 1. Validar Nombre
                 name = get_val('name')
                 if not name:
-                    if not any(row.values()): continue 
-                    raise ValueError("El campo 'name' es obligatorio.")
+                    if not any(row.values()): continue # Saltar filas vacías
+                    raise ValueError("El campo 'Nombre de Obra' es obligatorio.")
 
-                # [MEJORA] Validación Estricta del Código PEP antes de ir al DB
+                # 2. Código PEP
                 code_val = get_val('code')
                 if not code_val:
-                    raise ValueError(f"El Código PEP es obligatorio para la obra '{name}'.")
+                    raise ValueError(f"El 'Código PEP' es obligatorio para la obra '{name}'.")
                 
-                # Validar caracteres prohibidos en el Excel (para consistencia con el Frontend)
                 import re
                 if not re.match(r"^[a-zA-Z0-9_./-]*$", code_val):
-                     raise ValueError(f"El Código PEP '{code_val}' contiene caracteres inválidos. Solo use letras, números, guiones, puntos o barras.")
+                     raise ValueError(f"El Código PEP '{code_val}' contiene caracteres inválidos.")
 
-                # 2. Validar Proyecto (Macro)
-                macro_name_raw = get_val('macro_name') or get_val('proyecto')
+                # 3. Validar Proyecto (Macro)
+                macro_name_raw = get_val('macro_name')
                 macro_id = None
                 
                 if not macro_name_raw:
-                    raise ValueError(f"El campo 'Proyecto' (Macro) es obligatorio para la obra '{name}'.")
+                    # Intento fallback: A veces el usuario pone el nombre del proyecto en otra columna
+                    raise ValueError(f"El campo 'Proyecto (Macro)' es obligatorio para la obra '{name}'.")
                 
                 macro_clean = macro_name_raw.strip().upper()
                 if macro_clean not in macros_map:
-                    raise ValueError(f"El Proyecto '{macro_name_raw}' NO EXISTE en el sistema. Créelo primero.")
+                    raise ValueError(f"El Proyecto '{macro_name_raw}' NO EXISTE en el sistema. Créelo primero en Jerarquía.")
                 
                 macro_id = macros_map[macro_clean]
 
-                # 3. Validar y Parsear Fechas (CRÍTICO: Devuelve None o String válido)
-                final_start = parse_date_strict(get_val('start_date'), 'start_date')
-                final_end = parse_date_strict(get_val('end_date'), 'end_date')
+                # 4. Validar Fechas
+                final_start = parse_date_strict(get_val('start_date'), 'Inicio')
+                final_end = parse_date_strict(get_val('end_date'), 'Fin')
 
-                # 4. Validar Presupuesto
+                # 5. Validar Presupuesto
                 budget_str = get_val('budget').replace("S/", "").replace(",", "")
                 try:
                     budget = float(budget_str) if budget_str else 0.0
@@ -551,13 +572,13 @@ async def import_projects_csv(
 
                 valid_rows_to_process.append({
                     "name": name,
-                    "code": get_val('code'),
+                    "code": code_val,
                     "macro_project_id": macro_id,
                     "address": get_val('address'),
                     "status": get_val('status') or 'active',
                     "phase": get_val('phase') or 'Sin Iniciar',
-                    "start_date": final_start, # <--- AQUÍ PASAMOS None, NO ''
-                    "end_date": final_end,     # <--- AQUÍ PASAMOS None, NO ''
+                    "start_date": final_start,
+                    "end_date": final_end,
                     "budget": budget,
                     "department": get_val('department'),
                     "province": get_val('province'),
@@ -579,7 +600,6 @@ async def import_projects_csv(
             res = db.upsert_project_from_import(
                 company_id=company_id,
                 **data
-                # Nota: NO pasamos cost_center aquí (va en macro)
             )
             if res == "created": stats['created'] += 1
             else: stats['updated'] += 1
@@ -591,5 +611,4 @@ async def import_projects_csv(
     except Exception as e:
         import traceback; traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error crítico: {str(e)}")
-
 
