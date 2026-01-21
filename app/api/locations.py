@@ -233,7 +233,7 @@ async def import_locations_csv(
     company_id: int = Query(...),
     file: UploadFile = File(...)
 ):
-    """ Importa ubicaciones desde un archivo CSV. """
+    """ Importa ubicaciones desde CSV (Auto-genera Path si falta). """
     if "locations.can_crud" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
@@ -241,66 +241,99 @@ async def import_locations_csv(
         content = await file.read()
         content_decoded = content.decode('utf-8-sig')
         file_io = io.StringIO(content_decoded)
+        
+        sniffer = csv.Sniffer()
+        try:
+            dialect = sniffer.sniff(content_decoded[:1024], delimiters=";,")
+        except csv.Error:
+            dialect = csv.excel
+            dialect.delimiter = ';'
+            
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error al leer el archivo: {e}")
 
-    reader = csv.DictReader(file_io, delimiter=';')
+    reader = csv.DictReader(file_io, dialect=dialect)
+    
     try:
         rows = list(reader)
         if not rows: raise ValueError("El archivo CSV está vacío.")
 
+        # Limpieza de cabeceras
         headers = {h.lower().strip() for h in reader.fieldnames or []}
-        # 'warehouse_name' es opcional, solo se usa si el tipo es 'internal'
-        required_headers = {"path", "name", "type"} 
+        # Path ya no es estrictamente requerido en el CSV si se puede generar
+        required_headers = {"name", "type"} 
         if not required_headers.issubset(headers):
             missing = required_headers - headers
             raise ValueError(f"Faltan columnas: {', '.join(sorted(list(missing)))}")
 
-        # Validar tipos de ubicación
         LOCATION_TYPE_MAP_REVERSE = {
             "Ubicación Interna": "internal", "Ubic. Proveedor (Virtual)": "vendor",
             "Ubic. Cliente (Virtual)": "customer", "Pérdida Inventario (Virtual)": "inventory",
             "Producción (Virtual)": "production", "Tránsito (Virtual)": "transit",
         }
-        # Cargar almacenes para validación
+        
+        # Cache de almacenes (Nombre -> ID y ID -> Código)
         warehouses_db = db.get_warehouses_simple(company_id)
-        warehouse_map = {wh['name']: wh['id'] for wh in warehouses_db}
+        warehouse_map = {wh['name'].upper(): wh['id'] for wh in warehouses_db}
+        
+        # Necesitamos los códigos para auto-generar paths
+        # Hacemos una consulta rápida o usamos un mapa auxiliar si get_warehouses_simple trajo el código
+        # Asumiendo que get_warehouses_simple devuelve {'id', 'name', 'code'}
+        warehouse_code_map = {wh['id']: wh['code'] for wh in warehouses_db}
 
         created, updated = 0, 0
         error_list = []
 
         for i, row in enumerate(rows):
             row_num = i + 2
-            path = row.get('path', '').strip()
+            
+            # Limpieza básica
+            raw_path = row.get('path', '').strip()
             name = row.get('name', '').strip()
             type_str = row.get('type', '').strip()
+            
+            if not name and not type_str: continue # Saltar vacíos
 
             try:
-                if not path or not name or not type_str:
-                    raise ValueError("path, name, y type son obligatorios.")
-
+                # 1. Validar Tipo
                 type_code = LOCATION_TYPE_MAP_REVERSE.get(type_str)
                 if not type_code:
-                    raise ValueError(f"Tipo '{type_str}' inválido.")
+                    if type_str in LOCATION_TYPE_MAP_REVERSE.values():
+                        type_code = type_str
+                    else:
+                        raise ValueError(f"Tipo '{type_str}' inválido.")
 
+                # 2. Validar Almacén
                 warehouse_id = None
                 if type_code == 'internal':
                     wh_name = row.get('warehouse_name', '').strip()
                     if not wh_name:
-                        raise ValueError("warehouse_name es obligatorio si el tipo es 'Ubicación Interna'.")
-                    warehouse_id = warehouse_map.get(wh_name)
+                        raise ValueError("warehouse_name es obligatorio para Ubicación Interna.")
+                    
+                    warehouse_id = warehouse_map.get(wh_name.upper())
                     if not warehouse_id:
-                        raise ValueError(f"Almacén '{wh_name}' no encontrado en la base de datos.")
+                        raise ValueError(f"Almacén '{wh_name}' no existe.")
 
-                # Llamar a la función de la BD (asumimos que existe una 'upsert')
-                # Nota: 'upsert_location_from_import' no existe, así que usaremos create/update
+                # 3. AUTO-GENERACIÓN DE PATH (La Magia)
+                final_path = raw_path
+                if not final_path:
+                    if type_code == 'internal' and warehouse_id:
+                        wh_code = warehouse_code_map.get(warehouse_id)
+                        if wh_code:
+                            # Genera: WH/STOCK
+                            final_path = f"{wh_code}/{name.upper()}"
+                        else:
+                            raise ValueError("No se pudo generar Path (Almacén sin código).")
+                    else:
+                        # Para virtuales, usamos el nombre como path si viene vacío
+                        final_path = name.upper()
 
-                # 1. Buscar si la ubicación existe por path
-                existing_loc = db.get_location_by_path(company_id, path)
+                # 4. Upsert
+                existing_loc = db.get_location_by_path(company_id, final_path)
 
                 payload = {
                     "name": name,
-                    "path": path,
+                    "path": final_path,
                     "type": type_code,
                     "category": row.get('category', '').strip() or None,
                     "warehouse_id": warehouse_id
@@ -314,18 +347,21 @@ async def import_locations_csv(
                     created += 1
 
             except Exception as e:
-                error_list.append(f"Fila {row_num} (Path: {path}): {e}")
+                error_list.append(f"Fila {row_num} ('{name}'): {e}")
 
         if error_list:
-            raise HTTPException(
-                status_code=400, 
-                detail="Importación fallida. Corrija los errores y reintente:\n- " + "\n- ".join(error_list)
-            )
+            display_errors = error_list[:10]
+            if len(error_list) > 10: display_errors.append("...")
+            # Lanzamos HTTPException directamente (el catch de abajo la dejará pasar)
+            raise HTTPException(status_code=400, detail="Errores:\n- " + "\n- ".join(display_errors))
 
         return {"created": created, "updated": updated, "errors": 0}
 
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
+    # [CORRECCIÓN CRÍTICA]
+    # Primero capturamos HTTPException para que FastAPI la devuelva como 400 normal
+    except HTTPException as he:
+        raise he 
+    # Luego capturamos cualquier otro crash inesperado como 500
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error crítico al procesar CSV: {e}")
+        raise HTTPException(status_code=500, detail=f"Error crítico: {e}")
