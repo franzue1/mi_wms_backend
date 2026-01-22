@@ -578,9 +578,11 @@ def upsert_project_from_import(company_id, name, code, macro_project_id, address
         if conn: return_db_connection(conn)
 
 def get_macro_project_id_by_name(company_id, name):
-    """Helper para buscar ID de Macro Proyecto por nombre (útil en importación)."""
+    """Helper para buscar ID de Macro Proyecto por nombre."""
     if not name: return None
-    res = execute_query("SELECT id FROM macro_projects WHERE company_id = %s AND name ILIKE %s", (company_id, name.strip()), fetchone=True)
+    # [CORRECCIÓN] Limpieza preventiva
+    clean_name = name.strip() 
+    res = execute_query("SELECT id FROM macro_projects WHERE company_id = %s AND name ILIKE %s", (company_id, clean_name), fetchone=True)
     return res['id'] if res else None
 
 # --- 5. REPORTES DE JERARQUÍA ---

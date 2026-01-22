@@ -41,80 +41,71 @@ def get_product_details(product_id):
     return execute_query(query, (product_id,), fetchone=True)
 
 def get_product_details_by_sku(sku, company_id):
-    """Busca los detalles completos de un producto por su SKU exacto para una compañía."""
+    """
+    Busca los detalles de un producto por su SKU.
+    [MEJORA] Búsqueda insensible a mayúsculas (ILIKE + TRIM).
+    """
     if not sku: return None
-    # Incluimos id, name, tracking, y uom_name (útil para la fila)
+    clean_sku = sku.strip()
+    
     query = """
         SELECT p.id, p.name, p.tracking, u.name as uom_name, p.standard_price
         FROM products p
         LEFT JOIN uom u ON p.uom_id = u.id
-        WHERE p.sku =  %s AND p.company_id =  %s
+        WHERE TRIM(p.sku) ILIKE TRIM(%s) AND p.company_id = %s
     """
-    return execute_query(query, (sku, company_id), fetchone=True)
+    return execute_query(query, (clean_sku, company_id), fetchone=True)
 
 def create_product(name, sku, category_id, tracking, uom_id, company_id, ownership, standard_price):
     """
-    Crea un nuevo producto usando el helper de commit.
+    Crea un nuevo producto. [ESTRICTO] Fuerza mayúsculas en SKU y Nombre.
     """
-    # Eliminamos la lógica manual del pool. execute_commit_query ya lo hace.
-    
+    # Normalización Estricta
+    sku_upper = sku.strip().upper() if sku else None
+    name_upper = name.strip().upper() if name else None
+
     query = """
         INSERT INTO products (name, sku, category_id, tracking, uom_id, company_id, ownership, standard_price) 
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s) 
         RETURNING id
     """
-    params = (name, sku, category_id, tracking, uom_id, company_id, ownership, standard_price)
+    params = (name_upper, sku_upper, category_id, tracking, uom_id, company_id, ownership, standard_price)
 
     try:
-        # Usamos el helper que maneja conexión, cursor y commit automáticamente
         result = execute_commit_query(query, params, fetchone=True)
-        
-        if result:
-            return result[0]
-        else:
-            raise Exception("No se devolvió ID al crear producto.")
+        if result: return result[0]
+        else: raise Exception("No se devolvió ID al crear producto.")
             
     except Exception as e:
-        # Manejo específico de errores
         if "products_sku_key" in str(e):
-            raise ValueError(f"El SKU '{sku}' ya existe.")
+            raise ValueError(f"El SKU '{sku_upper}' ya existe.")
         else:
-            # Loguear y re-lanzar
             print(f"Error DB [create_product]: {e}")
             traceback.print_exc()
             raise e
 
 def update_product(product_id, name, sku, category_id, tracking, uom_id, ownership, standard_price):
     """
-    Actualiza un producto existente usando el pool de conexiones.
-    Maneja la restricción de SKU único.
+    Actualiza un producto. [ESTRICTO] Fuerza mayúsculas en SKU y Nombre.
     """
+    sku_upper = sku.strip().upper() if sku else None
+    name_upper = name.strip().upper() if name else None
+
     query = """
         UPDATE products 
         SET name = %s, sku = %s, category_id = %s, tracking = %s, 
             uom_id = %s, ownership = %s, standard_price = %s 
         WHERE id = %s
     """
-    params = (name, sku, category_id, tracking, uom_id, ownership, standard_price, product_id)
+    params = (name_upper, sku_upper, category_id, tracking, uom_id, ownership, standard_price, product_id)
 
     try:
-        # 1. Usamos la función centralizada de escritura.
         execute_commit_query(query, params)
         
     except Exception as e:
-        # 2. Manejamos errores comunes (como SKU duplicado)
-        #    que execute_commit_query re-lanza desde la BD.
-        
-        # ¡Ajusta 'products_sku_key' al nombre real de tu constraint si es diferente!
         if "products_sku_key" in str(e): 
-            raise ValueError(f"El SKU '{sku}' ya existe para otro producto.")
-        
-        # Puedes añadir más 'elif' si, por ejemplo, el nombre también es único
-        # elif "products_name_key" in str(e):
-        #    raise ValueError(f"El nombre de producto '{name}' ya existe.")
-        
+            raise ValueError(f"El SKU '{sku_upper}' ya existe para otro producto.")
         else:
-            # Re-lanzar cualquier otro error de BD
             raise e
 
 def delete_product(product_id):
@@ -270,11 +261,15 @@ def get_products_count(company_id, filters={}):
 
 def upsert_product_from_import(company_id, sku, name, category_id, uom_id, tracking, ownership, price):
     """
-    Inserta o actualiza un producto (UPSERT) basado en (company_id, sku).
+    Inserta o actualiza un producto (UPSERT).
+    [ESTRICTO] Normaliza a mayúsculas antes de guardar.
     """
     conn = None
     
-    # Consulta SQL correcta y completa
+    # Normalización
+    sku_upper = sku.strip().upper() if sku else None
+    name_upper = name.strip().upper() if name else None
+    
     query = """
         INSERT INTO products (
             company_id, sku, name, category_id, uom_id, tracking, ownership, standard_price
@@ -288,10 +283,9 @@ def upsert_product_from_import(company_id, sku, name, category_id, uom_id, track
             tracking = EXCLUDED.tracking,
             ownership = EXCLUDED.ownership,
             standard_price = EXCLUDED.standard_price
-        RETURNING (xmax = 0) AS inserted -- Truco de Postgres para saber si fue insert (True) o update (False)
+        RETURNING (xmax = 0) AS inserted
     """
-    
-    params = (company_id, sku, name, category_id, uom_id, tracking, ownership, price)
+    params = (company_id, sku_upper, name_upper, category_id, uom_id, tracking, ownership, price)
 
     try:
         conn = get_db_connection()
@@ -305,7 +299,7 @@ def upsert_product_from_import(company_id, sku, name, category_id, uom_id, track
 
     except Exception as e:
         if conn: conn.rollback()
-        print(f"Error procesando fila para SKU {sku}: {e}")
+        print(f"Error procesando fila para SKU {sku_upper}: {e}")
         raise e
         
     finally:

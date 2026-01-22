@@ -585,32 +585,32 @@ def get_stock_summary_filtered_sorted(company_id, filters={}, sort_by='sku', asc
 
 def get_full_product_kardex_data(company_id, date_from, date_to, warehouse_id=None, product_filter=None):
     """
-    Obtiene TODOS los movimientos de stock detallados ('done') para el EXPORT CSV,
-    generando filas separadas para entradas y salidas, incluso en transferencias internas.
-    (Versión Corregida v5 - Lógica de JOIN 'l' y CASE)
+    Obtiene TODOS los movimientos de stock detallados ('done') para el EXPORT CSV.
+    [CORREGIDO] Usa ILIKE para búsqueda de productos insensible a mayúsculas.
     """
     
     # --- 1. Parámetros y cláusulas para el WHERE ---
-    where_clauses = ["p.state = 'done'", "p.company_id =  %s"]
+    where_clauses = ["p.state = 'done'", "p.company_id = %s"]
     params = [company_id]
 
     if date_from:
-        where_clauses.append("date(p.date_done) >=  %s")
+        where_clauses.append("date(p.date_done) >= %s")
         params.append(date_from)
     if date_to:
-        where_clauses.append("date(p.date_done) <=  %s")
+        where_clauses.append("date(p.date_done) <= %s")
         params.append(date_to)
     
     # Filtro de Almacén
     if warehouse_id and warehouse_id != "all":
-        where_clauses.append("l.warehouse_id =  %s")
+        where_clauses.append("l.warehouse_id = %s")
         params.append(warehouse_id)
     else:
         where_clauses.append("l.type = 'internal'")
         
     # Filtro de Producto
     if product_filter:
-        where_clauses.append("(prod.sku LIKE  %s OR prod.name LIKE  %s)")
+        # [CORRECCIÓN] Usar ILIKE para búsqueda flexible
+        where_clauses.append("(prod.sku ILIKE %s OR prod.name ILIKE %s)")
         params.extend([f"%{product_filter}%", f"%{product_filter}%"])
         
     query = f"""
@@ -686,7 +686,7 @@ def get_full_product_kardex_data(company_id, date_from, date_to, warehouse_id=No
 
         WHERE {" AND ".join(where_clauses)}
         
-        AND sm.quantity_done > 0 -- ¡CORREGIDO!
+        AND sm.quantity_done > 0 
 
         ORDER BY prod.sku ASC, p.date_done ASC, p.id ASC
     """
@@ -1409,7 +1409,7 @@ def get_reverse_logistics_rate(company_id):
 def get_distinct_filter_values(company_id, field, warehouse_id=None):
     """
     Obtiene valores únicos para los filtros de dropdown (Ubicación, Categoría).
-    Solo devuelve valores que realmente tienen stock > 0.
+    [MEJORA] Normaliza a mayúsculas para unificar opciones duplicadas por case.
     """
     column_map = {
         'location_name': 'l.name',
@@ -1419,8 +1419,9 @@ def get_distinct_filter_values(company_id, field, warehouse_id=None):
     db_col = column_map.get(field)
     if not db_col: return []
 
+    # [MEJORA] Usamos DISTINCT UPPER() para limpiar la lista visual
     query = f"""
-        SELECT DISTINCT {db_col} as value
+        SELECT DISTINCT UPPER({db_col}) as value
         FROM stock_quants sq
         JOIN locations l ON sq.location_id = l.id
         JOIN products p ON sq.product_id = p.id
@@ -1433,7 +1434,7 @@ def get_distinct_filter_values(company_id, field, warehouse_id=None):
         query += " AND l.warehouse_id = %s"
         params.append(warehouse_id)
     
-    query += f" ORDER BY {db_col}"
+    query += " ORDER BY value"
     
     res = execute_query(query, tuple(params), fetchall=True)
     return [r['value'] for r in res if r['value']]

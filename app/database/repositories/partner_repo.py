@@ -136,15 +136,20 @@ def get_partner_id_by_name(name, company_id):
 
 def create_partner(name, category_id, company_id, social_reason, ruc, email, phone, address):
     """
-    Crea un nuevo partner usando el helper de commit.
+    Crea un nuevo partner. [ESTRICTO] Fuerza mayúsculas en Nombre, Razón Social y Dirección.
     """
+    # Normalización
+    name_upper = name.strip().upper() if name else None
+    social_upper = social_reason.strip().upper() if social_reason else None
+    addr_upper = address.strip().upper() if address else None
+    
     query = """
         INSERT INTO partners
         (name, category_id, company_id, social_reason, ruc, email, phone, address)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
     """
-    params = (name, category_id, company_id, social_reason, ruc, email, phone, address)
+    params = (name_upper, category_id, company_id, social_upper, ruc, email, phone, addr_upper)
     
     try:
         result = execute_commit_query(query, params, fetchone=True)
@@ -155,15 +160,20 @@ def create_partner(name, category_id, company_id, social_reason, ruc, email, pho
 
     except Exception as e: 
         if "partners_company_id_name_key" in str(e):
-            print(f"[DB-WARN] Intento de crear Partner duplicado: {name} para Company ID: {company_id}")
-            raise ValueError(f"Ya existe un proveedor/cliente con el nombre '{name}'.")
+            print(f"[DB-WARN] Intento de crear Partner duplicado: {name_upper}")
+            raise ValueError(f"Ya existe un proveedor/cliente con el nombre '{name_upper}'.")
         else:
             raise e
 
 def update_partner(partner_id, name, category_id, social_reason, ruc, email, phone, address):
     """
-    Actualiza los detalles de un partner existente.
+    Actualiza partner. [ESTRICTO] Fuerza mayúsculas.
     """
+    # Normalización
+    name_upper = name.strip().upper() if name else None
+    social_upper = social_reason.strip().upper() if social_reason else None
+    addr_upper = address.strip().upper() if address else None
+
     query = """
         UPDATE partners SET
             name = %s,
@@ -175,13 +185,13 @@ def update_partner(partner_id, name, category_id, social_reason, ruc, email, pho
             address = %s
         WHERE id = %s
     """
-    params = (name, category_id, social_reason, ruc, email, phone, address, partner_id)
+    params = (name_upper, category_id, social_upper, ruc, email, phone, addr_upper, partner_id)
     
     try:
         execute_commit_query(query, params)
     except Exception as e: 
         if "partners_company_id_name_key" in str(e):
-            raise ValueError(f"Ya existe otro proveedor/cliente con el nombre '{name}'.")
+            raise ValueError(f"Ya existe otro proveedor/cliente con el nombre '{name_upper}'.")
         else:
             raise e
 
@@ -222,7 +232,13 @@ def delete_partner(partner_id):
 def upsert_partner_from_import(company_id, name, category_id, ruc, social_reason, address, email, phone):
     """
     Inserta o actualiza un partner desde la importación.
+    [ESTRICTO] Normaliza a mayúsculas.
     """
+    # Normalización
+    name_upper = name.strip().upper() if name else None
+    social_upper = social_reason.strip().upper() if social_reason else None
+    addr_upper = address.strip().upper() if address else None
+
     query = """
         INSERT INTO partners (company_id, name, category_id, ruc, social_reason, address, email, phone)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -235,7 +251,7 @@ def upsert_partner_from_import(company_id, name, category_id, ruc, social_reason
             phone = EXCLUDED.phone
         RETURNING (xmax = 0) AS inserted;
     """
-    params = (company_id, name, category_id, ruc, social_reason, address, email, phone)
+    params = (company_id, name_upper, category_id, ruc, social_upper, addr_upper, email, phone)
     
     try:
         result = execute_commit_query(query, params, fetchone=True)
@@ -243,11 +259,11 @@ def upsert_partner_from_import(company_id, name, category_id, ruc, social_reason
             was_inserted = result[0]
             return "created" if was_inserted else "updated"
         else:
-            print(f"ADVERTENCIA: UPSERT para Partner '{name}' no retornó un estado.")
+            print(f"ADVERTENCIA: UPSERT para Partner '{name_upper}' no retornó un estado.")
             return "error"
 
     except Exception as e:
-        print(f"Error procesando fila para Partner '{name}': {e}")
+        print(f"Error procesando fila para Partner '{name_upper}': {e}")
         return "error"
 
 def get_partners_filtered_sorted(company_id, filters={}, sort_by='name', ascending=True, limit=None, offset=None):
