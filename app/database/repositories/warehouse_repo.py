@@ -268,9 +268,13 @@ def inactivate_warehouse(warehouse_id):
         if conn: return_db_connection(conn) # <-- USAR HELPER
 
 def get_warehouse_id_by_name(name):
-    """Busca el ID de un almacén por su nombre exacto."""
+    """
+    Busca el ID de un almacén por su nombre.
+    [MEJORA] Búsqueda insensible a mayúsculas/minúsculas (ILIKE).
+    """
     if not name: return None
-    result = execute_query("SELECT id FROM warehouses WHERE name = %s", (name,), fetchone=True)
+    clean_name = name.strip()
+    result = execute_query("SELECT id FROM warehouses WHERE TRIM(name) ILIKE TRIM(%s)", (clean_name,), fetchone=True)
     return result['id'] if result else None
 
 def get_warehouse_id_for_location(location_id):
@@ -555,22 +559,25 @@ def get_locations_detailed(company_id):
 def create_location(company_id, name, path, type, category, warehouse_id):
     """
     Crea una nueva ubicación.
+    [MEJORA] Fuerza mayúsculas en nombre y path para estandarización.
     """
     if type != 'internal' and warehouse_id is not None: warehouse_id = None
     elif type == 'internal' and warehouse_id is None:
         raise ValueError("Se requiere un Almacén Asociado para ubicaciones de tipo 'Interna'.")
 
-    # ELIMINADO: global db_pool...
+    # Normalización
+    name_upper = name.strip().upper() if name else name
+    path_upper = path.strip().upper() if path else path
 
     conn = None
     try:
-        conn = get_db_connection() # <-- USAR HELPER
+        conn = get_db_connection()
         
         with conn.cursor() as cursor:
             # Validación de Path duplicado
-            cursor.execute("SELECT id FROM locations WHERE path = %s AND company_id = %s", (path, company_id))
+            cursor.execute("SELECT id FROM locations WHERE path = %s AND company_id = %s", (path_upper, company_id))
             if cursor.fetchone():
-                raise ValueError(f"El Path '{path}' ya existe.")
+                raise ValueError(f"El Path '{path_upper}' ya existe.")
             
             # Insertar
             query = """
@@ -578,7 +585,7 @@ def create_location(company_id, name, path, type, category, warehouse_id):
                 VALUES (%s, %s, %s, %s, %s, %s)
                 RETURNING id
             """
-            params = (company_id, name, path, type, category, warehouse_id)
+            params = (company_id, name_upper, path_upper, type, category, warehouse_id)
             cursor.execute(query, params)
             new_id = cursor.fetchone()[0]
             
@@ -588,24 +595,27 @@ def create_location(company_id, name, path, type, category, warehouse_id):
     except Exception as e:
         if conn: conn.rollback()
         if "locations_path_key" in str(e): 
-            raise ValueError(f"El Path '{path}' ya existe.")
-        raise ValueError(f"No se pudo crear la ubicación. Verifique los datos.") from e
+            raise ValueError(f"El Path '{path_upper}' ya existe.")
+        raise ValueError(f"No se pudo crear la ubicación: {e}") from e
     finally:
-        if conn: return_db_connection(conn) # <-- USAR HELPER
+        if conn: return_db_connection(conn)
 
 def update_location(location_id, company_id, name, path, type, category, warehouse_id):
     """
     Actualiza una ubicación existente.
+    [MEJORA] Fuerza mayúsculas en nombre y path.
     """
     print(f"[DB-UPDATE-LOC] Intentando actualizar Location ID: {location_id}")
     if type != 'internal' and warehouse_id is not None: warehouse_id = None
     elif type == 'internal' and warehouse_id is None: raise ValueError("Se requiere un Almacén Asociado.")
 
-    # ELIMINADO: global db_pool...
+    # Normalización
+    name_upper = name.strip().upper() if name else name
+    path_upper = path.strip().upper() if path else path
 
     conn = None
     try:
-        conn = get_db_connection() # <-- USAR HELPER
+        conn = get_db_connection() 
         
         with conn.cursor() as cursor:
             # Datos Actuales
@@ -630,16 +640,16 @@ def update_location(location_id, company_id, name, path, type, category, warehou
                     raise ValueError(f"No se puede modificar: es la última ubicación interna del almacén original (ID: {current_warehouse_id}).")
 
             # Validación Path único
-            cursor.execute("SELECT id FROM locations WHERE path = %s AND company_id = %s AND id != %s", (path, company_id, location_id))
+            cursor.execute("SELECT id FROM locations WHERE path = %s AND company_id = %s AND id != %s", (path_upper, company_id, location_id))
             existing = cursor.fetchone()
-            if existing: raise ValueError(f"El Path '{path}' ya está en uso por otra ubicación.")
+            if existing: raise ValueError(f"El Path '{path_upper}' ya está en uso por otra ubicación.")
 
             # Ejecutar UPDATE
             cursor.execute(
                 """UPDATE locations SET
                    name = %s, path = %s, type = %s, category = %s, warehouse_id = %s
                    WHERE id = %s AND company_id = %s""",
-                (name, path, type, category, warehouse_id, location_id, company_id)
+                (name_upper, path_upper, type, category, warehouse_id, location_id, company_id)
             )
             conn.commit()
             return True
@@ -654,7 +664,7 @@ def update_location(location_id, company_id, name, path, type, category, warehou
         traceback.print_exc()
         raise RuntimeError(f"Error inesperado al actualizar ubicación: {ex}")
     finally:
-        if conn: return_db_connection(conn) # <-- USAR HELPER
+        if conn: return_db_connection(conn)
 
 def delete_location(location_id):
     """
@@ -714,14 +724,27 @@ def get_location_name_details(location_id):
     return dict(result) if result else None
 
 def get_location_details_by_names(company_id, warehouse_name, location_name):
+    """
+    Busca una ubicación interna por nombre de almacén y nombre de ubicación.
+    [MEJORA] Búsqueda insensible a mayúsculas/minúsculas y espacios (ILIKE + TRIM).
+    """
     if not company_id or not warehouse_name or not location_name: return None
+    
+    # Limpieza previa
+    wh_clean = warehouse_name.strip()
+    loc_clean = location_name.strip()
+
     query = """
         SELECT l.id, l.warehouse_id
         FROM locations l
         JOIN warehouses w ON l.warehouse_id = w.id
-        WHERE l.company_id = %s AND w.name = %s AND l.name = %s AND l.type = 'internal'
+        WHERE l.company_id = %s 
+          AND TRIM(w.name) ILIKE TRIM(%s) 
+          AND TRIM(l.name) ILIKE TRIM(%s) 
+          AND l.type = 'internal'
+        LIMIT 1
     """
-    result = execute_query(query, (company_id, warehouse_name, location_name), fetchone=True)
+    result = execute_query(query, (company_id, wh_clean, loc_clean), fetchone=True)
     return dict(result) if result else None
 
 def get_location_details_by_id(location_id: int):
