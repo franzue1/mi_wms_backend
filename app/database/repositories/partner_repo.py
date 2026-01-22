@@ -1,3 +1,4 @@
+#app/database/repositories/partner_repo.py
 import traceback
 from ..core import (
     get_db_connection, 
@@ -114,15 +115,23 @@ def get_partner_name(partner_id):
     return result['name'] if result else None
 
 def get_partner_id_by_name(name, company_id):
-    """Busca el ID y el NOMBRE DE CATEGORÍA de un partner por su nombre exacto."""
+    """
+    Busca el ID y el NOMBRE DE CATEGORÍA de un partner.
+    [MEJORA] Búsqueda insensible a mayúsculas/minúsculas y espacios (ILIKE + TRIM).
+    """
     if not name: return None
+    
+    # Limpiamos el input
+    clean_name = name.strip()
+    
     query = """
         SELECT p.id, pc.name as category_name
         FROM partners p
         LEFT JOIN partner_categories pc ON p.category_id = pc.id
-        WHERE p.name = %s AND p.company_id = %s
+        WHERE TRIM(p.name) ILIKE TRIM(%s) AND p.company_id = %s
+        LIMIT 1
     """
-    result = execute_query(query, (name, company_id), fetchone=True)
+    result = execute_query(query, (clean_name, company_id), fetchone=True)
     return result
 
 def create_partner(name, category_id, company_id, social_reason, ruc, email, phone, address):

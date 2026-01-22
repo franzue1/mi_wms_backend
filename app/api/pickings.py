@@ -470,8 +470,9 @@ async def import_pickings_csv(
                 if current_errors: all_errors.extend([f"Fila {row_num}: {err}" for err in current_errors])
                 else: validated_data.append(validated_row_data)
 
+
+
         elif import_type == 'full':
-            # ... (Validación FULL - misma lógica resumida) ...
             required_headers = {'documento_origen', 'custom_operation_type', 'ubicacion_origen', 'ubicacion_destino', 'date_transfer', 'product_sku', 'quantity'}
             if not required_headers.issubset(set(headers_csv)):
                 missing = required_headers - set(headers_csv); raise ValueError(f"Faltan columnas: {', '.join(missing)}")
@@ -517,7 +518,6 @@ async def import_pickings_csv(
                             actual_dest_cat = warehouse_cat_map.get(str(almacen_destino_csv).upper())
                             if actual_dest_cat not in allowed_dest_cats: group_errors.append(f"Lógica: '{op_type_name}' no puede ir a '{almacen_destino_csv}' ({actual_dest_cat}). Esperado: {allowed_dest_cats}")
 
-                    # (Repetir validaciones de existencia de src/dest como en headers...)
                     # --- VALIDACIÓN DE EXISTENCIA (Resumida) ---
                     if expected_source_type == 'vendor':
                         partner_info = db.get_partner_id_by_name(ubicacion_origen_csv, company_id)
@@ -529,7 +529,6 @@ async def import_pickings_csv(
                             source_loc_details = db.get_location_details_by_names(company_id, almacen_origen_csv, ubicacion_origen_csv)
                             if not source_loc_details: group_errors.append(f"Ubicación Origen Inválida.")
                             else: src_loc_id = source_loc_details['id']; wh_id_for_pt = source_loc_details['warehouse_id']
-                    # ... (Destino igual) ...
                     if expected_dest_type == 'internal':
                         if not almacen_destino_csv: group_errors.append("Falta Almacén Destino.")
                         else:
@@ -652,8 +651,15 @@ async def import_pickings_csv(
         if all_errors: raise HTTPException(status_code=500, detail="\n".join(all_errors[:10]))
         return {"created": created_headers or created_pickings, "updated": 0, "errors": 0}
 
-    except ValueError as ve: raise HTTPException(status_code=400, detail=str(ve))
-    except Exception as e: traceback.print_exc(); raise HTTPException(status_code=500, detail=f"Error crítico: {e}")
+    except HTTPException as he:
+        # Re-lanzar excepciones HTTP explícitas (como el 400 de validación)
+        raise he
+    except ValueError as ve: 
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e: 
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error crítico: {e}")
+
 
 # --- 3. Endpoints Helpers (CRÍTICO: Deben ir ANTES de /{id}) ---
 

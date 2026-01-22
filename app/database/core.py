@@ -1,5 +1,3 @@
-#app/database/core.py
-
 import psycopg2
 import psycopg2.pool
 import psycopg2.extras
@@ -14,6 +12,7 @@ DATABASE_URL = None
 def init_db_pool():
     """
     Inicializa el pool de conexiones.
+    [OPTIMIZADO] Usa ThreadedConnectionPool para concurrencia segura en FastAPI.
     """
     global db_pool, DATABASE_URL
     if db_pool:
@@ -25,13 +24,11 @@ def init_db_pool():
     if DATABASE_URL is None:
         raise ValueError("No se pudo conectar: DATABASE_URL no está configurada.")
 
-    # print(f"DEBUG URL: {repr(DATABASE_URL)}") # <--- Comenta esto en producción por seguridad
-
     try:
         # Definimos argumentos base
         pool_args = {
             "minconn": 1,
-            "maxconn": 10,
+            "maxconn": 10, # Ajustar según el plan de Render/Supabase
             "dsn": DATABASE_URL
         }
 
@@ -42,14 +39,16 @@ def init_db_pool():
             pool_args["sslmode"] = "require"
         # ----------------------------------------------------
 
-        db_pool = psycopg2.pool.SimpleConnectionPool(**pool_args)
+        # [MEJORA CRÍTICA] Usamos ThreadedConnectionPool
+        # SimpleConnectionPool no es thread-safe para aplicaciones multihilo como FastAPI/Uvicorn
+        db_pool = psycopg2.pool.ThreadedConnectionPool(**pool_args)
         
-        # Probar conexión
+        # Probar conexión inmediatamente (Fail Fast)
         conn = db_pool.getconn()
         if "localhost" in DATABASE_URL:
-            print(" -> Pool de BD (Local) Creado.")
+            print(" -> Pool de BD (Local - Threaded) Creado.")
         else:
-            print(" -> Pool de BD (Producción + SSL) Creado.")
+            print(" -> Pool de BD (Producción + SSL - Threaded) Creado.")
         db_pool.putconn(conn)
 
     except psycopg2.OperationalError as e:
@@ -68,39 +67,50 @@ def return_db_connection(conn):
     """Helper para devolver conexión al pool"""
     global db_pool
     if db_pool and conn:
-        db_pool.putconn(conn)
+        try:
+            db_pool.putconn(conn)
+        except Exception:
+            # Si la conexión ya estaba cerrada o el pool murió, no crasheamos
+            pass
 
 def execute_query(query, params=(), fetchone=False, fetchall=False):
+    """
+    Ejecuta una consulta de LECTURA (SELECT).
+    Maneja la conexión y el retorno al pool automáticamente.
+    """
     global db_pool
     if not db_pool: init_db_pool()
 
     conn = None
     try:
-        conn = db_pool.getconn() 
-        conn.cursor_factory = psycopg2.extras.DictCursor 
-        
-        with conn.cursor() as cursor:
+        conn = db_pool.getconn()
+        # [MEJORA] Asignamos el factory directamente en el cursor para no ensuciar la conexión global
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
             cursor.execute(query, params)
             if fetchone: return cursor.fetchone()
             if fetchall: return cursor.fetchall()
-
+            
     except Exception as e:
         print(f"Error lectura SQL: {e}")
-        traceback.print_exc()
+        # No imprimimos traceback completo para errores de consulta comunes, solo el mensaje
+        # traceback.print_exc() 
         raise e
     finally:
         if conn: db_pool.putconn(conn) 
 
 def execute_commit_query(query, params=(), fetchone=False):
+    """
+    Ejecuta una consulta de ESCRITURA (INSERT/UPDATE/DELETE).
+    Maneja Commit y Rollback automáticamente.
+    """
     global db_pool
     if not db_pool: init_db_pool()
 
     conn = None
     try:
         conn = db_pool.getconn() 
-        conn.cursor_factory = psycopg2.extras.DictCursor
         
-        with conn.cursor() as cursor:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
             cursor.execute(query, params)
             result = None
             if fetchone:

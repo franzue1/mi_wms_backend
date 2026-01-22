@@ -1975,16 +1975,47 @@ def import_smart_adjustments_transaction(company_id, user_name, rows):
 def get_data_for_export(company_id, export_type, selected_ids=None):
     """
     Obtiene los datos para el CSV.
-    [MEJORA] Soporta filtrado por lista de IDs seleccionados.
+    [MEJORA v2] Lógica Inteligente para Nombres de Proveedores/Clientes.
+    - Si es IN (Recepción): Origen = Nombre del Partner (Proveedor).
+    - Si es OUT (Entrega): Destino = Nombre del Partner (Cliente).
+    - Mantiene la columna 'notes' (Comentarios).
     """
     params = [company_id]
     filter_clause = ""
     
-    # Lógica de Filtrado por Selección
     if selected_ids:
-        # Usamos ANY para pasar una lista de Python a un Array de Postgres de forma segura
         filter_clause = "AND p.id = ANY(%s)"
         params.append(selected_ids)
+
+    notes_col = "p.notes as comentarios,"
+
+    # Definimos la lógica de visualización de ubicaciones
+    # Se usa tanto en 'headers' como en 'full'
+    smart_locations_sql = """
+        -- LOGICA INTELIGENTE ORIGEN
+        CASE 
+            WHEN pt.code = 'IN' THEN part.name -- Si es Entrada, mostrar Proveedor
+            WHEN l_src.type = 'internal' THEN w_src.name 
+            ELSE l_src.path 
+        END as almacen_origen,
+        
+        CASE 
+            WHEN pt.code = 'IN' THEN part.name 
+            ELSE l_src.path 
+        END as ubicacion_origen,
+        
+        -- LOGICA INTELIGENTE DESTINO
+        CASE 
+            WHEN pt.code = 'OUT' THEN part.name -- Si es Salida, mostrar Cliente
+            WHEN l_dest.type = 'internal' THEN w_dest.name 
+            ELSE l_dest.path 
+        END as almacen_destino,
+        
+        CASE 
+            WHEN pt.code = 'OUT' THEN part.name 
+            ELSE l_dest.path 
+        END as ubicacion_destino
+    """
 
     if export_type == 'headers':
         query = f"""
@@ -1995,21 +2026,20 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
                 p.custom_operation_type,
                 proj.name as project_name,
                 
-                -- Origen Legible
-                CASE WHEN l_src.type = 'internal' THEN w_src.name ELSE l_src.path END as almacen_origen,
-                l_src.path as ubicacion_origen,
-                
-                -- Destino Legible
-                CASE WHEN l_dest.type = 'internal' THEN w_dest.name ELSE l_dest.path END as almacen_destino,
-                l_dest.path as ubicacion_destino,
+                {smart_locations_sql}, -- <--- Lógica inyectada aquí
                 
                 p.partner_ref, 
                 p.purchase_order,
                 TO_CHAR(p.date_transfer, 'DD/MM/YYYY') as date_transfer, 
-                p.responsible_user
+                p.responsible_user,
+                {notes_col}
+
+                -- Dummy columns
+                '' as product_sku, '' as product_name, 0 as quantity, 0 as price_unit, '' as serial
 
             FROM pickings p
             JOIN picking_types pt ON p.picking_type_id = pt.id
+            LEFT JOIN partners part ON p.partner_id = part.id  -- <--- JOIN CLAVE
             LEFT JOIN projects proj ON p.project_id = proj.id
             LEFT JOIN locations l_src ON p.location_src_id = l_src.id
             LEFT JOIN locations l_dest ON p.location_dest_id = l_dest.id
@@ -2018,7 +2048,7 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
             
             WHERE p.company_id = %s 
               AND pt.code != 'ADJ'
-              {filter_clause} -- <-- Aquí entra el filtro de IDs
+              {filter_clause}
             ORDER BY p.id DESC
         """
         
@@ -2031,24 +2061,20 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
                 p.custom_operation_type,
                 proj.name as project_name,
                 
-                CASE WHEN l_src.type = 'internal' THEN w_src.name ELSE l_src.path END as almacen_origen,
-                l_src.path as ubicacion_origen,
-                
-                CASE WHEN l_dest.type = 'internal' THEN w_dest.name ELSE l_dest.path END as almacen_destino,
-                l_dest.path as ubicacion_destino,
+                {smart_locations_sql}, -- <--- Lógica inyectada aquí
                 
                 p.partner_ref, 
                 p.purchase_order,
                 TO_CHAR(p.date_transfer, 'DD/MM/YYYY') as date_transfer, 
                 p.responsible_user,
                 
-                -- Detalle de Producto
                 prod.sku as product_sku,
                 prod.name as product_name,
                 sm.product_uom_qty as quantity,
                 sm.price_unit,
                 
-                -- Series concatenadas (String Aggregation)
+                {notes_col}
+
                 (
                     SELECT string_agg(sl.name, ', ')
                     FROM stock_move_lines sml
@@ -2060,6 +2086,7 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
             JOIN stock_moves sm ON sm.picking_id = p.id
             JOIN products prod ON sm.product_id = prod.id
             JOIN picking_types pt ON p.picking_type_id = pt.id
+            LEFT JOIN partners part ON p.partner_id = part.id -- <--- JOIN CLAVE
             LEFT JOIN projects proj ON p.project_id = proj.id
             LEFT JOIN locations l_src ON p.location_src_id = l_src.id
             LEFT JOIN locations l_dest ON p.location_dest_id = l_dest.id
@@ -2068,8 +2095,9 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
             
             WHERE p.company_id = %s 
               AND pt.code != 'ADJ'
-              {filter_clause} -- <-- Aquí entra el filtro de IDs
+              {filter_clause}
             ORDER BY p.id DESC, prod.sku ASC
         """
     
     return execute_query(query, tuple(params), fetchall=True)
+
