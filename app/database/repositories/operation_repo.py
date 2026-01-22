@@ -2101,3 +2101,25 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
     
     return execute_query(query, tuple(params), fetchall=True)
 
+def get_project_id_by_composite_key(macro_name, project_code, company_id):
+    """
+    Busca un proyecto usando la LLAVE COMPUESTA: (Nombre Macro Proyecto + Código PEP Obra).
+    Garantiza unicidad.
+    """
+    if not macro_name or not project_code: return None
+    
+    clean_macro = macro_name.strip()
+    clean_code = project_code.strip()
+    
+    query = """
+        SELECT p.id 
+        FROM projects p
+        JOIN macro_projects mp ON p.macro_project_id = mp.id
+        WHERE p.company_id = %s
+          AND p.status = 'active'
+          AND TRIM(mp.name) ILIKE TRIM(%s)  -- Coincidencia flexible de nombre Macro
+          AND TRIM(p.code) ILIKE TRIM(%s)   -- Coincidencia flexible de Código PEP
+        LIMIT 1
+    """
+    res = execute_query(query, (company_id, clean_macro, clean_code), fetchone=True)
+    return res['id'] if res else None

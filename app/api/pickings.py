@@ -318,10 +318,8 @@ async def import_pickings_csv(
     company_id: int = Query(...),
     file: UploadFile = File(...)
 ):
-    verify_company_access(auth, company_id) # <--- BLINDAJE
-    """
-    [MIGRADO & ACTUALIZADO] Importa operaciones con validación de PROYECTOS y LÓGICA DE NEGOCIO.
-    """
+    verify_company_access(auth, company_id)
+    
     if "operations.can_import_export" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
@@ -352,11 +350,7 @@ async def import_pickings_csv(
     responsible_user = auth.username
 
     try:
-        # ============================================
-        # --- FASE 1: VALIDACIÓN ---
-        # ============================================
-        
-        # [NUEVO] Precarga de Categorías de Almacén para validación rápida
+        # [NUEVO] Precarga de Categorías de Almacén
         warehouse_cat_map = {}
         try:
             wh_rows = await asyncio.to_thread(
@@ -369,6 +363,35 @@ async def import_pickings_csv(
         except Exception as e:
             print(f"Warn: No se pudo cargar mapa de categorías: {e}")
 
+        # ============================================
+        # --- BLOQUE COMÚN: VALIDACIÓN DE PROYECTO ---
+        # ============================================
+        async def resolve_project_id(row_data):
+            """Lógica encapsulada para buscar proyecto por Macro + Código."""
+            macro_name = row_data.get('macro_project')
+            proj_code = row_data.get('project_code')
+            
+            # Si el usuario puso el antiguo 'project_name', ignoramos o avisamos, pero la nueva plantilla manda.
+            
+            p_id = None
+            err = None
+
+            if macro_name and proj_code:
+                # Búsqueda EXACTA y SEGURA
+                p_id = await asyncio.to_thread(
+                    db.get_project_id_by_composite_key, 
+                    macro_name, proj_code, company_id
+                )
+                if p_id is None:
+                    err = f"Proyecto no encontrado: Macro '{macro_name}' / Código '{proj_code}'."
+            
+            elif macro_name or proj_code:
+                # Incompleto
+                err = "Para asignar un proyecto, debe indicar AMBOS: 'macro_project' y 'project_code'."
+            
+            return p_id, err
+        # ============================================
+
         if import_type == 'headers':
             required_headers = {'custom_operation_type', 'ubicacion_origen', 'ubicacion_destino', 'date_transfer'}
             if not required_headers.issubset(set(headers_csv)):
@@ -378,14 +401,11 @@ async def import_pickings_csv(
                 row_num = i + 2; current_errors = []
                 validated_row_data = {'row_num': row_num, 'original_data': row}
                 
-                # A. Validar Proyecto
-                project_name_csv = row.get('project_name') or row.get('proyecto')
-                project_id = None
-                if project_name_csv:
-                    project_id = await asyncio.to_thread(db.get_project_id_by_name, project_name_csv, company_id)
-                    if project_id is None:
-                        print(f" [WARN] Fila {row_num}: Proyecto '{project_name_csv}' no encontrado. Se usará Stock General.")
-                validated_row_data['project_id'] = project_id
+                # --- 1. RESOLVER PROYECTO (PRELIMINAR) ---
+                pid, perr = await resolve_project_id(row)
+                if perr: current_errors.append(perr)
+                validated_row_data['project_id'] = pid
+                # -----------------------------------------
 
                 try:
                     op_type_name = row.get('custom_operation_type')
@@ -404,43 +424,41 @@ async def import_pickings_csv(
                             op_code = op_rule['code']; expected_source_type = op_rule['source_location_category']; expected_dest_type = op_rule['destination_location_category']
                             src_loc_id, dest_loc_id, partner_id, wh_id_for_pt = None, None, None, None
 
-                            # [NUEVO] VALIDACIÓN DE LÓGICA DE NEGOCIO (MATRIZ)
+                            # --- [REGLA DE NEGOCIO CRÍTICA] ---
+                            # Si es RECEPCIÓN (IN), forzamos SIN PROYECTO (Stock General)
+                            if op_code == 'IN':
+                                validated_row_data['project_id'] = None
+                                # Y si hubo un error de proyecto antes (ej. no encontrado), lo limpiamos porque no importa
+                                if perr and perr in current_errors:
+                                    current_errors.remove(perr)
+                            # ----------------------------------
+
+                            # VALIDACIÓN DE LÓGICA DE NEGOCIO (Matriz Origen/Destino)
                             logic_rule = IMPORT_LOGIC_RULES.get(op_type_name)
                             if logic_rule:
                                 allowed_src_cats, allowed_dest_cats = logic_rule
-                                # Validar Origen
                                 if allowed_src_cats and expected_source_type == 'internal':
                                     actual_src_cat = warehouse_cat_map.get(str(almacen_origen_csv).upper())
                                     if actual_src_cat not in allowed_src_cats:
                                         current_errors.append(f"Lógica: '{op_type_name}' no puede salir de '{almacen_origen_csv}' ({actual_src_cat}). Esperado: {allowed_src_cats}")
-                                # Validar Destino
                                 if allowed_dest_cats and expected_dest_type == 'internal':
                                     actual_dest_cat = warehouse_cat_map.get(str(almacen_destino_csv).upper())
                                     if actual_dest_cat not in allowed_dest_cats:
                                         current_errors.append(f"Lógica: '{op_type_name}' no puede ir a '{almacen_destino_csv}' ({actual_dest_cat}). Esperado: {allowed_dest_cats}")
 
-                            # Validar Existencia de Origen
+                            # Validar Origen/Destino
                             if expected_source_type == 'vendor':
                                 partner_info = db.get_partner_id_by_name(ubicacion_origen_csv, company_id)
                                 if not partner_info or partner_info['category_name'] != 'Proveedor Externo': current_errors.append(f"Proveedor Origen '{ubicacion_origen_csv}' inválido.")
-                                else: partner_id = partner_info['id']
-                            elif expected_source_type == 'customer':
-                                partner_info = db.get_partner_id_by_name(ubicacion_origen_csv, company_id)
-                                if not partner_info or partner_info['category_name'] != 'Proveedor Cliente': current_errors.append(f"Cliente Origen '{ubicacion_origen_csv}' inválido.")
                                 else: partner_id = partner_info['id']
                             elif expected_source_type == 'internal':
                                 if not almacen_origen_csv: current_errors.append("Falta Almacén Origen.")
                                 else:
                                     source_loc_details = db.get_location_details_by_names(company_id, almacen_origen_csv, ubicacion_origen_csv)
-                                    if not source_loc_details: current_errors.append(f"Ubicación Origen '{almacen_origen_csv}/{ubicacion_origen_csv}' inválida.")
+                                    if not source_loc_details: current_errors.append(f"Ubicación Origen '{almacen_origen_csv}/{ubicacion_origen_csv}' no encontrada.")
                                     else: src_loc_id = source_loc_details['id']; wh_id_for_pt = source_loc_details['warehouse_id']
 
-                            # Validar Existencia de Destino
-                            if expected_dest_type == 'vendor':
-                                partner_info = db.get_partner_id_by_name(ubicacion_destino_csv, company_id)
-                                if not partner_info or partner_info['category_name'] != 'Proveedor Externo': current_errors.append(f"Proveedor Destino '{ubicacion_destino_csv}' inválido.")
-                                else: partner_id = partner_info['id']
-                            elif expected_dest_type == 'customer':
+                            if expected_dest_type == 'customer':
                                 partner_info = db.get_partner_id_by_name(ubicacion_destino_csv, company_id)
                                 if not partner_info or partner_info['category_name'] != 'Proveedor Cliente': current_errors.append(f"Cliente Destino '{ubicacion_destino_csv}' inválido.")
                                 else: partner_id = partner_info['id']
@@ -448,18 +466,18 @@ async def import_pickings_csv(
                                 if not almacen_destino_csv: current_errors.append("Falta Almacén Destino.")
                                 else:
                                     dest_loc_details = db.get_location_details_by_names(company_id, almacen_destino_csv, ubicacion_destino_csv)
-                                    if not dest_loc_details: current_errors.append(f"Ubicación Destino '{almacen_destino_csv}/{ubicacion_destino_csv}' inválida.")
+                                    if not dest_loc_details: current_errors.append(f"Ubicación Destino '{almacen_destino_csv}/{ubicacion_destino_csv}' no encontrada.")
                                     else: 
                                         dest_loc_id = dest_loc_details['id']
                                         if wh_id_for_pt is None: wh_id_for_pt = dest_loc_details['warehouse_id']
 
                             if not current_errors:
                                 picking_type_id = db.find_picking_type_id(company_id, op_code, wh_id_for_pt)
-                                if not picking_type_id: current_errors.append(f"No se encontró tipo albarán '{op_code}' para almacén ID '{wh_id_for_pt}'.")
+                                if not picking_type_id: current_errors.append(f"No se encontró tipo albarán compatible.")
                                 else: validated_row_data['picking_type_id'] = picking_type_id
                             
                             try: date_transfer_db = datetime.strptime(date_str, "%d/%m/%Y").strftime("%Y-%m-%d"); validated_row_data['date_transfer_db'] = date_transfer_db
-                            except ValueError: current_errors.append(f"Formato fecha '{date_str}' incorrecto (DD/MM/YYYY).")
+                            except ValueError: current_errors.append(f"Fecha '{date_str}' inválida.")
 
                     validated_row_data['src_loc_id'] = src_loc_id; validated_row_data['dest_loc_id'] = dest_loc_id
                     validated_row_data['partner_id'] = partner_id; validated_row_data['partner_ref'] = partner_ref
@@ -469,8 +487,6 @@ async def import_pickings_csv(
                 
                 if current_errors: all_errors.extend([f"Fila {row_num}: {err}" for err in current_errors])
                 else: validated_data.append(validated_row_data)
-
-
 
         elif import_type == 'full':
             required_headers = {'documento_origen', 'custom_operation_type', 'ubicacion_origen', 'ubicacion_destino', 'date_transfer', 'product_sku', 'quantity'}
@@ -488,11 +504,10 @@ async def import_pickings_csv(
                 first_line = lines_with_nums[0]['data']
                 group_errors = []
 
-                # A. Proyecto
-                project_name_csv = first_line.get('project_name') or first_line.get('proyecto')
-                project_id = None
-                if project_name_csv:
-                    project_id = await asyncio.to_thread(db.get_project_id_by_name, project_name_csv, company_id)
+                # --- 1. RESOLVER PROYECTO (PRELIMINAR) ---
+                pid, perr = await resolve_project_id(first_line)
+                if perr: group_errors.append(perr)
+                # -----------------------------------------
 
                 try:
                     op_type_name = first_line.get('custom_operation_type'); almacen_origen_csv = first_line.get('almacen_origen'); ubicacion_origen_csv = first_line.get('ubicacion_origen')
@@ -507,51 +522,74 @@ async def import_pickings_csv(
                     op_code = op_rule['code']; expected_source_type = op_rule['source_location_category']; expected_dest_type = op_rule['destination_location_category']
                     src_loc_id, dest_loc_id, partner_id, wh_id_for_pt = None, None, None, None
 
-                    # [NUEVO] VALIDACIÓN DE LÓGICA DE NEGOCIO (MATRIZ) - FULL IMPORT
+                    # --- [REGLA DE NEGOCIO CRÍTICA] ---
+                    # Si es RECEPCIÓN (IN), forzamos SIN PROYECTO
+                    if op_code == 'IN':
+                        pid = None
+                        # Limpiamos errores de proyecto si los hubiera, ya que no aplica
+                        if perr and perr in group_errors:
+                            group_errors.remove(perr)
+                    # ----------------------------------
+
+                    # VALIDACIÓN LÓGICA (Matriz)
                     logic_rule = IMPORT_LOGIC_RULES.get(op_type_name)
                     if logic_rule:
                         allowed_src_cats, allowed_dest_cats = logic_rule
                         if allowed_src_cats and expected_source_type == 'internal':
                             actual_src_cat = warehouse_cat_map.get(str(almacen_origen_csv).upper())
-                            if actual_src_cat not in allowed_src_cats: group_errors.append(f"Lógica: '{op_type_name}' no puede salir de '{almacen_origen_csv}' ({actual_src_cat}). Esperado: {allowed_src_cats}")
+                            if actual_src_cat not in allowed_src_cats: group_errors.append(f"Lógica: Origen '{almacen_origen_csv}' ({actual_src_cat}) inválido.")
                         if allowed_dest_cats and expected_dest_type == 'internal':
                             actual_dest_cat = warehouse_cat_map.get(str(almacen_destino_csv).upper())
-                            if actual_dest_cat not in allowed_dest_cats: group_errors.append(f"Lógica: '{op_type_name}' no puede ir a '{almacen_destino_csv}' ({actual_dest_cat}). Esperado: {allowed_dest_cats}")
+                            if actual_dest_cat not in allowed_dest_cats: group_errors.append(f"Lógica: Destino '{almacen_destino_csv}' ({actual_dest_cat}) inválido.")
 
-                    # --- VALIDACIÓN DE EXISTENCIA (Resumida) ---
+                    # VALIDACIÓN DE EXISTENCIA
                     if expected_source_type == 'vendor':
                         partner_info = db.get_partner_id_by_name(ubicacion_origen_csv, company_id)
-                        if not partner_info or partner_info['category_name'] != 'Proveedor Externo': group_errors.append(f"Proveedor Origen Inválido.")
-                        else: partner_id = partner_info['id']
+                        if not partner_info:
+                            group_errors.append(f"Proveedor '{ubicacion_origen_csv}' no existe.")
+                        elif partner_info.get('category_name') != 'Proveedor Externo':
+                            group_errors.append(
+                                f"Partner '{ubicacion_origen_csv}' no es Proveedor Externo (es '{partner_info.get('category_name')}')."
+                            )
+                        else:
+                            partner_id = partner_info['id']
+
                     elif expected_source_type == 'internal':
                         if not almacen_origen_csv: group_errors.append("Falta Almacén Origen.")
                         else:
-                            source_loc_details = db.get_location_details_by_names(company_id, almacen_origen_csv, ubicacion_origen_csv)
-                            if not source_loc_details: group_errors.append(f"Ubicación Origen Inválida.")
-                            else: src_loc_id = source_loc_details['id']; wh_id_for_pt = source_loc_details['warehouse_id']
-                    if expected_dest_type == 'internal':
+                            sl = db.get_location_details_by_names(company_id, almacen_origen_csv, ubicacion_origen_csv)
+                            if not sl: group_errors.append(f"Origen '{almacen_origen_csv}/{ubicacion_origen_csv}' no existe.")
+                            else: src_loc_id = sl['id']; wh_id_for_pt = sl['warehouse_id']
+                    
+                    if expected_dest_type == 'customer':
+                        partner_info = db.get_partner_id_by_name(ubicacion_destino_csv, company_id)
+                        if not partner_info:
+                            group_errors.append(f"Cliente '{ubicacion_destino_csv}' no existe.")
+                        elif partner_info.get('category_name') != 'Proveedor Cliente':
+                            group_errors.append(
+                                f"Partner '{ubicacion_destino_csv}' no es Cliente (es '{partner_info.get('category_name')}')."
+                            )
+                        else:
+                            partner_id = partner_info['id']
+
+                    elif expected_dest_type == 'internal':
                         if not almacen_destino_csv: group_errors.append("Falta Almacén Destino.")
                         else:
-                            dest_loc_details = db.get_location_details_by_names(company_id, almacen_destino_csv, ubicacion_destino_csv)
-                            if not dest_loc_details: group_errors.append(f"Ubicación Destino Inválida.")
+                            dl = db.get_location_details_by_names(company_id, almacen_destino_csv, ubicacion_destino_csv)
+                            if not dl: group_errors.append(f"Destino '{almacen_destino_csv}/{ubicacion_destino_csv}' no existe.")
                             else: 
-                                dest_loc_id = dest_loc_details['id']
-                                if wh_id_for_pt is None: wh_id_for_pt = dest_loc_details['warehouse_id']
-                    elif expected_dest_type == 'customer':
-                        partner_info = db.get_partner_id_by_name(ubicacion_destino_csv, company_id)
-                        if not partner_info or partner_info['category_name'] != 'Proveedor Cliente': group_errors.append(f"Cliente Destino Inválido.")
-                        else: partner_id = partner_info['id']
-                    # ---------------------------------------------
+                                dest_loc_id = dl['id']
+                                if wh_id_for_pt is None: wh_id_for_pt = dl['warehouse_id']
 
                     if not group_errors:
                         picking_type_id = db.find_picking_type_id(company_id, op_code, wh_id_for_pt)
-                        if not picking_type_id: group_errors.append(f"No se encontró tipo albarán.")
+                        if not picking_type_id: group_errors.append(f"Tipo albarán no configurado.")
                         try: date_transfer_db = datetime.strptime(date_str, "%d/%m/%Y").strftime("%Y-%m-%d")
                         except ValueError: group_errors.append(f"Fecha inválida.")
                     
                     if group_errors: raise ValueError("; ".join(group_errors))
 
-                    validated_group_data['header'] = {'picking_type_id': picking_type_id, 'src_loc_id': src_loc_id, 'dest_loc_id': dest_loc_id, 'op_type_name': op_type_name, 'partner_id': partner_id, 'date_transfer_db': date_transfer_db, 'partner_ref': partner_ref, 'purchase_order': purchase_order, 'project_id': project_id }
+                    validated_group_data['header'] = {'picking_type_id': picking_type_id, 'src_loc_id': src_loc_id, 'dest_loc_id': dest_loc_id, 'op_type_name': op_type_name, 'partner_id': partner_id, 'date_transfer_db': date_transfer_db, 'partner_ref': partner_ref, 'purchase_order': purchase_order, 'project_id': pid }
 
                     # Procesar Líneas
                     for line_info in lines_with_nums:
@@ -561,10 +599,6 @@ async def import_pickings_csv(
                         
                         product_details = db.get_product_details_by_sku(sku, company_id)
                         if not product_details: raise ValueError(f"Línea {line_num}: SKU '{sku}' no encontrado.")
-                        
-                        # [NUEVO] Validar Candado de Propiedad en Importación
-                        # Usamos una lógica simplificada: Si es IN/OUT estricta, validamos.
-                        # (Opcional: Puedes agregar aquí la lógica de 'allowed_ownerships' si quieres ser estricto)
                         
                         try: qty = float(qty_str); price = float(price_str.replace(',', '.'))
                         except: raise ValueError(f"Línea {line_num}: Datos numéricos inválidos.")
@@ -580,37 +614,32 @@ async def import_pickings_csv(
             raise HTTPException(status_code=400, detail="Validación fallida:\n- " + "\n- ".join(all_errors[:20]))
 
         # ============================================
-        # --- FASE 2: EJECUCIÓN (CORREGIDA) ---
+        # --- FASE 2: EJECUCIÓN ---
         # ============================================
         
         created_headers = 0; created_pickings = 0
         
         if import_type == 'headers':
-            try:
-                for valid_row in validated_data:
-                    row_num = valid_row['row_num']; picking_type_id = valid_row['picking_type_id']
-                    try:
-                        new_name = db.get_next_picking_name(picking_type_id)
-                        new_picking_id = db.create_picking(
-                            new_name, picking_type_id, valid_row['src_loc_id'], valid_row['dest_loc_id'], 
-                            company_id, responsible_user, project_id=valid_row['project_id']
-                        )
-                        
-                        # [CORREGIDO] Usar diccionario para updates
-                        updates = {
-                            "partner_ref": valid_row.get('partner_ref'),
-                            "purchase_order": valid_row.get('purchase_order'),
-                            "date_transfer": valid_row.get('date_transfer_db'),
-                            "partner_id": valid_row.get('partner_id'),
-                            "location_src_id": valid_row['src_loc_id'],
-                            "location_dest_id": valid_row['dest_loc_id'],
-                            "custom_operation_type": valid_row['op_rule']['name']
-                        }
-                        db.update_picking_header(new_picking_id, updates)
-                        created_headers += 1
-                    except Exception as exec_row_err: all_errors.append(f"Fila {row_num}: {exec_row_err}"); raise exec_row_err
-            except Exception as exec_err:
-                if not all_errors: all_errors.append(f"Error ejecución: {exec_err}");
+            for valid_row in validated_data:
+                try:
+                    new_name = db.get_next_picking_name(valid_row['picking_type_id'])
+                    new_picking_id = db.create_picking(
+                        new_name, valid_row['picking_type_id'], valid_row['src_loc_id'], valid_row['dest_loc_id'], 
+                        company_id, responsible_user, project_id=valid_row['project_id']
+                    )
+                    updates = {
+                        "partner_ref": valid_row.get('partner_ref'),
+                        "purchase_order": valid_row.get('purchase_order'),
+                        "date_transfer": valid_row.get('date_transfer_db'),
+                        "partner_id": valid_row.get('partner_id'),
+                        "location_src_id": valid_row['src_loc_id'],
+                        "location_dest_id": valid_row['dest_loc_id'],
+                        "custom_operation_type": valid_row['op_rule']['name']
+                    }
+                    db.update_picking_header(new_picking_id, updates)
+                    created_headers += 1
+                except Exception as e:
+                    all_errors.append(f"Error guardando fila {valid_row['row_num']}: {e}")
 
         elif import_type == 'full':
             for group_data in validated_data:
@@ -622,7 +651,6 @@ async def import_pickings_csv(
                         company_id, responsible_user, project_id=header.get('project_id')
                     )
                     
-                    # [CORREGIDO] Usar diccionario para updates
                     updates = {
                         "partner_ref": header.get('partner_ref'),
                         "purchase_order": header.get('purchase_order'),
@@ -645,21 +673,17 @@ async def import_pickings_csv(
                             tracking_data = {s: 1 for s in line['serials']}
                             db.save_move_lines_for_move(move_id, tracking_data)
                     created_pickings += 1
-                except Exception as exec_group_err:
-                    all_errors.append(f"Doc '{doc_origen}': {exec_group_err}"); break
+                except Exception as e:
+                    all_errors.append(f"Error guardando Doc '{doc_origen}': {e}")
 
         if all_errors: raise HTTPException(status_code=500, detail="\n".join(all_errors[:10]))
         return {"created": created_headers or created_pickings, "updated": 0, "errors": 0}
 
-    except HTTPException as he:
-        # Re-lanzar excepciones HTTP explícitas (como el 400 de validación)
-        raise he
-    except ValueError as ve: 
-        raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException as he: raise he
+    except ValueError as ve: raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e: 
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error crítico: {e}")
-
 
 # --- 3. Endpoints Helpers (CRÍTICO: Deben ir ANTES de /{id}) ---
 
