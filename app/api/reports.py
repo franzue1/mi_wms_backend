@@ -254,6 +254,23 @@ async def get_product_reservations(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al obtener reservas: {e}")
 
+@router.get("/incoming/{product_id}/{location_id}", response_model=List[dict])
+async def get_product_incoming(
+    product_id: int,
+    location_id: int,
+    auth: AuthDependency
+):
+    """ Obtiene el detalle de albaranes 'listo' que están trayendo stock (En Tránsito). """
+    if "reports.stock.view" not in auth.permissions:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
+    
+    try:
+        # Llamamos a la nueva función del repo
+        incoming_data = db.get_product_incoming(product_id, location_id)
+        return [dict(row) for row in incoming_data]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al obtener tránsito: {e}")
+
 # --- ¡NUEVOS ENDPOINTS PARA KARDEX! ---
 
 @router.get("/kardex-summary", response_model=List[schemas.KardexSummaryResponse])

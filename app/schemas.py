@@ -140,7 +140,6 @@ class LocationResponse(LocationBase):
 # --- Schemas para Reportes ---
 
 class StockReportResponse(BaseModel):
-    # Definimos todos los campos que la consulta devuelve
     product_id: int
     sku: str
     product_name: str
@@ -153,6 +152,11 @@ class StockReportResponse(BaseModel):
     physical_quantity: float
     reserved_quantity: float
     available_quantity: float
+    
+    # [CORRECCIÓN] Lo hacemos opcional con valor por defecto 0.0
+    # Esto evita que el servidor explote si la DB no envía la columna.
+    incoming_quantity: Optional[float] = 0.0 
+    
     notes: Optional[str] = None
 
     class Config:
@@ -583,11 +587,12 @@ class StockDetailResponse(BaseModel):
     physical_quantity: float
     reserved_quantity: float
     available_quantity: float
-    uom_name: Optional[str] = None
     
-    # --- [FIX] AGREGAR ESTE CAMPO ---
+    # [NUEVO] Campo En Tránsito (Detallado)
+    incoming_quantity: float = 0.0 
+    
+    uom_name: Optional[str] = None
     notes: Optional[str] = None 
-    # --------------------------------
 
     class Config:
         from_attributes = True

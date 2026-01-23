@@ -488,21 +488,58 @@ def get_stock_summary_count(company_id, filters={}):
     res = execute_query(base_query, tuple(params), fetchone=True)
     return res['total'] if res else 0
 
-def get_stock_summary_filtered_sorted(company_id, filters={}, sort_by='sku', ascending=True, limit=None, offset=None):
+def get_stock_summary_filtered_sorted(company_id, warehouse_id=None, filters={}, sort_by='sku', ascending=True, limit=None, offset=None):
     """ 
-    [ACTUALIZADO] Obtiene el stock resumen PAGINADO.
-    - Incluye 'MAX(sq.notes)' para mostrar la nota unificada en el resumen.
+    [CORREGIDO DEFINITIVO] Obtiene el stock resumen.
+    
+    CAMBIO CLAVE:
+    Para 'IncomingStock' (En Tránsito) y 'ReservedStock' (Reservado), ahora usamos
+    directamente 'sm.product_uom_qty' (la cantidad planificada en el movimiento).
+    
+    Esto evita el problema donde el cálculo por líneas (stock_move_lines) devolvía 0
+    si las líneas aún no tenían 'qty_done' validado, garantizando que el número
+    coincida con la realidad operativa.
     """
     base_query = """
-    WITH ReservedStockSummary AS (
+    WITH 
+    -- 1. Stock Físico (Quants existentes)
+    PhysicalStock AS (
         SELECT 
-            sm.product_id, sm.location_src_id,
-            SUM(sm.product_uom_qty) as reserved_qty
+            sq.product_id, sq.location_id, SUM(sq.quantity) as qty, MAX(sq.notes) as note
+        FROM stock_quants sq
+        JOIN locations l ON sq.location_id = l.id
+        WHERE l.company_id = %s AND l.type = 'internal'
+        GROUP BY sq.product_id, sq.location_id
+    ),
+    -- 2. Stock Reservado (Salidas Planificadas)
+    ReservedStock AS (
+        SELECT 
+            sm.product_id, sm.location_src_id as location_id, 
+            SUM(sm.product_uom_qty) as qty -- Usamos la demanda total del movimiento
         FROM stock_moves sm
         JOIN pickings p ON sm.picking_id = p.id
         WHERE p.state = 'listo' AND p.company_id = %s
         GROUP BY sm.product_id, sm.location_src_id
+    ),
+    -- 3. Stock En Tránsito (Entradas Planificadas)
+    IncomingStock AS (
+        SELECT 
+            sm.product_id, sm.location_dest_id as location_id, 
+            SUM(sm.product_uom_qty) as qty -- Usamos la demanda total del movimiento
+        FROM stock_moves sm
+        JOIN pickings p ON sm.picking_id = p.id
+        WHERE p.state = 'listo' AND p.company_id = %s
+        GROUP BY sm.product_id, sm.location_dest_id
+    ),
+    -- 4. Unimos todas las claves para no perder productos que solo tengan tránsito
+    ActiveKeys AS (
+        SELECT product_id, location_id FROM PhysicalStock
+        UNION
+        SELECT product_id, location_id FROM ReservedStock
+        UNION
+        SELECT product_id, location_id FROM IncomingStock
     )
+    
     SELECT
         p.id as product_id, 
         w.id as warehouse_id, 
@@ -515,58 +552,67 @@ def get_stock_summary_filtered_sorted(company_id, filters={}, sort_by='sku', asc
         l.name as location_name,
         u.name as uom_name,
 
-        -- [CORRECCIÓN] Recuperar la nota. 
-        -- Como unificamos notas por prod/loc, MAX devuelve la nota existente.
-        MAX(sq.notes) as notes,
+        COALESCE(phys.note, '') as notes,
 
-        SUM(sq.quantity) as physical_quantity,
-        COALESCE(MAX(rss.reserved_qty), 0) as reserved_quantity,
-        (SUM(sq.quantity) - COALESCE(MAX(rss.reserved_qty), 0)) as available_quantity
+        COALESCE(phys.qty, 0) as physical_quantity,
+        COALESCE(res.qty, 0) as reserved_quantity,
+        
+        -- Aquí aseguramos que si Incoming es nulo, sea 0
+        COALESCE(inc.qty, 0) as incoming_quantity,
+        
+        (COALESCE(phys.qty, 0) - COALESCE(res.qty, 0)) as available_quantity
 
-    FROM stock_quants sq
-    JOIN products p ON sq.product_id = p.id
-    JOIN locations l ON sq.location_id = l.id
+    FROM ActiveKeys k
+    JOIN products p ON k.product_id = p.id
+    JOIN locations l ON k.location_id = l.id
     JOIN warehouses w ON l.warehouse_id = w.id
     LEFT JOIN product_categories pc ON p.category_id = pc.id
     LEFT JOIN uom u ON p.uom_id = u.id
-    LEFT JOIN ReservedStockSummary rss ON sq.product_id = rss.product_id AND sq.location_id = rss.location_src_id
     
-    WHERE l.type = 'internal' AND p.company_id = %s AND sq.quantity > 0.001
+    -- Joins a las tablas CTE calculadas arriba
+    LEFT JOIN PhysicalStock phys ON k.product_id = phys.product_id AND k.location_id = phys.location_id
+    LEFT JOIN ReservedStock res ON k.product_id = res.product_id AND k.location_id = res.location_id
+    LEFT JOIN IncomingStock inc ON k.product_id = inc.product_id AND k.location_id = inc.location_id
+    
+    WHERE p.company_id = %s 
+      -- Filtro para mostrar solo filas con actividad
+      AND (COALESCE(phys.qty, 0) > 0.001 OR COALESCE(inc.qty, 0) > 0.001 OR COALESCE(res.qty, 0) > 0.001)
     """
-    params = [company_id, company_id]
+    
+    # Params: [Physical, Reserved, Incoming, MainQuery]
+    params = [company_id, company_id, company_id, company_id]
     where_clauses = []
 
     filter_map = {
         'warehouse_name': 'w.name', 'location_name': 'l.name', 'sku': 'p.sku', 
         'product_name': 'p.name', 'category_name': 'pc.name', 'uom_name': 'u.name',
         'warehouse_id': 'w.id', 'location_id': 'l.id',
-        'notes': 'sq.notes' # Permitir filtrar por contenido de nota
+        'notes': 'phys.note' 
     }
+    
     for key, value in filters.items():
         db_column = filter_map.get(key)
         if db_column and value is not None and value != "":
             if key in ['warehouse_id', 'location_id']:
-                where_clauses.append(f"{db_column} = %s"); params.append(value)
+                where_clauses.append(f"{db_column} = %s")
+                params.append(value)
             else:
-                where_clauses.append(f"{db_column} ILIKE %s"); params.append(f"%{value}%")
+                where_clauses.append(f"{db_column} ILIKE %s")
+                params.append(f"%{value}%")
 
     if where_clauses:
         base_query += " AND " + " AND ".join(where_clauses)
 
-    base_query += """
-    GROUP BY 
-        p.id, p.sku, p.name, pc.id, pc.name, u.id, u.name, 
-        w.id, w.name, l.id, l.name
-    """
-
-    # Ordenamiento
     sort_map = {
         'warehouse_name': 'w.name', 'location_name': 'l.name', 'sku': 'p.sku',
         'product_name': 'p.name', 'category_name': 'pc.name',
-        'physical_quantity': 'physical_quantity', 'reserved_quantity': 'reserved_quantity', 
+        'physical_quantity': 'physical_quantity', 
+        'reserved_quantity': 'reserved_quantity', 
+        'incoming_quantity': 'incoming_quantity',
         'available_quantity': 'available_quantity'
     }
-    order_by_col = sort_map.get(sort_by, 'p.sku')
+    order_by_col_key = sort_by if sort_by else 'sku'
+    order_by_col = sort_map.get(order_by_col_key, 'p.sku')
     direction = "ASC" if ascending else "DESC"
     
     if order_by_col in ['pc.name', 'u.name', 'l.name']:
@@ -576,12 +622,122 @@ def get_stock_summary_filtered_sorted(company_id, filters={}, sort_by='sku', asc
          
     base_query += f" ORDER BY {order_by_clause} {direction}"
     
-    # Paginación
     if limit is not None:
         base_query += " LIMIT %s OFFSET %s"
         params.extend([limit, offset])
     
     return execute_query(base_query, tuple(params), fetchall=True)
+
+def get_stock_on_hand_filtered_sorted(company_id, warehouse_id=None, filters={}, sort_by='sku', ascending=True, limit=None, offset=None):
+    """ 
+    Obtiene el stock detallado por lote/serie y PROYECTO (Versión V3).
+    [ACTUALIZADO] Incluye IncomingStock para mostrar tránsito en detalle.
+    """
+    base_query = """
+    WITH ReservedStock AS (
+        SELECT 
+            sm.product_id, sm.location_src_id, sml.lot_id, sm.project_id,
+            SUM(CASE WHEN sml.id IS NOT NULL THEN sml.qty_done ELSE sm.product_uom_qty END) as reserved_qty
+        FROM stock_moves sm
+        JOIN pickings p ON sm.picking_id = p.id
+        LEFT JOIN stock_move_lines sml ON sm.id = sml.move_id
+        WHERE p.state = 'listo' AND p.company_id = %s
+        GROUP BY sm.product_id, sm.location_src_id, sml.lot_id, sm.project_id
+    ),
+    IncomingStock AS (
+        SELECT 
+            sm.product_id, sm.location_dest_id, sml.lot_id, sm.project_id,
+            SUM(CASE WHEN sml.id IS NOT NULL THEN sml.qty_done ELSE sm.product_uom_qty END) as incoming_qty
+        FROM stock_moves sm
+        JOIN pickings p ON sm.picking_id = p.id
+        LEFT JOIN stock_move_lines sml ON sm.id = sml.move_id
+        WHERE p.state = 'listo' AND p.company_id = %s
+        GROUP BY sm.product_id, sm.location_dest_id, sml.lot_id, sm.project_id
+    )
+    SELECT
+        p.id as product_id, w.id as warehouse_id, l.id as location_id, sl.id as lot_id, sq.project_id,
+        p.sku, p.name as product_name, pc.name as category_name,
+        w.name as warehouse_name, l.name as location_name, 
+        sl.name as lot_name, proj.name as project_name,
+        
+        SUM(sq.quantity) as physical_quantity, 
+        u.name as uom_name, MAX(sq.notes) as notes, 
+        
+        COALESCE(MAX(rs.reserved_qty), 0) as reserved_quantity,
+        -- [CRÍTICO] Columna necesaria
+        COALESCE(MAX(iss.incoming_qty), 0) as incoming_quantity,
+        
+        (SUM(sq.quantity) - COALESCE(MAX(rs.reserved_qty), 0)) as available_quantity,
+        COALESCE(sl.name, '---') as lot_name_ordered
+        
+    FROM stock_quants sq
+    JOIN products p ON sq.product_id = p.id
+    JOIN locations l ON sq.location_id = l.id
+    JOIN warehouses w ON l.warehouse_id = w.id
+    LEFT JOIN product_categories pc ON p.category_id = pc.id
+    LEFT JOIN stock_lots sl ON sq.lot_id = sl.id
+    LEFT JOIN uom u ON p.uom_id = u.id
+    LEFT JOIN projects proj ON sq.project_id = proj.id
+    
+    LEFT JOIN ReservedStock rs ON sq.product_id = rs.product_id AND sq.location_id = rs.location_src_id 
+        AND ((sq.lot_id = rs.lot_id AND sq.lot_id IS NOT NULL) OR (sq.lot_id IS NULL AND rs.lot_id IS NULL))
+        AND ((sq.project_id = rs.project_id AND sq.project_id IS NOT NULL) OR (sq.project_id IS NULL AND rs.project_id IS NULL))
+
+    LEFT JOIN IncomingStock iss ON sq.product_id = iss.product_id AND sq.location_id = iss.location_dest_id 
+        AND ((sq.lot_id = iss.lot_id AND sq.lot_id IS NOT NULL) OR (sq.lot_id IS NULL AND iss.lot_id IS NULL))
+        AND ((sq.project_id = iss.project_id AND sq.project_id IS NOT NULL) OR (sq.project_id IS NULL AND iss.project_id IS NULL))
+
+    WHERE l.type = 'internal' AND p.company_id = %s AND sq.quantity > 0.001
+    """
+    
+    params = [company_id, company_id, company_id]
+    where_clauses = []
+
+    filter_map = {
+        'warehouse_name': 'w.name','location_name': 'l.name', 'sku': 'p.sku', 'product_name': 'p.name',
+        'category_name': 'pc.name', 'lot_name': 'sl.name', 'uom_name': 'u.name',
+        'warehouse_id': 'w.id', 'location_id': 'l.id', 
+        'project_name': 'proj.name', 'location_name': 'l.name'
+    }
+    
+    for key, value in filters.items():
+        db_column = filter_map.get(key)
+        if db_column and value is not None and value != "":
+            if key in ['warehouse_id', 'location_id']:
+                where_clauses.append(f"{db_column} = %s"); params.append(value)
+            elif key == 'lot_name' and value == '-':
+                where_clauses.append("sl.id IS NULL")
+            else:
+                where_clauses.append(f"{db_column} ILIKE %s"); params.append(f"%{value}%")
+
+    if where_clauses:
+        base_query += " AND " + " AND ".join(where_clauses)
+
+    base_query += """
+    GROUP BY p.id, w.id, l.id, sl.id, sq.project_id, p.sku, p.name, pc.name, w.name, l.name, sl.name, proj.name, u.name, lot_name_ordered
+    """
+
+    sort_map = {
+        'warehouse_name': 'w.name', 'location_name': 'l.name', 'sku': 'p.sku',
+        'product_name': 'p.name', 'category_name': 'pc.name', 'lot_name': 'lot_name_ordered',
+        'physical_quantity': 'physical_quantity', 'reserved_quantity': 'reserved_quantity', 'incoming_quantity': 'incoming_quantity',
+        'available_quantity': 'available_quantity', 'uom_name': 'u.name', 'project_name': 'proj.name'
+    }
+    order_by_col_key = sort_by if sort_by else 'sku'
+    order_by_col = sort_map.get(order_by_col_key, 'p.sku')
+    direction = "ASC" if ascending else "DESC"
+    if order_by_col in ['pc.name', 'u.name', 'lot_name_ordered', 'l.name', 'proj.name']: order_by_clause = f"COALESCE({order_by_col}, 'zzzz')"
+    else: order_by_clause = order_by_col
+         
+    base_query += f" ORDER BY {order_by_clause} {direction}, p.sku ASC, lot_name_ordered ASC"
+    
+    if limit is not None:
+        base_query += " LIMIT %s OFFSET %s"
+        params.extend([limit, offset])
+    
+    return execute_query(base_query, tuple(params), fetchall=True)
+
+
 
 def get_full_product_kardex_data(company_id, date_from, date_to, warehouse_id=None, product_filter=None):
     """
@@ -886,144 +1042,10 @@ def get_stock_on_hand_count(company_id, warehouse_id=None, filters={}):
     res = execute_query(base_query, tuple(params), fetchone=True)
     return res['total'] if res else 0
 
-def get_stock_on_hand_filtered_sorted(company_id, warehouse_id=None, filters={}, sort_by='sku', ascending=True, limit=None, offset=None):
-    """ 
-    Obtiene el stock detallado por lote/serie y PROYECTO.
-    [CORREGIDO] Agrupa (SUM) los quants fragmentados para evitar duplicados visuales.
-    """
-    base_query = """
-    WITH ReservedStock AS (
-        SELECT 
-            sm.product_id, 
-            sm.location_src_id, 
-            sml.lot_id, 
-            sm.project_id,
-            SUM(
-                CASE 
-                    WHEN sml.id IS NOT NULL THEN sml.qty_done 
-                    ELSE sm.product_uom_qty 
-                END
-            ) as reserved_qty
-        FROM stock_moves sm
-        JOIN pickings p ON sm.picking_id = p.id
-        LEFT JOIN stock_move_lines sml ON sm.id = sml.move_id
-        WHERE p.state = 'listo' AND p.company_id = %s
-        GROUP BY sm.product_id, sm.location_src_id, sml.lot_id, sm.project_id
-    )
-    SELECT
-        p.id as product_id, 
-        w.id as warehouse_id, 
-        l.id as location_id, 
-        sl.id as lot_id,
-        sq.project_id,
-
-        p.sku, 
-        p.name as product_name, 
-        pc.name as category_name,
-        w.name as warehouse_name, 
-        l.name as location_name, 
-        
-        sl.name as lot_name,
-        proj.name as project_name,
-        
-        -- [CAMBIO] Sumamos la cantidad física
-        SUM(sq.quantity) as physical_quantity, 
-        u.name as uom_name,
-
-        -- [CAMBIO] Unificamos notas
-        MAX(sq.notes) as notes, 
-        
-        -- Reservas (usamos MAX o SUM dependiendo de la lógica, aquí SUM de la CTE agrupada externa es complejo, 
-        -- pero como ya agrupamos la CTE por las mismas claves, un MAX es seguro o un SUM si hubiera multiples matches, 
-        -- pero el LEFT JOIN es 1:1 gracias al GROUP BY de abajo)
-        COALESCE(MAX(rs.reserved_qty), 0) as reserved_quantity,
-        
-        (SUM(sq.quantity) - COALESCE(MAX(rs.reserved_qty), 0)) as available_quantity,
-        
-        COALESCE(sl.name, '---') as lot_name_ordered
-        
-    FROM stock_quants sq
-    JOIN products p ON sq.product_id = p.id
-    JOIN locations l ON sq.location_id = l.id
-    JOIN warehouses w ON l.warehouse_id = w.id
-    LEFT JOIN product_categories pc ON p.category_id = pc.id
-    LEFT JOIN stock_lots sl ON sq.lot_id = sl.id
-    LEFT JOIN uom u ON p.uom_id = u.id
-    LEFT JOIN projects proj ON sq.project_id = proj.id
-    
-    LEFT JOIN ReservedStock rs ON 
-        sq.product_id = rs.product_id 
-        AND sq.location_id = rs.location_src_id 
-        AND (
-            (sq.lot_id = rs.lot_id AND sq.lot_id IS NOT NULL)
-            OR
-            (sq.lot_id IS NULL AND rs.lot_id IS NULL AND 
-             (sq.project_id = rs.project_id OR (sq.project_id IS NULL AND rs.project_id IS NULL)))
-        )
-
-    WHERE l.type = 'internal' AND p.company_id = %s AND sq.quantity > 0.001
-    """
-    
-    params = [company_id, company_id]
-    where_clauses = []
-
-    filter_map = {
-        'warehouse_name': 'w.name','location_name': 'l.name', 'sku': 'p.sku', 'product_name': 'p.name',
-        'category_name': 'pc.name', 'lot_name': 'sl.name', 'uom_name': 'u.name',
-        'warehouse_id': 'w.id', 'location_id': 'l.id', 
-        'project_name': 'proj.name', 'location_name': 'l.name'
-    }
-    
-    for key, value in filters.items():
-        db_column = filter_map.get(key)
-        if db_column and value is not None and value != "":
-            if key in ['warehouse_id', 'location_id']:
-                where_clauses.append(f"{db_column} = %s"); params.append(value)
-            elif key == 'lot_name' and value == '-':
-                where_clauses.append("sl.id IS NULL")
-            else:
-                where_clauses.append(f"{db_column} ILIKE %s"); params.append(f"%{value}%")
-
-    if where_clauses:
-        base_query += " AND " + " AND ".join(where_clauses)
-
-    # [CLAVE] Agregamos el GROUP BY para fusionar filas fragmentadas
-    base_query += """
-    GROUP BY 
-        p.id, w.id, l.id, sl.id, sq.project_id,
-        p.sku, p.name, pc.name, w.name, l.name, 
-        sl.name, proj.name, u.name, lot_name_ordered
-    """
-
-    sort_map = {
-        'warehouse_name': 'w.name', 'location_name': 'l.name', 'sku': 'p.sku',
-        'product_name': 'p.name', 'category_name': 'pc.name', 'lot_name': 'lot_name_ordered',
-        'physical_quantity': 'physical_quantity', 'reserved_quantity': 'reserved_quantity', 
-        'available_quantity': 'available_quantity', 'uom_name': 'u.name', 
-        'project_name': 'proj.name'
-    }
-    order_by_col_key = sort_by if sort_by else 'sku'
-    order_by_col = sort_map.get(order_by_col_key, 'p.sku')
-    direction = "ASC" if ascending else "DESC"
-    
-    if order_by_col in ['pc.name', 'u.name', 'lot_name_ordered', 'l.name', 'proj.name']:
-         order_by_clause = f"COALESCE({order_by_col}, 'zzzz')"
-    else:
-         order_by_clause = order_by_col
-         
-    base_query += f" ORDER BY {order_by_clause} {direction}, p.sku ASC, lot_name_ordered ASC"
-    
-    # --- PAGINACIÓN ---
-    if limit is not None:
-        base_query += " LIMIT %s OFFSET %s"
-        params.extend([limit, offset])
-    
-    return execute_query(base_query, tuple(params), fetchall=True)
-
 def get_product_reservations(product_id, location_id, lot_id=None):
     """
     Devuelve una lista enriquecida de operaciones 'listo' que reservan stock.
-    [CORREGIDO] Prioriza 'date_transfer' que es la fecha obligatoria en Operaciones.
+    [CORREGIDO] Muestra el Nombre del Almacén en lugar del Path completo en 'dest_location'.
     """
     params = [product_id, location_id]
     
@@ -1033,10 +1055,6 @@ def get_product_reservations(product_id, location_id, lot_id=None):
             p.custom_operation_type as op_type,
             pt.code as type_code,
             
-            -- [CORRECCIÓN] Prioridad de Fechas:
-            -- 1. date_transfer (Fecha de Traslado - Obligatoria en Operaciones)
-            -- 2. attention_date (Fecha de Atención - Usada en Liquidaciones)
-            -- 3. scheduled_date (Fecha de Creación - Fallback)
             COALESCE(
                 TO_CHAR(p.date_transfer, 'DD/MM/YYYY'), 
                 TO_CHAR(p.attention_date, 'DD/MM/YYYY'), 
@@ -1047,12 +1065,15 @@ def get_product_reservations(product_id, location_id, lot_id=None):
             
             COALESCE(proj.name, 'Stock General') as project_name,
             COALESCE(part.name, 'Uso Interno') as partner_name,
-            COALESCE(l_dest.path, w_dest.name, 'Desconocido') as dest_location,
+            
+            -- [CAMBIO AQUI] Priorizamos el Nombre del Almacén (w_dest.name)
+            -- Si no es un almacén (ej. es un Cliente), mostramos el path o el nombre de la ubicación.
+            COALESCE(w_dest.name, l_dest.name, l_dest.path, 'Desconocido') as dest_location,
             
             SUM(sm.product_uom_qty) as reserved_qty
     """
 
-    # El resto de la función (JOINS, WHERE, etc.) se mantiene IGUAL
+    # El resto de la función se mantiene idéntico
     joins_clause = """
         FROM stock_moves sm
         JOIN pickings p ON sm.picking_id = p.id
@@ -1070,12 +1091,13 @@ def get_product_reservations(product_id, location_id, lot_id=None):
           AND sm.state != 'cancelled'
     """
 
-    # [CORRECCIÓN] Asegurar que date_transfer esté en el GROUP BY
+    # [IMPORTANTE] Aseguramos que el nuevo campo esté en el GROUP BY
     group_by_clause = """
         GROUP BY 
             p.name, p.custom_operation_type, pt.code, 
             p.date_transfer, p.attention_date, p.scheduled_date, p.responsible_user,
-            proj.name, part.name, l_dest.path, w_dest.name
+            proj.name, part.name, 
+            w_dest.name, l_dest.name, l_dest.path -- Agregados al Group By
     """
 
     if lot_id is not None:
@@ -1087,6 +1109,62 @@ def get_product_reservations(product_id, location_id, lot_id=None):
     query = f"{select_clause} {joins_clause} {where_clause} {group_by_clause} ORDER BY p.scheduled_date ASC"
     
     return execute_query(query, tuple(params), fetchall=True)
+
+def get_product_incoming(product_id, location_id):
+    """
+    Devuelve el detalle de operaciones 'listo' que están por llegar (En Tránsito).
+    [ACTUALIZADO] Incluye Orden de Compra.
+    """
+    query = """
+        SELECT 
+            p.name as picking_name,
+            p.custom_operation_type as op_type,
+            pt.code as type_code,
+            
+            -- [NUEVO] Orden de Compra
+            p.purchase_order,
+            
+            COALESCE(
+                TO_CHAR(p.date_transfer, 'DD/MM/YYYY'), 
+                TO_CHAR(p.attention_date, 'DD/MM/YYYY'), 
+                TO_CHAR(p.scheduled_date, 'DD/MM/YYYY')
+            ) as attention_date,
+            
+            p.responsible_user,
+            
+            COALESCE(proj.name, 'Stock General') as project_name,
+            
+            CASE 
+                WHEN pt.code = 'IN' THEN COALESCE(part.name, 'Proveedor Externo')
+                ELSE COALESCE(w_src.name, l_src.path, 'Origen Desconocido')
+            END as origin_location,
+            
+            SUM(sm.product_uom_qty) as incoming_qty
+
+        FROM stock_moves sm
+        JOIN pickings p ON sm.picking_id = p.id
+        JOIN picking_types pt ON p.picking_type_id = pt.id
+        
+        LEFT JOIN locations l_src ON sm.location_src_id = l_src.id
+        LEFT JOIN warehouses w_src ON l_src.warehouse_id = w_src.id
+        LEFT JOIN projects proj ON p.project_id = proj.id
+        LEFT JOIN partners part ON p.partner_id = part.id
+        
+        WHERE sm.product_id = %s
+          AND sm.location_dest_id = %s
+          AND p.state = 'listo'
+          AND sm.state != 'cancelled'
+          
+        GROUP BY 
+            p.name, p.custom_operation_type, pt.code, 
+            p.purchase_order, -- <--- IMPORTANTE: Agregar al Group By
+            p.date_transfer, p.attention_date, p.scheduled_date, p.responsible_user,
+            proj.name, part.name, w_src.name, l_src.path
+            
+        ORDER BY p.scheduled_date ASC
+    """
+    
+    return execute_query(query, (product_id, location_id), fetchall=True)
 
 # --- NUEVAS CONSULTAS PARA DASHBOARD GERENCIAL ---
 

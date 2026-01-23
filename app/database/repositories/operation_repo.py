@@ -863,17 +863,17 @@ def get_pickings_count(picking_type_code, company_id, filters={}):
 
 def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id', ascending=False, limit=None, offset=None):
     """
-    Obtiene la lista de operaciones con todos los detalles para la grilla (List View).
-    [CORREGIDO] Incluye Joins para mostrar nombres de almacenes, partners y referencias.
+    Obtiene la lista de operaciones.
+    [CORREGIDO] 'project_name' ahora devuelve "PEP (Macro)" en lugar del nombre simple.
     """
     sort_map = {
-        'name': "p.name", 'purchase_order': "p.purchase_order", 'project_name': "proj.name",
+        'name': "p.name", 'purchase_order': "p.purchase_order", 
+        'project_name': "proj.code", # Ordenar por código PEP es más útil ahora
         'src_path_display': "src_path_display", 'dest_path_display': "dest_path_display",
         'warehouse_src_name': "w_src.name", 'warehouse_dest_name': "w_dest.name",
         'date': "p.scheduled_date", 'transfer_date': "p.date_transfer",
         'state': "p.state", 'id': "p.id", 'custom_operation_type': 'p.custom_operation_type',
-        'partner_ref': 'p.partner_ref', 'responsible_user': 'p.responsible_user',
-        'project_name': 'proj.name'
+        'partner_ref': 'p.partner_ref', 'responsible_user': 'p.responsible_user'
     }
     order_by_column = sort_map.get(sort_by, "p.id")
     direction = "ASC" if ascending else "DESC"
@@ -881,7 +881,7 @@ def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id'
     query_params = [picking_type_code, company_id]
     where_clauses = []
 
-    # --- Lógica de Filtros (Reutilizada) ---
+    # --- Lógica de Filtros ---
     for key, value in filters.items():
          if value:
             if key in ["date_transfer_from", "date_transfer_to"]:
@@ -892,15 +892,17 @@ def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id'
                     query_params.append(db_date)
                 except ValueError: pass
             
-            # Filtros directos
             elif key == 'p.state':
                 where_clauses.append("p.state = %s"); query_params.append(value)
             
-            # Filtros de texto (ILIKE)
-            elif key in ["p.partner_ref", "p.custom_operation_type", "p.name", "p.purchase_order", "p.responsible_user", "project_name"]:
+            # [CORRECCIÓN] Filtro de Proyecto busca en Código o Macro Nombre
+            elif key == 'project_name':
+                 where_clauses.append("(proj.code ILIKE %s OR mp.name ILIKE %s)")
+                 query_params.extend([f"%{value}%", f"%{value}%"])
+
+            elif key in ["p.partner_ref", "p.custom_operation_type", "p.name", "p.purchase_order", "p.responsible_user"]:
                 where_clauses.append(f"{key} ILIKE %s"); query_params.append(f"%{value}%")
             
-            # Filtros de columnas calculadas (Display)
             elif key == 'src_path_display':
                 where_clauses.append("CASE WHEN pt.code = 'IN' THEN partner.name ELSE l_src.path END ILIKE %s")
                 query_params.append(f"%{value}%")
@@ -914,7 +916,6 @@ def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id'
 
     where_string = " AND " + " AND ".join(where_clauses) if where_clauses else ""
 
-    # --- CONSULTA COMPLETA ---
     query = f"""
     SELECT
         p.id, p.name, p.state, p.purchase_order, p.partner_ref, p.custom_operation_type, p.responsible_user,
@@ -922,18 +923,17 @@ def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id'
         TO_CHAR(p.date_transfer, 'DD/MM/YYYY') as transfer_date,
         pt.code as type_code,
         
-        -- Lógica para mostrar Origen (Partner o Ubicación/Almacén)
         CASE WHEN pt.code = 'IN' THEN partner.name ELSE l_src.path END as src_path_display,
-        
-        -- Lógica para mostrar Destino (Partner o Ubicación/Almacén)
         CASE WHEN pt.code = 'OUT' THEN partner.name ELSE l_dest.path END as dest_path_display,
         
-        -- Nombres de Almacenes
         CASE WHEN l_src.type = 'internal' THEN w_src.name ELSE NULL END as warehouse_src_name,
         CASE WHEN l_dest.type = 'internal' THEN w_dest.name ELSE NULL END as warehouse_dest_name,
         
-        -- Proyecto
-        proj.name as project_name
+        -- [CAMBIO CRÍTICO] Concatenación PEP + Macro para la vista lista
+        CASE 
+            WHEN proj.id IS NOT NULL THEN CONCAT(proj.code, ' (', mp.name, ')') 
+            ELSE NULL 
+        END as project_name
 
     FROM pickings p
     JOIN picking_types pt ON p.picking_type_id = pt.id
@@ -942,7 +942,10 @@ def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id'
     LEFT JOIN partners partner ON p.partner_id = partner.id
     LEFT JOIN warehouses w_src ON l_src.warehouse_id = w_src.id
     LEFT JOIN warehouses w_dest ON l_dest.warehouse_id = w_dest.id
+    
+    -- Joins de Proyecto
     LEFT JOIN projects proj ON p.project_id = proj.id
+    LEFT JOIN macro_projects mp ON proj.macro_project_id = mp.id
     
     WHERE pt.code = %s AND p.company_id = %s AND pt.code != 'ADJ'
     {where_string}
@@ -954,6 +957,7 @@ def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id'
         query_params.extend([limit, offset])
 
     return execute_query(query, tuple(query_params), fetchall=True)
+
 def get_or_create_by_name(cursor, table, name):
     if not name: return None
     if table not in ['stock_lots', 'brands']: raise ValueError("Tabla no permitida")
@@ -1462,114 +1466,6 @@ def get_draft_liquidation(wo_id):
 
 def get_finalized_liquidation(wo_id):
     return execute_query("SELECT id FROM pickings WHERE work_order_id = %s AND state = 'done'", (wo_id,), fetchone=True)
-
-def get_stock_summary_filtered_sorted(company_id, warehouse_id=None, filters={}, sort_by=None, ascending=True, limit=None, offset=None):
-    """ 
-    [CORREGIDO V2] Incluye columna 'notes' en el resumen.
-    Usa MAX(notes) para traer al menos una nota si existe en el grupo.
-    """
-    base_query = """
-    WITH ReservedStockSummary AS (
-        -- ... (Tu CTE existente de ReservedStockSummary, sin cambios) ...
-        SELECT 
-            sm.product_id, sm.location_src_id,
-            SUM(sm.product_uom_qty) as reserved_qty
-        FROM stock_moves sm
-        JOIN pickings p ON sm.picking_id = p.id
-        WHERE p.state = 'listo' AND p.company_id = %s
-        GROUP BY sm.product_id, sm.location_src_id
-    )
-    SELECT
-        p.id as product_id, 
-        w.id as warehouse_id, 
-        l.id as location_id, 
-        
-        p.sku, 
-        p.name as product_name, 
-        pc.name as category_name,
-        w.name as warehouse_name, 
-        l.name as location_name,
-        u.name as uom_name,
-
-        SUM(sq.quantity) as physical_quantity,
-        COALESCE(MAX(rss.reserved_qty), 0) as reserved_quantity,
-        (SUM(sq.quantity) - COALESCE(MAX(rss.reserved_qty), 0)) as available_quantity,
-        
-        -- [NUEVO] Propagar notas al resumen
-        -- Si hay varias notas diferentes, tomará la "máxima" alfabéticamente. 
-        -- Suficiente para pintar el icono de amarillo.
-        MAX(sq.notes) as notes
-
-    FROM stock_quants sq
-    -- ... (Resto de tus JOINs y WHEREs igual que antes) ...
-    JOIN products p ON sq.product_id = p.id
-    JOIN locations l ON sq.location_id = l.id
-    JOIN warehouses w ON l.warehouse_id = w.id
-    LEFT JOIN product_categories pc ON p.category_id = pc.id
-    LEFT JOIN uom u ON p.uom_id = u.id
-    LEFT JOIN ReservedStockSummary rss ON sq.product_id = rss.product_id AND sq.location_id = rss.location_src_id
-    
-    WHERE l.type = 'internal' AND p.company_id = %s AND sq.quantity > 0.001
-    """
-
-    params = [company_id, company_id]
-    where_clauses = []
-
-    # Filtros
-    filter_map = {
-        'warehouse_name': 'w.name', 'location_name': 'l.name', 'sku': 'p.sku', 
-        'product_name': 'p.name', 'category_name': 'pc.name', 'uom_name': 'u.name',
-        'warehouse_id': 'w.id', 'location_id': 'l.id'
-    }
-    for key, value in filters.items():
-        db_column = filter_map.get(key)
-        if db_column and value is not None and value != "":
-            if key in ['warehouse_id', 'location_id']:
-                where_clauses.append(f"{db_column} = %s")
-                params.append(value)
-            else:
-                where_clauses.append(f"{db_column} ILIKE %s")
-                params.append(f"%{value}%")
-
-    if where_clauses:
-        base_query += " AND " + " AND ".join(where_clauses)
-
-    # Group By
-    base_query += """
-    GROUP BY 
-        p.id, p.sku, p.name, pc.id, pc.name, u.id, u.name, 
-        w.id, w.name, l.id, l.name
-    """
-
-    # Sort By
-    sort_map = {
-        'warehouse_name': 'w.name', 
-        'location_name': 'l.name', 
-        'sku': 'p.sku',
-        'product_name': 'p.name', 
-        'category_name': 'pc.name',
-        'physical_quantity': 'physical_quantity',
-        'reserved_quantity': 'reserved_quantity', 
-        'available_quantity': 'available_quantity',
-        'uom_name': 'u.name'
-    }
-    order_by_col_key = sort_by if sort_by else 'sku'
-    order_by_col = sort_map.get(order_by_col_key, 'p.sku')
-    direction = "ASC" if ascending else "DESC"
-    
-    if order_by_col in ['pc.name', 'u.name', 'l.name']:
-         order_by_clause = f"COALESCE({order_by_col}, 'zzzz')"
-    else:
-         order_by_clause = order_by_col
-         
-    base_query += f" ORDER BY {order_by_clause} {direction}"
-    
-    # [NUEVO] Paginación
-    if limit is not None and offset is not None:
-        base_query += " LIMIT %s OFFSET %s"
-        params.extend([limit, offset])
-    
-    return execute_query(base_query, tuple(params), fetchall=True)
 
 def get_project_id_by_name(project_name, company_id):
     """Busca un proyecto activo por nombre (exacto o similar)."""

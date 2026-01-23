@@ -1236,3 +1236,4 @@ async def update_stock_notes(
         return {"message": "Nota actualizada"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    

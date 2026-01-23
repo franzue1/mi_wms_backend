@@ -168,19 +168,17 @@ def get_projects(company_id: int, status: str = None, search: str = None,
                  limit: int = 100, offset: int = 0,
                  sort_by: str = None, ascending: bool = True):
     """
-    Lista Obras con KPIs corregidos (Stock Físico Real).
+    Lista Obras con KPIs y Nombre Compuesto (PEP + Macro).
     """
     query = """
         WITH ProjectStock AS (
-            -- [CORRECCIÓN] Ahora filtramos explícitamente ubicaciones INTERNAS.
-            -- Esto evita sumar stock que ya está en manos del cliente (Liquidado).
             SELECT 
                 sq.project_id, 
                 COALESCE(SUM(sq.quantity * prod.standard_price), 0) as stock_value
             FROM stock_quants sq
             JOIN locations l ON sq.location_id = l.id
             JOIN products prod ON sq.product_id = prod.id
-            WHERE l.type = 'internal'  -- <--- EL FILTRO CLAVE
+            WHERE l.type = 'internal' 
               AND sq.quantity > 0
             GROUP BY sq.project_id
         ),
@@ -201,12 +199,16 @@ def get_projects(company_id: int, status: str = None, search: str = None,
             m.name as management_name,
             d.name as direction_name,
             COALESCE(ps.stock_value, 0) as stock_value,
-            COALESCE(pc.liquidated_value, 0) as liquidated_value
+            COALESCE(pc.liquidated_value, 0) as liquidated_value,
+
+            -- [NUEVO] Columna compuesta para Dropdowns: "PEP (Macro)"
+            CONCAT(p.code, ' (', mp.name, ')') as full_name_display
+
         FROM projects p
         LEFT JOIN macro_projects mp ON p.macro_project_id = mp.id
         LEFT JOIN managements m ON mp.management_id = m.id
         LEFT JOIN directions d ON m.direction_id = d.id
-        LEFT JOIN ProjectStock ps ON p.id = ps.project_id  -- Join corregido por project_id
+        LEFT JOIN ProjectStock ps ON p.id = ps.project_id 
         LEFT JOIN ProjectConsumed pc ON p.id = pc.project_id
         WHERE p.company_id = %s
     """
@@ -220,25 +222,14 @@ def get_projects(company_id: int, status: str = None, search: str = None,
         query += " AND (p.name ILIKE %s OR p.code ILIKE %s)"
         term = f"%{search}%"; params.extend([term, term])
 
-    # --- [NUEVO] FILTROS DE COLUMNA ESPECÍFICOS ---
-    if filter_code:
-        query += " AND p.code ILIKE %s"
-        params.append(f"%{filter_code}%")
-    
-    if filter_macro:
-        query += " AND mp.name ILIKE %s"
-        params.append(f"%{filter_macro}%")
-
+    # --- FILTROS DE COLUMNA ---
+    if filter_code: query += " AND p.code ILIKE %s"; params.append(f"%{filter_code}%")
+    if filter_macro: query += " AND mp.name ILIKE %s"; params.append(f"%{filter_macro}%")
     if filter_dept: query += " AND p.department = %s"; params.append(filter_dept)
     if filter_prov: query += " AND p.province = %s"; params.append(filter_prov)
     if filter_dist: query += " AND p.district = %s"; params.append(filter_dist)
-    if filter_direction:
-        query += " AND d.name ILIKE %s"
-        params.append(f"%{filter_direction}%")
-        
-    if filter_management:
-        query += " AND m.name ILIKE %s"
-        params.append(f"%{filter_management}%")
+    if filter_direction: query += " AND d.name ILIKE %s"; params.append(f"%{filter_direction}%")
+    if filter_management: query += " AND m.name ILIKE %s"; params.append(f"%{filter_management}%")
 
     # --- ORDENAMIENTO ---
     sort_map = {
