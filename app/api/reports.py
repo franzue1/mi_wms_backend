@@ -643,8 +643,9 @@ async def export_stock_summary_csv(
             'warehouse_name': "Almacen", 'location_name': "Ubicacion",
             'sku': "SKU", 'product_name': "Producto", 'category_name': "Categoria",
             'physical_quantity': "Fisico", 'reserved_quantity': "Reservado",
+            'incoming_quantity': "En Transito",
             'available_quantity': "Disponible", 'uom_name': "UdM",
-            'notes': "Observaciones" # [AGREGADO]
+            'notes': "Observaciones"
         }
         
         return _generate_csv_response(stock_data, headers_map, "stock_resumen.csv")
@@ -709,6 +710,7 @@ async def export_stock_detail_csv(
         headers_map.update({
             'physical_quantity': "Fisico", 
             'reserved_quantity': "Reservado",
+            'incoming_quantity': "En Transito", # <--- ¡AGREGADO AQUÍ!
             'available_quantity': "Disponible", 
             'uom_name': "UdM",
             'notes': "Observaciones"

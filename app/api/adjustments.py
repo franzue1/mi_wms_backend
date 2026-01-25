@@ -82,44 +82,20 @@ async def export_adjustments_csv(auth: AuthDependency, company_id: int = Query(.
     except Exception as e:
         traceback.print_exc(); raise HTTPException(500, f"Error exportando: {e}")
 
-# app/api/adjustments.py
-
-# ... imports ...
-from typing import Optional # Asegúrate de importar esto
-
 @router.post("/import/csv", status_code=201)
 async def import_adjustments_csv(
     auth: AuthDependency, 
     company_id: int = Query(...), 
-    file: UploadFile = File(None), # Ahora es opcional
-    file_path: str = Query(None)   # Nuevo parámetro opcional para ruta local del servidor
+    file: UploadFile = File(...)
 ):
     """
-    Importa ajustes masivos. Acepta archivo subido O ruta local del servidor.
+    Importa ajustes masivos.
     """
     if "adjustments.can_create" not in auth.permissions: raise HTTPException(403, "No autorizado")
 
     try:
-        content_decoded = ""
-        
-        # CASO 1: Archivo subido directamente (Desktop o subida estándar)
-        if file:
-            content = await file.read()
-            content_decoded = content.decode('utf-8-sig')
-            
-        # CASO 2: Ruta de archivo en el servidor (Web Flet uploads)
-        elif file_path:
-            import os
-            if not os.path.exists(file_path):
-                raise ValueError(f"El archivo no existe en la ruta del servidor: {file_path}")
-            
-            with open(file_path, 'r', encoding='utf-8-sig') as f:
-                content_decoded = f.read()
-        
-        else:
-            raise ValueError("Debe proporcionar un archivo o una ruta de archivo.")
-
-        # --- Procesamiento Común ---
+        content = await file.read()
+        content_decoded = content.decode('utf-8-sig') 
         file_io = io.StringIO(content_decoded)
         
         sniffer = csv.Sniffer()
@@ -140,11 +116,6 @@ async def import_adjustments_csv(
 
         count = await asyncio.to_thread(db.import_smart_adjustments_transaction, company_id, auth.username, rows)
         
-        # [LIMPIEZA] Si usamos ruta temporal, borramos el archivo para no llenar el disco
-        if file_path and os.path.exists(file_path):
-            try: os.remove(file_path)
-            except: pass
-
         return {"message": f"Se crearon {count} documentos de ajuste correctamente."}
 
     except ValueError as ve: raise HTTPException(400, str(ve))
