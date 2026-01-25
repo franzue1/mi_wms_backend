@@ -592,15 +592,32 @@ def _generate_csv_response(data: List[dict], headers_map: dict, filename: str) -
         raise HTTPException(status_code=404, detail="No hay datos para exportar.")
         
     output = io.StringIO(newline='')
+    # Usamos dialecto excel con delimitador ; (mejor para Excel en español/latino)
     writer = csv.writer(output, delimiter=';')
     
-    # Escribir cabeceras (usando las keys del map como el orden)
+    # Escribir cabeceras
     writer.writerow(headers_map.values())
+
+    # Campos que deben forzarse como texto en Excel
+    TEXT_FIELDS = {'sku', 'lot_name', 'serie', 'remission_number', 'orden_compra'}
 
     # Escribir datos
     for row_dict in data:
-        # Construir la fila en el orden de las cabeceras
-        csv_row = [row_dict.get(key, '') for key in headers_map.keys()]
+        csv_row = []
+        for key in headers_map.keys():
+            val = row_dict.get(key, '')
+            
+            # --- [CORRECCIÓN EXCEL] ---
+            # Si el campo es SKU o Serie, y parece un número (tiene dígitos y empieza con 0),
+            # le agregamos un tabulador (\t) para que Excel no se coma los ceros.
+            if key in TEXT_FIELDS and val:
+                str_val = str(val)
+                # Si empieza con 0 y es numérico (ej: "0035"), inyectamos el hack
+                if str_val.startswith('0') and str_val.isdigit():
+                    val = f"\t{val}"
+            
+            csv_row.append(val)
+            
         writer.writerow(csv_row)
             
     output.seek(0)
