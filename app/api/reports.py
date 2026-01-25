@@ -11,6 +11,7 @@ import io
 import asyncio
 from fastapi.responses import StreamingResponse
 from decimal import Decimal, ROUND_HALF_UP, getcontext
+from app.database.repositories import operation_repo # Para update_stock_quant_notes
 getcontext().prec = 28
 
 router = APIRouter()
@@ -820,3 +821,26 @@ async def get_report_filter_options(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error obteniendo opciones: {e}")
 
+@router.put("/stock-note")
+async def update_stock_note(
+    auth: AuthDependency,
+    note_data: schemas.StockNoteUpdate
+):
+    """ Actualiza la nota de un stock quant específico. """
+    if "reports.stock.edit_notes" not in auth.permissions:
+        raise HTTPException(status_code=403, detail="No tienes permiso para editar notas de stock.")
+
+    try:
+        await asyncio.to_thread(
+            operation_repo.update_stock_quant_notes,
+            product_id=note_data.product_id,
+            location_id=note_data.location_id,
+            notes=note_data.notes,
+            lot_id=note_data.lot_id,
+            project_id=note_data.project_id,
+            apply_to_group=note_data.apply_to_group
+        )
+        return {"message": "Nota actualizada correctamente"}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))

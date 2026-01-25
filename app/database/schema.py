@@ -657,7 +657,9 @@ def create_initial_data(conn):
             "adjustments.can_edit": "Editar Ajustes (Borrador)", "adjustments.can_validate": "Validar Ajustes",
             "products.can_crud": "CRUD Productos", "warehouses.can_crud": "CRUD Almacenes",
             "partners.can_crud": "CRUD Proveedores", "locations.can_crud": "CRUD Ubicaciones",
-            "reports.stock.view": "Ver Reporte de Stock", "reports.kardex.view": "Ver Reporte Kardex",
+            "reports.stock.view": "Ver Reporte de Stock",
+            "reports.stock.edit_notes": "Editar notas en Reporte de Stock",
+            "reports.kardex.view": "Ver Reporte Kardex",
             "reports.aging.view": "Ver Reporte Antigüedad", "reports.coverage.view": "Ver Reporte Cobertura",
             "admin.can_manage_users": "Gestionar Usuarios (Crear/Editar)", "admin.can_manage_roles": "Gestionar Roles y Permisos"
         }
