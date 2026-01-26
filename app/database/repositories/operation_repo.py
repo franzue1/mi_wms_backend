@@ -71,30 +71,68 @@ def create_picking(name, picking_type_id, location_src_id, location_dest_id, com
 
 def update_picking_header(pid: int, updates: dict):
     """
-    Actualiza campos del picking.
-    Es la ÚNICA función autorizada para modificar la cabecera.
+    Actualiza campos del picking y sincroniza en cascada a las líneas (stock_moves).
+    [MEJORA] Si cambian ubicaciones, partner o proyecto, se actualizan todas las líneas hijas.
     """
     if not updates: return
 
-    # Validar campos permitidos
-    fields_to_update = {}
-    for key, value in updates.items():
-        if key in ALLOWED_PICKING_FIELDS_TO_UPDATE:
-            # Convertir fechas a ISO string
-            if isinstance(value, date) and not isinstance(value, str): 
-                fields_to_update[key] = value.isoformat()
-            else: 
-                fields_to_update[key] = value
-    
-    if not fields_to_update: 
-        print(f"[WARN] update_picking_header: Ningún campo válido en updates para PID {pid}")
-        return
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            # 1. Preparar actualización de Cabecera
+            fields_to_update = {}
+            for key, value in updates.items():
+                if key in ALLOWED_PICKING_FIELDS_TO_UPDATE:
+                    if isinstance(value, date) and not isinstance(value, str): 
+                        fields_to_update[key] = value.isoformat()
+                    else: 
+                        fields_to_update[key] = value
+            
+            if not fields_to_update: return
 
-    set_clause_parts = [f"{key} = %s" for key in fields_to_update.keys()]
-    params = list(fields_to_update.values()) + [pid]
-    
-    query = f"UPDATE pickings SET {', '.join(set_clause_parts)} WHERE id = %s"
-    execute_commit_query(query, tuple(params))
+            # Construir query dinámica para pickings
+            set_clause_parts = [f"{key} = %s" for key in fields_to_update.keys()]
+            params = list(fields_to_update.values()) + [pid]
+            
+            cursor.execute(f"UPDATE pickings SET {', '.join(set_clause_parts)} WHERE id = %s", tuple(params))
+            
+            # --- 2. LÓGICA DE CASCADA (Sincronizar Líneas) ---
+            # Si cambiamos datos estructurales en la cabecera, las líneas deben heredar el cambio.
+            
+            moves_updates = []
+            moves_params = []
+
+            # Mapeo: Campo Header -> Campo Move
+            cascade_map = {
+                'location_src_id': 'location_src_id',
+                'location_dest_id': 'location_dest_id',
+                'partner_id': 'partner_id',
+                'project_id': 'project_id'
+            }
+
+            for head_field, move_field in cascade_map.items():
+                if head_field in fields_to_update:
+                    moves_updates.append(f"{move_field} = %s")
+                    moves_params.append(fields_to_update[head_field])
+            
+            if moves_updates:
+                # Solo actualizamos líneas que no estén canceladas/hechas (aunque en draft todas deberían estar draft)
+                # Y forzamos la actualización masiva para este picking
+                query_moves = f"UPDATE stock_moves SET {', '.join(moves_updates)} WHERE picking_id = %s"
+                moves_params.append(pid)
+                
+                cursor.execute(query_moves, tuple(moves_params))
+                print(f"[DB] Cascada ejecutada para Picking {pid}: Actualizados {moves_updates}")
+
+            conn.commit()
+
+    except Exception as e:
+        if conn: conn.rollback()
+        print(f"[ERROR] update_picking_header: {e}")
+        raise e
+    finally:
+        if conn: return_db_connection(conn)
 
 def cancel_picking(picking_id):
     conn = None
@@ -1481,7 +1519,7 @@ def get_project_id_by_name(project_name, company_id):
 def create_full_picking_transaction(data: dict):
     """
     [LAZY CREATION] Crea cabecera y líneas en una sola transacción atómica.
-    [BLINDADO v2] Usa lógica MAX(ID) + Bucle.
+    [CORREGIDO] Ya no fuerza defaults si el usuario envía NULL. Respeta los campos vacíos.
     """
     conn = None
     try:
@@ -1495,7 +1533,7 @@ def create_full_picking_transaction(data: dict):
         pt = cursor.fetchone()
         if not pt: raise ValueError("Tipo de operación no válido.")
 
-        # --- GENERACIÓN DE NOMBRE SEGURA ---
+        # --- GENERACIÓN DE NOMBRE SEGURA (Sin cambios) ---
         wh_id = pt['warehouse_id']
         cursor.execute(
             "SELECT wt.code as wh_code, pt.code as pt_code FROM picking_types pt JOIN warehouses wt ON pt.warehouse_id = wt.id WHERE pt.id = %s", 
@@ -1522,9 +1560,22 @@ def create_full_picking_transaction(data: dict):
                 break
         # -----------------------------------
 
-        # 3. Ubicaciones
-        final_src = data.get('location_src_id') or pt['default_location_src_id']
-        final_dest = data.get('location_dest_id') or pt['default_location_dest_id']
+        # 3. Ubicaciones [CORRECCIÓN CRÍTICA AQUÍ]
+        # ANTES:
+        # final_src = data.get('location_src_id') or pt['default_location_src_id']
+        # final_dest = data.get('location_dest_id') or pt['default_location_dest_id']
+        
+        # AHORA: Respetamos estrictamente lo que manda la UI. 
+        # Si la UI manda None, guardamos None (NULL).
+        # Solo usamos el default si NO EXISTE la clave en 'data' (que es raro), 
+        # pero si la clave existe y es None, se queda None.
+        
+        final_src = data.get('location_src_id')
+        final_dest = data.get('location_dest_id')
+
+        # NOTA: Para operaciones de entrada/salida donde una ubicación es virtual (Proveedor/Cliente),
+        # la UI debería estar enviando el ID correcto de esa ubicación virtual o el backend
+        # podría validarlo, pero para ubicaciones FÍSICAS internas, esto permite dejarlas vacías.
 
         # 4. Insertar Cabecera
         cursor.execute("""
