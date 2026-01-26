@@ -268,47 +268,54 @@ def return_picking_to_draft(picking_id):
     finally:
         if conn: return_db_connection(conn)
 
-def get_next_picking_name(picking_type_id):
+def get_next_picking_name(picking_type_id, company_id):
     """
-    [BLINDADO v2] Genera el siguiente nombre de albarán.
-    Usa MAX(ID) en lugar de COUNT(*) para evitar colisiones por huecos.
-    Incluye bucle de seguridad.
+    [BLINDADO v4 - PREFIJO DE COMPAÑÍA] 
+    Genera secuencia única por empresa: C{id}/{TIPO}/00001
+    Ejemplo: C2/IN/00001
     """
-    # 1. Obtener Prefijo
+    # 1. Obtener solo el código del tipo de operación (IN, OUT, INT)
     pt = execute_query(
-        "SELECT wt.code as wh_code, pt.code as pt_code FROM picking_types pt JOIN warehouses wt ON pt.warehouse_id = wt.id WHERE pt.id = %s", 
+        "SELECT code as pt_code FROM picking_types WHERE id = %s", 
         (picking_type_id,), fetchone=True
     )
-    prefix = f"{pt['wh_code']}/{pt['pt_code']}/"
     
-    # 2. Buscar el último nombre REAL usado en la base de datos
-    # (Ignoramos COUNT, buscamos el string más alto o el último insertado)
+    # NUEVO FORMATO: C{company_id}/{TIPO}/
+    prefix = f"C{company_id}/{pt['pt_code']}/"
+    
+    # 2. Buscar último usado con este prefijo exacto
     last_res = execute_query(
-        "SELECT name FROM pickings WHERE name LIKE %s ORDER BY id DESC LIMIT 1", 
-        (f"{prefix}%",), fetchone=True
+        "SELECT name FROM pickings WHERE name LIKE %s AND company_id = %s ORDER BY id DESC LIMIT 1", 
+        (f"{prefix}%", company_id), fetchone=True
     )
     
     current_sequence = 0
     if last_res:
         try:
-            # Extraer "00129" -> 129
+            # Extraer número final
             current_sequence = int(last_res['name'].split('/')[-1])
         except ValueError:
             pass
 
-    # 3. Bucle de Seguridad (Collision Check)
-    # Incrementamos y verificamos disponibilidad
+    # 3. Bucle de Seguridad
     while True:
         current_sequence += 1
         new_name = f"{prefix}{str(current_sequence).zfill(5)}"
         
-        # Verificación rápida de existencia
+        # Verificar colisión
         exists = execute_query("SELECT 1 FROM pickings WHERE name = %s", (new_name,), fetchone=True)
         if not exists:
             return new_name
 
-def get_next_remission_number():
-    res = execute_query("SELECT remission_number FROM pickings WHERE remission_number IS NOT NULL ORDER BY remission_number DESC LIMIT 1", fetchone=True)
+def get_next_remission_number(company_id):
+    """
+    [BLINDADO] Busca la última guía SOLO de esta empresa.
+    """
+    res = execute_query(
+        "SELECT remission_number FROM pickings WHERE remission_number IS NOT NULL AND company_id = %s ORDER BY remission_number DESC LIMIT 1", 
+        (company_id,), 
+        fetchone=True
+    )
     last = int(res['remission_number'].replace("GR-", "")) if res else 0
     return f"GR-{str(last + 1).zfill(5)}"
 
@@ -1216,12 +1223,13 @@ def get_adjustments(company_id):
 
 def create_draft_adjustment(company_id, user_name):
     """
-    Crea un picking ADJ vacío.
-    [BLINDADO v2] Usa lógica MAX(ID) + Bucle.
+    Crea un picking ADJ vacío con prefijo de compañía.
+    Ejemplo: C2/ADJ/00001
     """
     try:
         conn = get_db_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+            # Validaciones previas
             cursor.execute("SELECT id FROM picking_types WHERE code='ADJ' AND company_id=%s LIMIT 1", (company_id,))
             pt = cursor.fetchone()
             cursor.execute("SELECT id FROM locations WHERE category='AJUSTE' AND company_id=%s LIMIT 1", (company_id,))
@@ -1229,13 +1237,11 @@ def create_draft_adjustment(company_id, user_name):
             
             if not pt or not loc: return None
             
-            # --- GENERACIÓN DE NOMBRE SEGURA ---
-            cursor.execute("SELECT wt.code FROM picking_types pt JOIN warehouses wt ON pt.warehouse_id = wt.id WHERE pt.id = %s", (pt['id'],))
-            wh_code = cursor.fetchone()['code']
-            prefix = f"{wh_code}/ADJ/"
+            # --- GENERACIÓN DE NOMBRE (NUEVA LÓGICA) ---
+            prefix = f"C{company_id}/ADJ/"
             
             # 1. Buscar último usado
-            cursor.execute("SELECT name FROM pickings WHERE name LIKE %s ORDER BY id DESC LIMIT 1", (f"{prefix}%",))
+            cursor.execute("SELECT name FROM pickings WHERE name LIKE %s AND company_id = %s ORDER BY id DESC LIMIT 1", (f"{prefix}%", company_id))
             last_res = cursor.fetchone()
             
             current_seq = 0
@@ -1539,17 +1545,16 @@ def create_full_picking_transaction(data: dict):
         pt = cursor.fetchone()
         if not pt: raise ValueError("Tipo de operación no válido.")
 
-        # --- GENERACIÓN DE NOMBRE SEGURA (Sin cambios) ---
-        wh_id = pt['warehouse_id']
-        cursor.execute(
-            "SELECT wt.code as wh_code, pt.code as pt_code FROM picking_types pt JOIN warehouses wt ON pt.warehouse_id = wt.id WHERE pt.id = %s", 
-            (pt['id'],)
-        )
-        codes = cursor.fetchone()
-        prefix = f"{codes['wh_code']}/{codes['pt_code']}/"
+        # --- GENERACIÓN DE NOMBRE (NUEVA LÓGICA) ---
+        cursor.execute("SELECT code FROM picking_types WHERE id = %s", (pt['id'],))
+        res_pt = cursor.fetchone()
+        pt_code = res_pt['code']
+        
+        # Prefijo: C{company_id}/{TIPO}/
+        prefix = f"C{data['company_id']}/{pt_code}/"
         
         # Buscar último
-        cursor.execute("SELECT name FROM pickings WHERE name LIKE %s ORDER BY id DESC LIMIT 1", (f"{prefix}%",))
+        cursor.execute("SELECT name FROM pickings WHERE name LIKE %s AND company_id = %s ORDER BY id DESC LIMIT 1", (f"{prefix}%", data['company_id']))
         last_res = cursor.fetchone()
         
         current_seq = 0
@@ -1782,7 +1787,7 @@ def import_smart_adjustments_transaction(company_id, user_name, rows):
         # Obtener prefijo del almacén
         cursor.execute("SELECT wt.code FROM warehouses wt WHERE id = %s", (pt['warehouse_id'],))
         wh_code = cursor.fetchone()['code']
-        prefix = f"{wh_code}/ADJ/"
+        prefix = f"C{company_id}/ADJ/"
 
         # 2. Agrupar filas
         from collections import defaultdict
@@ -1793,17 +1798,15 @@ def import_smart_adjustments_transaction(company_id, user_name, rows):
             grouped_rows[ref].append({'data': row, 'line': i + 2})
 
         # --- CÁLCULO DE SECUENCIA MAESTRA ---
-        # Buscamos el número más alto usado actualmente en la BD para ese prefijo
         cursor.execute(
-            "SELECT name FROM pickings WHERE name LIKE %s", 
-            (f"{prefix}%",)
+            "SELECT name FROM pickings WHERE name LIKE %s AND company_id = %s", 
+            (f"{prefix}%", company_id)
         )
         existing_names = cursor.fetchall()
         
         max_sequence = 0
         for row in existing_names:
             try:
-                # Extraemos el número final: "PRI/ADJ/00033" -> 33
                 name_str = row[0]
                 num_part = int(name_str.split('/')[-1])
                 if num_part > max_sequence:
@@ -1811,9 +1814,8 @@ def import_smart_adjustments_transaction(company_id, user_name, rows):
             except (ValueError, IndexError):
                 continue
         
-        # Inicializamos el contador local en el máximo encontrado
         current_sequence_counter = max_sequence
-        print(f"[IMPORT] Secuencia inicial detectada: {current_sequence_counter}")
+        print(f"[IMPORT] Secuencia inicial detectada para Cia {company_id}: {current_sequence_counter}")
         # ------------------------------------
 
         total_created = 0

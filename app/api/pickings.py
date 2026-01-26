@@ -181,7 +181,7 @@ async def create_draft_picking(data: PickingCreateRequest, auth: AuthDependency)
     try:
         pt_details = db.get_picking_type_details(data.picking_type_id) # (Copiar lógica existente)
         if not pt_details: raise HTTPException(status_code=404, detail="Tipo no encontrado")
-        new_name = db.get_next_picking_name(data.picking_type_id)
+        new_name = db.get_next_picking_name(data.picking_type_id, data.company_id)
 
         new_picking_id = db.create_picking(
             name=new_name,
@@ -622,7 +622,7 @@ async def import_pickings_csv(
         if import_type == 'headers':
             for valid_row in validated_data:
                 try:
-                    new_name = db.get_next_picking_name(valid_row['picking_type_id'])
+                    new_name = db.get_next_picking_name(valid_row['picking_type_id'], company_id)
                     new_picking_id = db.create_picking(
                         new_name, valid_row['picking_type_id'], valid_row['src_loc_id'], valid_row['dest_loc_id'], 
                         company_id, responsible_user, project_id=valid_row['project_id']
@@ -645,7 +645,7 @@ async def import_pickings_csv(
             for group_data in validated_data:
                 header = group_data['header']; lines = group_data['lines']; doc_origen = group_data['doc_origen']
                 try:
-                    new_name = db.get_next_picking_name(header['picking_type_id'])
+                    new_name = db.get_next_picking_name(header['picking_type_id'], company_id)
                     new_picking_id = db.create_picking(
                         new_name, header['picking_type_id'], header['src_loc_id'], header['dest_loc_id'], 
                         company_id, responsible_user, project_id=header.get('project_id')
