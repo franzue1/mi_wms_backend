@@ -1075,31 +1075,29 @@ def get_stock_for_product_location(product_id, location_id):
     )
     return result['total'] if result and result['total'] else 0
 
-# En app/database/repositories/operation_repo.py
-
 def get_real_available_stock(product_id, location_id, project_id=None):
     """
     Calcula disponible (Físico - Reservado).
-    [CORREGIDO] Soluciona la ambigüedad de columna project_id en el JOIN.
+    [CORREGIDO V3] Lógica estricta de aislamiento.
+    - Si project_id es None: Solo mira stock GENERAL (project_id IS NULL).
+    - Si project_id tiene valor: Mira stock PROYECTO + stock GENERAL.
     """
     if not product_id or not location_id: return 0.0
     
-    # Filtros SQL dinámicos
-    proj_filter_quant = ""
-    proj_filter_move = ""
+    # Parametros base
     params = [product_id, location_id]
     
+    # Filtros SQL dinámicos
     if project_id is not None:
-        # 1. Filtro para Stock Físico (Tabla stock_quants)
-        # Aquí no hay JOIN, así que 'project_id' directo funciona, pero
-        # si usamos alias en la query, debemos coincidir.
+        # Caso Cascada: Mi Proyecto + Stock General
         proj_filter_quant = "AND (project_id = %s OR project_id IS NULL)"
-        
-        # 2. Filtro para Stock Reservado (Tabla stock_moves + pickings)
-        # ¡AQUÍ ESTABA EL ERROR! Agregamos 'sm.' para desambiguar.
         proj_filter_move = "AND (sm.project_id = %s OR sm.project_id IS NULL)"
-        
         params.append(project_id)
+    else:
+        # Caso Estricto: Solo Stock General (Sin dueño)
+        # Esto evita que veas stock "Físico" que en realidad pertenece a un proyecto.
+        proj_filter_quant = "AND project_id IS NULL"
+        proj_filter_move = "AND sm.project_id IS NULL"
     
     # 1. Físico (Query simple sobre stock_quants)
     query_phy = f"SELECT SUM(quantity) as total FROM stock_quants WHERE product_id = %s AND location_id = %s {proj_filter_quant}"
@@ -1107,6 +1105,7 @@ def get_real_available_stock(product_id, location_id, project_id=None):
     physical = res_phy['total'] if res_phy and res_phy['total'] else 0.0
     
     # 2. Reservado (Query con JOIN)
+    # Restamos lo que ya está en albaranes 'listo' (reservado) que coincidan con nuestro criterio de proyecto
     query_res = f"""
         SELECT SUM(sm.product_uom_qty) as reserved 
         FROM stock_moves sm 
@@ -1115,11 +1114,16 @@ def get_real_available_stock(product_id, location_id, project_id=None):
           AND p.state = 'listo' AND sm.state != 'cancelled'
           {proj_filter_move}
     """
-    # Usamos los mismos params porque el orden de los %s (%s, %s, %s) es idéntico
+    # Usamos los mismos params porque el orden de los %s es idéntico
     res_res = execute_query(query_res, tuple(params), fetchone=True)
     reserved = res_res['reserved'] if res_res and res_res['reserved'] else 0.0
     
-    return max(0.0, physical - reserved)
+    available = max(0.0, physical - reserved)
+    
+    # [DEBUG LOG] Para rastrear en consola si algo no cuadra
+    print(f"[STOCK-CHECK] Prod {product_id} @ Loc {location_id} (Proj {project_id}): Phy {physical} - Res {reserved} = {available}")
+    
+    return available
 
 def get_products_with_stock_at_location(location_id):
     if not location_id: return []
