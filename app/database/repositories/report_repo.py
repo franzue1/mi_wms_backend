@@ -631,7 +631,7 @@ def get_stock_summary_filtered_sorted(company_id, warehouse_id=None, filters={},
 def get_stock_on_hand_filtered_sorted(company_id, warehouse_id=None, filters={}, sort_by='sku', ascending=True, limit=None, offset=None):
     """ 
     Obtiene el stock detallado por lote/serie y PROYECTO (Versión V3).
-    [ACTUALIZADO] Incluye IncomingStock para mostrar tránsito en detalle.
+    [CORREGIDO] Arreglado bug de ordenamiento por lote (lot_name_ordered).
     """
     base_query = """
     WITH ReservedStock AS (
@@ -664,7 +664,6 @@ def get_stock_on_hand_filtered_sorted(company_id, warehouse_id=None, filters={},
         u.name as uom_name, MAX(sq.notes) as notes, 
         
         COALESCE(MAX(rs.reserved_qty), 0) as reserved_quantity,
-        -- [CRÍTICO] Columna necesaria
         COALESCE(MAX(iss.incoming_qty), 0) as incoming_quantity,
         
         (SUM(sq.quantity) - COALESCE(MAX(rs.reserved_qty), 0)) as available_quantity,
@@ -726,8 +725,14 @@ def get_stock_on_hand_filtered_sorted(company_id, warehouse_id=None, filters={},
     order_by_col_key = sort_by if sort_by else 'sku'
     order_by_col = sort_map.get(order_by_col_key, 'p.sku')
     direction = "ASC" if ascending else "DESC"
-    if order_by_col in ['pc.name', 'u.name', 'lot_name_ordered', 'l.name', 'proj.name']: order_by_clause = f"COALESCE({order_by_col}, 'zzzz')"
-    else: order_by_clause = order_by_col
+    
+    # [CORRECCIÓN AQUI]
+    # Quitamos 'lot_name_ordered' de esta lista porque ya es un alias "seguro" (nunca es nulo)
+    # y PostgreSQL falla si metemos un alias dentro de una función en el ORDER BY.
+    if order_by_col in ['pc.name', 'u.name', 'proj.name']: 
+        order_by_clause = f"COALESCE({order_by_col}, 'zzzz')"
+    else: 
+        order_by_clause = order_by_col
          
     base_query += f" ORDER BY {order_by_clause} {direction}, p.sku ASC, lot_name_ordered ASC"
     
@@ -736,8 +741,6 @@ def get_stock_on_hand_filtered_sorted(company_id, warehouse_id=None, filters={},
         params.extend([limit, offset])
     
     return execute_query(base_query, tuple(params), fetchall=True)
-
-
 
 def get_full_product_kardex_data(company_id, date_from, date_to, warehouse_id=None, product_filter=None):
     """
