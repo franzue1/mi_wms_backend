@@ -1077,52 +1077,54 @@ def get_stock_for_product_location(product_id, location_id):
 
 def get_real_available_stock(product_id, location_id, project_id=None):
     """
-    Calcula disponible (Físico - Reservado).
-    [CORREGIDO V3] Lógica estricta de aislamiento.
-    - Si project_id es None: Solo mira stock GENERAL (project_id IS NULL).
-    - Si project_id tiene valor: Mira stock PROYECTO + stock GENERAL.
+    Calcula disponible (Físico Accesible - TODO lo Reservado).
+    [CORRECCIÓN LÓGICA] Las reservas se restan globalmente. 
+    Si la Obra A reserva 20, la Obra B no debe verlas como disponibles.
     """
     if not product_id or not location_id: return 0.0
     
-    # Parametros base
-    params = [product_id, location_id]
+    # --- 1. CALCULAR STOCK FÍSICO ACCESIBLE ---
+    # Aquí SÍ aplicamos filtro: Solo veo mi stock propio o el stock general.
+    # No puedo contar como "mío" el stock físico que ya está asignado a otro proyecto.
     
-    # Filtros SQL dinámicos
+    params_phy = [product_id, location_id]
+    proj_filter_quant = ""
+    
     if project_id is not None:
-        # Caso Cascada: Mi Proyecto + Stock General
         proj_filter_quant = "AND (project_id = %s OR project_id IS NULL)"
-        proj_filter_move = "AND (sm.project_id = %s OR sm.project_id IS NULL)"
-        params.append(project_id)
-    else:
-        # Caso Estricto: Solo Stock General (Sin dueño)
-        # Esto evita que veas stock "Físico" que en realidad pertenece a un proyecto.
-        proj_filter_quant = "AND project_id IS NULL"
-        proj_filter_move = "AND sm.project_id IS NULL"
+        params_phy.append(project_id)
     
-    # 1. Físico (Query simple sobre stock_quants)
     query_phy = f"SELECT SUM(quantity) as total FROM stock_quants WHERE product_id = %s AND location_id = %s {proj_filter_quant}"
-    res_phy = execute_query(query_phy, tuple(params), fetchone=True)
+    res_phy = execute_query(query_phy, tuple(params_phy), fetchone=True)
     physical = res_phy['total'] if res_phy and res_phy['total'] else 0.0
     
-    # 2. Reservado (Query con JOIN)
-    # Restamos lo que ya está en albaranes 'listo' (reservado) que coincidan con nuestro criterio de proyecto
-    query_res = f"""
+    # --- 2. CALCULAR STOCK RESERVADO GLOBALMENTE ---
+    # [CAMBIO CRÍTICO] AQUÍ NO FILTRAMOS POR PROYECTO.
+    # Si hay una reserva en esta ubicación física, resta capacidad para TODOS.
+    # Una unidad reservada para Obra A deja de estar disponible para Obra B.
+    
+    query_res = """
         SELECT SUM(sm.product_uom_qty) as reserved 
         FROM stock_moves sm 
         JOIN pickings p ON sm.picking_id = p.id
-        WHERE sm.product_id = %s AND sm.location_src_id = %s 
-          AND p.state = 'listo' AND sm.state != 'cancelled'
-          {proj_filter_move}
+        WHERE sm.product_id = %s 
+          AND sm.location_src_id = %s 
+          AND p.state = 'listo' 
+          AND sm.state != 'cancelled'
     """
-    # Usamos los mismos params porque el orden de los %s es idéntico
-    res_res = execute_query(query_res, tuple(params), fetchone=True)
+    # Solo pasamos producto y ubicación
+    res_res = execute_query(query_res, (product_id, location_id), fetchone=True)
     reserved = res_res['reserved'] if res_res and res_res['reserved'] else 0.0
     
+    # --- 3. RESULTADO ---
     available = max(0.0, physical - reserved)
-    
-    # [DEBUG LOG] Para rastrear en consola si algo no cuadra
-    print(f"[STOCK-CHECK] Prod {product_id} @ Loc {location_id} (Proj {project_id}): Phy {physical} - Res {reserved} = {available}")
-    
+
+    # Debug para que verifiques en consola
+    print(f"[STOCK-LOGIC] Prod: {product_id} | Loc: {location_id} | ReqProj: {project_id}")
+    print(f"              Físico Accesible: {physical}")
+    print(f"              Reservado Total (Cualquier Obra): {reserved}")
+    print(f"              Disponible Real: {available}")
+
     return available
 
 def get_products_with_stock_at_location(location_id):
