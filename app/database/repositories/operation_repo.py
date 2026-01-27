@@ -1476,7 +1476,8 @@ def get_picking_ui_details_optimized(picking_id, company_id):
     moves_data AS (
         SELECT COALESCE(json_agg(json_build_object(
             'id', sm.id, 
-            'product_id', pr.id, 
+            'product_id', pr.id,
+            'location_src_id', sm.location_src_id, -- <--- ¡AGREGA ESTA LÍNEA!
             'name', pr.name, 
             'sku', pr.sku, 
             'product_uom_qty', sm.product_uom_qty, 
