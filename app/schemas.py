@@ -306,6 +306,10 @@ class AdjustmentListResponse(BaseModel):
     responsible_user: Optional[str] = None
     adjustment_reason: Optional[str] = None
     notes: Optional[str] = None
+    
+    # --- [AGREGADO] ---
+    dest_path: Optional[str] = None # <--- ESTO FALTABA
+    src_path: Optional[str] = None  # Agregamos este también por consistencia
 
     class Config:
         from_attributes = True

@@ -52,15 +52,28 @@ def get_picking_details(picking_id, company_id):
     return p_info, moves
 
 
-def create_picking(name, picking_type_id, location_src_id, location_dest_id, company_id, responsible_user, work_order_id=None, project_id=None):
+def create_picking(name, picking_type_id, location_src_id, location_dest_id, company_id, responsible_user, work_order_id=None, project_id=None, warehouse_id=None):
     """
-    Crea un nuevo picking (albarán). Soporta project_id.
+    [CORREGIDO] Crea un nuevo picking base.
+    Ahora guarda el warehouse_id para que los reportes por almacén funcionen.
     """
     s_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
-    query = """INSERT INTO pickings (company_id, name, picking_type_id, location_src_id, location_dest_id, scheduled_date, state, work_order_id, responsible_user, project_id) 
-               VALUES (%s, %s, %s, %s, %s, %s, 'draft', %s, %s, %s) RETURNING id"""
-    params = (company_id, name, picking_type_id, location_src_id, location_dest_id, s_date, work_order_id, responsible_user, project_id)
+    # [FIX] Agregamos warehouse_id a la consulta
+    query = """
+        INSERT INTO pickings (
+            company_id, name, picking_type_id, 
+            location_src_id, location_dest_id, warehouse_id, 
+            scheduled_date, state, work_order_id, responsible_user, project_id
+        ) 
+        VALUES (%s, %s, %s, %s, %s, %s, %s, 'draft', %s, %s, %s) 
+        RETURNING id
+    """
+    params = (
+        company_id, name, picking_type_id, 
+        location_src_id, location_dest_id, warehouse_id, 
+        s_date, work_order_id, responsible_user, project_id
+    )
     
     new_id_row = execute_commit_query(query, params, fetchone=True)
     
@@ -71,8 +84,8 @@ def create_picking(name, picking_type_id, location_src_id, location_dest_id, com
 
 def update_picking_header(pid: int, updates: dict):
     """
-    Actualiza campos del picking y sincroniza en cascada a las líneas (stock_moves).
-    [MEJORA] Si cambian ubicaciones, partner o proyecto, se actualizan todas las líneas hijas.
+    Actualiza campos del picking y sincroniza en cascada.
+    [MEJORA] Si cambia una ubicación, actualiza automáticamente el warehouse_id.
     """
     if not updates: return
 
@@ -80,8 +93,25 @@ def update_picking_header(pid: int, updates: dict):
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
-            # 1. Preparar actualización de Cabecera
+            # 1. Preparar actualización
             fields_to_update = {}
+            
+            # --- LÓGICA DE DETECCIÓN DE ALMACÉN ---
+            # Si se actualiza una ubicación, verificamos a qué almacén pertenece
+            new_location_id = updates.get('location_src_id') or updates.get('location_dest_id')
+            
+            # Solo si se envió un ID de ubicación y NO se envió explícitamente un warehouse_id
+            if new_location_id and 'warehouse_id' not in updates:
+                cursor.execute("""
+                    SELECT warehouse_id FROM locations 
+                    WHERE id = %s AND type = 'internal' -- Solo nos importa si es interna
+                """, (new_location_id,))
+                res_wh = cursor.fetchone()
+                if res_wh and res_wh[0]:
+                    fields_to_update['warehouse_id'] = res_wh[0]
+                    print(f"[DB] Auto-detectado Warehouse ID {res_wh[0]} para Picking {pid}")
+            # --------------------------------------
+
             for key, value in updates.items():
                 if key in ALLOWED_PICKING_FIELDS_TO_UPDATE:
                     if isinstance(value, date) and not isinstance(value, str): 
@@ -91,19 +121,16 @@ def update_picking_header(pid: int, updates: dict):
             
             if not fields_to_update: return
 
-            # Construir query dinámica para pickings
+            # Construir query dinámica
             set_clause_parts = [f"{key} = %s" for key in fields_to_update.keys()]
             params = list(fields_to_update.values()) + [pid]
             
             cursor.execute(f"UPDATE pickings SET {', '.join(set_clause_parts)} WHERE id = %s", tuple(params))
             
             # --- 2. LÓGICA DE CASCADA (Sincronizar Líneas) ---
-            # Si cambiamos datos estructurales en la cabecera, las líneas deben heredar el cambio.
-            
             moves_updates = []
             moves_params = []
 
-            # Mapeo: Campo Header -> Campo Move
             cascade_map = {
                 'location_src_id': 'location_src_id',
                 'location_dest_id': 'location_dest_id',
@@ -117,13 +144,10 @@ def update_picking_header(pid: int, updates: dict):
                     moves_params.append(fields_to_update[head_field])
             
             if moves_updates:
-                # Solo actualizamos líneas que no estén canceladas/hechas (aunque en draft todas deberían estar draft)
-                # Y forzamos la actualización masiva para este picking
                 query_moves = f"UPDATE stock_moves SET {', '.join(moves_updates)} WHERE picking_id = %s"
                 moves_params.append(pid)
-                
                 cursor.execute(query_moves, tuple(moves_params))
-                print(f"[DB] Cascada ejecutada para Picking {pid}: Actualizados {moves_updates}")
+                print(f"[DB] Cascada ejecutada para Picking {pid}")
 
             conn.commit()
 
@@ -133,6 +157,7 @@ def update_picking_header(pid: int, updates: dict):
         raise e
     finally:
         if conn: return_db_connection(conn)
+
 
 def cancel_picking(picking_id):
     conn = None
@@ -1223,24 +1248,26 @@ def get_adjustments(company_id):
 
 def create_draft_adjustment(company_id, user_name):
     """
-    Crea un picking ADJ vacío con prefijo de compañía.
-    Ejemplo: C2/ADJ/00001
+    [CORREGIDO COMPLETO] Crea picking ADJ guardando el warehouse_id.
     """
     try:
         conn = get_db_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-            # Validaciones previas
-            cursor.execute("SELECT id FROM picking_types WHERE code='ADJ' AND company_id=%s LIMIT 1", (company_id,))
+            # 1. Obtener configuración (incluyendo warehouse_id)
+            cursor.execute("SELECT id, warehouse_id FROM picking_types WHERE code='ADJ' AND company_id=%s LIMIT 1", (company_id,))
             pt = cursor.fetchone()
+            
             cursor.execute("SELECT id FROM locations WHERE category='AJUSTE' AND company_id=%s LIMIT 1", (company_id,))
             loc = cursor.fetchone()
             
             if not pt or not loc: return None
             
-            # --- GENERACIÓN DE NOMBRE (NUEVA LÓGICA) ---
+            # Capturamos el ID del almacén para guardarlo
+            wh_id = pt['warehouse_id'] 
+            
+            # --- GENERACIÓN DE NOMBRE C{id} ---
             prefix = f"C{company_id}/ADJ/"
             
-            # 1. Buscar último usado
             cursor.execute("SELECT name FROM pickings WHERE name LIKE %s AND company_id = %s ORDER BY id DESC LIMIT 1", (f"{prefix}%", company_id))
             last_res = cursor.fetchone()
             
@@ -1249,7 +1276,6 @@ def create_draft_adjustment(company_id, user_name):
                 try: current_seq = int(last_res['name'].split('/')[-1])
                 except: pass
             
-            # 2. Bucle de Seguridad
             while True:
                 current_seq += 1
                 new_name = f"{prefix}{str(current_seq).zfill(5)}"
@@ -1259,14 +1285,26 @@ def create_draft_adjustment(company_id, user_name):
             # -----------------------------------
             
             s_date = datetime.now()
+            
+            # [FIX] Agregamos warehouse_id al INSERT
             cursor.execute("""
-                INSERT INTO pickings (company_id, name, picking_type_id, location_src_id, location_dest_id, scheduled_date, state, responsible_user, custom_operation_type) 
-                VALUES (%s, %s, %s, %s, %s, %s, 'draft', %s, 'Ajuste de Inventario') RETURNING id
-            """, (company_id, new_name, pt['id'], loc['id'], loc['id'], s_date, user_name))
+                INSERT INTO pickings (
+                    company_id, name, picking_type_id, warehouse_id, 
+                    location_src_id, location_dest_id, 
+                    scheduled_date, state, responsible_user, custom_operation_type
+                ) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'draft', %s, 'Ajuste de Inventario') 
+                RETURNING id
+            """, (
+                company_id, new_name, pt['id'], wh_id, 
+                loc['id'], loc['id'], 
+                s_date, user_name
+            ))
             
             new_id = cursor.fetchone()[0]
             conn.commit()
             return new_id
+
     except Exception as e:
         if conn: conn.rollback()
         print(f"Error create_draft_adjustment: {e}")
@@ -1337,12 +1375,14 @@ def get_adjustments_count(company_id, filters={}):
 def get_adjustments_filtered_sorted(company_id, filters={}, sort_by='id', ascending=False, limit=None, offset=None):
     """
     Listado de Ajustes de Inventario con nombres legibles de ubicaciones.
+    [MEJORA] Lógica inteligente para 'dest_path' (Ubicación Afectada).
     """
     sort_map = {
         'id': "p.id", 'name': "p.name", 'state': "p.state",
         'date': "p.scheduled_date", 
-        'src_path': "COALESCE(l_src.path, w_src.name)", # Ordenar por nombre real
-        'dest_path': "COALESCE(l_dest.path, w_dest.name)", 
+        'src_path': "COALESCE(l_src.path, w_src.name)", 
+        # Mapeamos 'dest_path' a la lógica inteligente para que el ordenamiento funcione
+        'dest_path': "CASE WHEN l_src.category = 'AJUSTE' THEN COALESCE(l_dest.path, w_dest.name) ELSE COALESCE(l_src.path, w_src.name) END", 
         'responsible_user': "p.responsible_user",
         'adjustment_reason': "p.adjustment_reason"
     }
@@ -1355,11 +1395,21 @@ def get_adjustments_filtered_sorted(company_id, filters={}, sort_by='id', ascend
             TO_CHAR(p.scheduled_date, 'YYYY-MM-DD') as date,
             p.responsible_user, p.adjustment_reason, p.notes, p.loss_confirmation,
             
-            -- Nombres legibles para Origen
-            CASE WHEN l_src.type = 'internal' THEN w_src.name ELSE l_src.path END as src_path,
-            
-            -- Nombres legibles para Destino
-            CASE WHEN l_dest.type = 'internal' THEN w_dest.name ELSE l_dest.path END as dest_path
+            -- Lógica Inteligente para 'Ubicación Afectada' (dest_path)
+            -- Buscamos el lado que NO sea 'AJUSTE' (Virtual).
+            CASE 
+                -- Caso 1: Origen es Virtual -> Mostramos Destino (Físico)
+                WHEN l_src.category = 'AJUSTE' THEN COALESCE(l_dest.path, w_dest.name, 'Sin Ubicación')
+                
+                -- Caso 2: Destino es Virtual -> Mostramos Origen (Físico)
+                WHEN l_dest.category = 'AJUSTE' THEN COALESCE(l_src.path, w_src.name, 'Sin Ubicación')
+                
+                -- Caso 3: Ambos Virtuales (Datos antiguos/sucios) -> Mostramos Destino por defecto
+                ELSE COALESCE(l_dest.path, 'Indeterminado')
+            END as dest_path,
+
+            -- (Opcional) Mantenemos src_path original por si se necesita
+            COALESCE(l_src.path, w_src.name) as src_path
 
         FROM pickings p 
         JOIN picking_types pt ON p.picking_type_id = pt.id
@@ -1376,7 +1426,6 @@ def get_adjustments_filtered_sorted(company_id, filters={}, sort_by='id', ascend
     for key, value in filters.items():
         if not value: continue
         
-        # Mapeo de filtros a columnas DB (o alias si usas subquery, pero aquí directo)
         if key == 'state':
             where_clauses.append("p.state = %s"); params.append(value)
         elif key == 'name':
@@ -1385,10 +1434,15 @@ def get_adjustments_filtered_sorted(company_id, filters={}, sort_by='id', ascend
             where_clauses.append("p.responsible_user ILIKE %s"); params.append(f"%{value}%")
         elif key == 'adjustment_reason':
             where_clauses.append("p.adjustment_reason ILIKE %s"); params.append(f"%{value}%")
-        # Nota: Filtrar por path calculado es complejo en SQL directo sin CTE, 
-        # por simplicidad filtramos por el path crudo de locations
-        elif key == 'src_path':
-            where_clauses.append("l_src.path ILIKE %s"); params.append(f"%{value}%")
+        # Filtro para la nueva columna inteligente
+        elif key == 'dest_path':
+             where_clauses.append("""
+                (CASE 
+                    WHEN l_src.category = 'AJUSTE' THEN COALESCE(l_dest.path, w_dest.name)
+                    ELSE COALESCE(l_src.path, w_src.name)
+                END) ILIKE %s
+             """)
+             params.append(f"%{value}%")
     
     if where_clauses:
         query += " AND " + " AND ".join(where_clauses)
@@ -1411,9 +1465,10 @@ def get_picking_ui_details_optimized(picking_id, company_id):
     WITH 
     -- 1. Cabecera y Regla
     picking_data AS (
-        SELECT p.*, pt.code as type_code, 
+        SELECT p.*, pt.code as type_code, w.name as warehouse_name, -- <--- AGREGAR ESTO
                json_build_object('id', ot.id, 'name', ot.name, 'source_location_category', ot.source_location_category, 'destination_location_category', ot.destination_location_category) as op_rule
         FROM pickings p JOIN picking_types pt ON p.picking_type_id = pt.id 
+        LEFT JOIN warehouses w ON p.warehouse_id = w.id -- <--- AGREGAR ESTE JOIN
         LEFT JOIN operation_types ot ON p.custom_operation_type = ot.name
         WHERE p.id = %(pid)s AND p.company_id = %(cid)s
     ),
@@ -1531,7 +1586,7 @@ def get_project_id_by_name(project_name, company_id):
 def create_full_picking_transaction(data: dict):
     """
     [LAZY CREATION] Crea cabecera y líneas en una sola transacción atómica.
-    [CORREGIDO] Ya no fuerza defaults si el usuario envía NULL. Respeta los campos vacíos.
+    [CORREGIDO] Definición de wh_id restaurada + Prefijo C{id}.
     """
     conn = None
     try:
@@ -1545,10 +1600,12 @@ def create_full_picking_transaction(data: dict):
         pt = cursor.fetchone()
         if not pt: raise ValueError("Tipo de operación no válido.")
 
-        # --- GENERACIÓN DE NOMBRE (NUEVA LÓGICA) ---
-        cursor.execute("SELECT code FROM picking_types WHERE id = %s", (pt['id'],))
-        res_pt = cursor.fetchone()
-        pt_code = res_pt['code']
+        # --- [FIX] RESTAURADO: Definir wh_id ---
+        wh_id = pt['warehouse_id'] 
+        # ---------------------------------------
+
+        # --- GENERACIÓN DE NOMBRE (LÓGICA C{id}) ---
+        pt_code = pt['code'] # El código ya viene en la consulta de picking_types
         
         # Prefijo: C{company_id}/{TIPO}/
         prefix = f"C{data['company_id']}/{pt_code}/"
@@ -1571,22 +1628,9 @@ def create_full_picking_transaction(data: dict):
                 break
         # -----------------------------------
 
-        # 3. Ubicaciones [CORRECCIÓN CRÍTICA AQUÍ]
-        # ANTES:
-        # final_src = data.get('location_src_id') or pt['default_location_src_id']
-        # final_dest = data.get('location_dest_id') or pt['default_location_dest_id']
-        
-        # AHORA: Respetamos estrictamente lo que manda la UI. 
-        # Si la UI manda None, guardamos None (NULL).
-        # Solo usamos el default si NO EXISTE la clave en 'data' (que es raro), 
-        # pero si la clave existe y es None, se queda None.
-        
+        # 3. Ubicaciones (Respetando NULLs de la UI)
         final_src = data.get('location_src_id')
         final_dest = data.get('location_dest_id')
-
-        # NOTA: Para operaciones de entrada/salida donde una ubicación es virtual (Proveedor/Cliente),
-        # la UI debería estar enviando el ID correcto de esa ubicación virtual o el backend
-        # podría validarlo, pero para ubicaciones FÍSICAS internas, esto permite dejarlas vacías.
 
         # 4. Insertar Cabecera
         cursor.execute("""
@@ -1603,7 +1647,7 @@ def create_full_picking_transaction(data: dict):
             ) RETURNING id
         """, (
             data['company_id'], new_name, data['picking_type_id'], data['responsible_user'],
-            final_src, final_dest, wh_id,
+            final_src, final_dest, wh_id, # <--- Aquí es donde fallaba antes
             data.get('partner_id'), data.get('partner_ref'), data.get('purchase_order'), data.get('date_transfer'),
             data.get('custom_operation_type'), data.get('project_id')
         ))
@@ -1778,7 +1822,10 @@ def import_smart_adjustments_transaction(company_id, user_name, rows):
         cursor.execute("SELECT id, warehouse_id FROM picking_types WHERE code='ADJ' AND company_id=%s LIMIT 1", (company_id,))
         pt = cursor.fetchone()
         if not pt: raise ValueError("No existe configuración de 'Ajustes' (Picking Type ADJ).")
-        
+
+        # [FIX] Capturamos el ID del almacén
+        wh_id = pt['warehouse_id']
+
         cursor.execute("SELECT id FROM locations WHERE category='AJUSTE' AND company_id=%s LIMIT 1", (company_id,))
         loc_virtual = cursor.fetchone()
         if not loc_virtual: raise ValueError("No existe ubicación virtual 'AJUSTE'.")
@@ -1829,21 +1876,40 @@ def import_smart_adjustments_transaction(company_id, user_name, rows):
             
             notes = first_row.get('notas', '')
 
-            # --- ASIGNACIÓN DE NOMBRE (EN MEMORIA) ---
+            # --- [FIX] DETECTAR UBICACIÓN FÍSICA PARA LA CABECERA ---
+            # Leemos la ubicación de la primera línea para asignarla al documento general
+            first_loc_path = first_row.get('ubicacion')
+            header_dest_id = virtual_id # Por defecto (si falla)
+
+            if first_loc_path:
+                cursor.execute(
+                    "SELECT id FROM locations WHERE (path = %s OR name = %s) AND company_id = %s AND type='internal'", 
+                    (first_loc_path, first_loc_path, company_id)
+                )
+                res_loc = cursor.fetchone()
+                if res_loc:
+                    header_dest_id = res_loc['id']
+
+            # --- ASIGNACIÓN DE NOMBRE ---
             current_sequence_counter += 1
             new_name = f"{prefix}{str(current_sequence_counter).zfill(5)}"
-            # -----------------------------------------
 
             # Crear Cabecera
+            # [CORREGIDO] Usamos header_dest_id en location_dest_id
             cursor.execute("""
                 INSERT INTO pickings (
-                    company_id, name, picking_type_id, state, responsible_user, 
+                    company_id, name, picking_type_id, warehouse_id,
+                    state, responsible_user, 
                     adjustment_reason, notes, custom_operation_type,
                     location_src_id, location_dest_id, scheduled_date
-                ) VALUES (%s, %s, %s, 'draft', %s, %s, %s, 'Ajuste de Inventario', %s, %s, NOW())
+                ) VALUES (%s, %s, %s, %s, 'draft', %s, %s, %s, 'Ajuste de Inventario', %s, %s, NOW())
                 RETURNING id
-            """, (company_id, new_name, pt['id'], user_name, reason, notes, virtual_id, virtual_id))
-            
+            """, (
+                company_id, new_name, pt['id'], wh_id, 
+                user_name, reason, notes, 
+                virtual_id, header_dest_id # <--- AQUI ESTABA EL ERROR (antes era virtual_id)
+            ))
+
             picking_id = cursor.fetchone()[0]
             
             # Procesar Líneas

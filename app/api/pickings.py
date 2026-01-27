@@ -174,15 +174,18 @@ async def get_pickings_count(
 
 @router.post("/create-draft", response_model=schemas.PickingResponse, status_code=201)
 async def create_draft_picking(data: PickingCreateRequest, auth: AuthDependency):
-    verify_company_access(auth, data.company_id) # <--- BLINDAJE (Leyendo del modelo)
-    """ Crea un nuevo albarán en estado 'borrador'. """
+    verify_company_access(auth, data.company_id)
     if "operations.can_create" not in auth.permissions:
         raise HTTPException(status_code=403, detail="No autorizado")
     try:
-        pt_details = db.get_picking_type_details(data.picking_type_id) # (Copiar lógica existente)
+        # 1. Obtenemos detalles del tipo (incluye warehouse_id)
+        pt_details = db.get_picking_type_details(data.picking_type_id)
         if not pt_details: raise HTTPException(status_code=404, detail="Tipo no encontrado")
+        
+        # 2. Generamos nombre (Ya corregido con company_id)
         new_name = db.get_next_picking_name(data.picking_type_id, data.company_id)
 
+        # 3. [FIX] Pasamos warehouse_id a la función
         new_picking_id = db.create_picking(
             name=new_name,
             picking_type_id=data.picking_type_id,
@@ -190,7 +193,8 @@ async def create_draft_picking(data: PickingCreateRequest, auth: AuthDependency)
             location_dest_id=pt_details['default_location_dest_id'],
             company_id=data.company_id,
             responsible_user=data.responsible_user,
-            project_id=data.project_id  # <--- ¡AQUÍ PASAMOS EL PROYECTO!
+            project_id=data.project_id,
+            warehouse_id=pt_details['warehouse_id'] # <--- ¡AGREGADO!
         )
         picking_header, picking_moves_raw = db.get_picking_details(new_picking_id, data.company_id)
         if not picking_header: raise HTTPException(status_code=404, detail="Creado pero no encontrado")
