@@ -85,31 +85,34 @@ def create_picking(name, picking_type_id, location_src_id, location_dest_id, com
 def update_picking_header(pid: int, updates: dict):
     """
     Actualiza campos del picking y sincroniza en cascada.
-    [MEJORA] Si cambia una ubicación, actualiza automáticamente el warehouse_id.
+    [MEJORA] Si es ADJ, NO sincroniza ubicaciones a las líneas (protege la dirección mixta).
     """
     if not updates: return
 
     conn = None
     try:
         conn = get_db_connection()
-        with conn.cursor() as cursor:
-            # 1. Preparar actualización
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+            # 1. Identificar Tipo de Operación (Para proteger ADJ)
+            cursor.execute("""
+                SELECT pt.code 
+                FROM pickings p 
+                JOIN picking_types pt ON p.picking_type_id = pt.id 
+                WHERE p.id = %s
+            """, (pid,))
+            res_code = cursor.fetchone()
+            pt_code = res_code['code'] if res_code else ''
+
+            # 2. Preparar actualización
             fields_to_update = {}
             
             # --- LÓGICA DE DETECCIÓN DE ALMACÉN ---
-            # Si se actualiza una ubicación, verificamos a qué almacén pertenece
             new_location_id = updates.get('location_src_id') or updates.get('location_dest_id')
-            
-            # Solo si se envió un ID de ubicación y NO se envió explícitamente un warehouse_id
             if new_location_id and 'warehouse_id' not in updates:
-                cursor.execute("""
-                    SELECT warehouse_id FROM locations 
-                    WHERE id = %s AND type = 'internal' -- Solo nos importa si es interna
-                """, (new_location_id,))
+                cursor.execute("SELECT warehouse_id FROM locations WHERE id = %s AND type = 'internal'", (new_location_id,))
                 res_wh = cursor.fetchone()
                 if res_wh and res_wh[0]:
                     fields_to_update['warehouse_id'] = res_wh[0]
-                    print(f"[DB] Auto-detectado Warehouse ID {res_wh[0]} para Picking {pid}")
             # --------------------------------------
 
             for key, value in updates.items():
@@ -121,13 +124,12 @@ def update_picking_header(pid: int, updates: dict):
             
             if not fields_to_update: return
 
-            # Construir query dinámica
+            # Construir query dinámica para Header
             set_clause_parts = [f"{key} = %s" for key in fields_to_update.keys()]
             params = list(fields_to_update.values()) + [pid]
-            
             cursor.execute(f"UPDATE pickings SET {', '.join(set_clause_parts)} WHERE id = %s", tuple(params))
             
-            # --- 2. LÓGICA DE CASCADA (Sincronizar Líneas) ---
+            # --- 3. LÓGICA DE CASCADA (Sincronizar Líneas) ---
             moves_updates = []
             moves_params = []
 
@@ -138,6 +140,13 @@ def update_picking_header(pid: int, updates: dict):
                 'project_id': 'project_id'
             }
 
+            # [PROTECCIÓN CRÍTICA] 
+            # Si es Ajuste (ADJ), las líneas tienen direcciones propias (entrada/salida mixta).
+            # NO debemos sobrescribir sus ubicaciones con la de la cabecera.
+            if pt_code == 'ADJ':
+                cascade_map.pop('location_src_id', None)
+                cascade_map.pop('location_dest_id', None)
+
             for head_field, move_field in cascade_map.items():
                 if head_field in fields_to_update:
                     moves_updates.append(f"{move_field} = %s")
@@ -147,7 +156,7 @@ def update_picking_header(pid: int, updates: dict):
                 query_moves = f"UPDATE stock_moves SET {', '.join(moves_updates)} WHERE picking_id = %s"
                 moves_params.append(pid)
                 cursor.execute(query_moves, tuple(moves_params))
-                print(f"[DB] Cascada ejecutada para Picking {pid}")
+                print(f"[DB] Cascada ejecutada para Picking {pid} (Moves actualizados)")
 
             conn.commit()
 
@@ -157,7 +166,6 @@ def update_picking_header(pid: int, updates: dict):
         raise e
     finally:
         if conn: return_db_connection(conn)
-
 
 def cancel_picking(picking_id):
     conn = None
