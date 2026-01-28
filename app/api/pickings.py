@@ -1051,22 +1051,24 @@ async def cancel_picking(picking_id: int, auth: AuthDependency):
 @router.put("/{picking_id}/header", status_code=200)
 async def update_picking_header(picking_id: int, data: PickingHeaderUpdate, auth: AuthDependency):
     """ 
-    [CORREGIDO & BLINDADO] Actualiza campos específicos de la cabecera.
-    CRÍTICO: Evita que se borren las ubicaciones si el frontend envía NULL al editar un borrador.
+    [CORREGIDO] Actualiza campos de cabecera.
+    FIX: Se permite que 'project_id' sea NULL para poder desasignar proyectos.
     """
-    # Permisos (Asumimos que quien puede editar operaciones o ajustes puede usar esto)
+    # Permisos
     if "operations.can_edit" not in auth.permissions and "adjustments.can_edit" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
     
     try:
-        # 1. Convertir a diccionario, pero OJO: exclude_unset=True no filtra los Nones explícitos enviados por el frontend
+        # 1. Convertir a diccionario
+        # exclude_unset=True evita procesar campos que no venían en el JSON
         update_data = data.dict(exclude_unset=True)
         
-        # [BLINDAJE DE SEGURIDAD CONTRA BORRADO ACCIDENTAL]
-        # Si el frontend envía location_src_id=None (null), lo eliminamos del diccionario
-        # para que NO se ejecute "SET location_src_id = NULL" en la base de datos.
-        # Esto preserva el valor que ya tenía el registro.
-        keys_to_protect = ['location_src_id', 'location_dest_id', 'project_id', 'warehouse_id']
+        # [BLINDAJE DE SEGURIDAD AJUSTADO]
+        # Protegemos ubicaciones críticas de ser borradas accidentalmente si el UI envía null,
+        # PERO permitimos borrar el 'project_id' (para pasar a Stock General).
+        
+        # ELIMINADO 'project_id' DE ESTA LISTA:
+        keys_to_protect = ['location_src_id', 'location_dest_id', 'warehouse_id']
         
         keys_to_remove = []
         for k in keys_to_protect:
@@ -1091,7 +1093,7 @@ async def update_picking_header(picking_id: int, data: PickingHeaderUpdate, auth
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al actualizar cabecera: {e}")
-    
+
 @router.post("/{picking_id}/moves", response_model=dict, status_code=201)
 async def add_stock_move(
     picking_id: int, 

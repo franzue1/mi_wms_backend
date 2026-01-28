@@ -36,6 +36,7 @@ def create_schema(conn):
             name TEXT NOT NULL,
             code TEXT,
             status TEXT DEFAULT 'active',
+            -- Unicidad de nombre por compañía (Ya estaba, bien)
             UNIQUE(company_id, name)
         );
     """)
@@ -50,7 +51,10 @@ def create_schema(conn):
             analytic_account TEXT,
             description TEXT,
             status TEXT DEFAULT 'active',
-            UNIQUE(company_id, name)
+            -- Unicidad de nombre por compañía
+            UNIQUE(company_id, name),
+            -- [NUEVO] Unicidad de CÓDIGO dentro de la Dirección Padre
+            UNIQUE(direction_id, code)
         );
     """)
 
@@ -65,7 +69,10 @@ def create_schema(conn):
             description TEXT,
             client_name TEXT,
             status TEXT DEFAULT 'active',
-            UNIQUE(company_id, name)
+            -- Unicidad de nombre por compañía
+            UNIQUE(company_id, name),
+            -- [NUEVO] Unicidad de CÓDIGO dentro de la Gerencia Padre
+            UNIQUE(management_id, code)
         );
     """)
 
@@ -87,7 +94,7 @@ def create_schema(conn):
             phase TEXT DEFAULT 'Sin Iniciar',
             budget REAL DEFAULT 0,
             
-            -- Restricción de unicidad compuesta
+            -- [BLINDAJE] Restricción de unicidad compuesta: (Padre + Código)
             UNIQUE(macro_project_id, code)
         );
     """)
@@ -160,7 +167,8 @@ def create_schema(conn):
         CREATE TABLE IF NOT EXISTS partners (
             id SERIAL PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), name TEXT NOT NULL,
             social_reason TEXT, ruc TEXT, email TEXT, phone TEXT, address TEXT,
-            category_id INTEGER REFERENCES partner_categories(id), UNIQUE (company_id, name)
+            category_id INTEGER REFERENCES partner_categories(id),UNIQUE (company_id, name),
+            UNIQUE (company_id, ruc) 
         );
     """)
 
@@ -200,7 +208,10 @@ def create_schema(conn):
             location_id INTEGER NOT NULL REFERENCES locations(id), 
             lot_id INTEGER REFERENCES stock_lots(id), 
             project_id INTEGER REFERENCES projects(id), 
-            quantity REAL NOT NULL,
+            
+            -- [BLINDAJE] La cantidad NUNCA puede ser negativa.
+            quantity REAL NOT NULL CHECK (quantity >= 0),
+            
             notes TEXT
         );
     """)
@@ -269,7 +280,7 @@ def create_schema(conn):
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY, 
-            username TEXT UNIQUE NOT NULL, 
+            username TEXT NOT NULL, -- Quitamos UNIQUE aquí para ponerlo abajo más inteligente
             hashed_password TEXT NOT NULL,
             full_name TEXT, 
             role_id INTEGER NOT NULL REFERENCES roles(id), 
@@ -277,6 +288,13 @@ def create_schema(conn):
             must_change_password BOOLEAN DEFAULT TRUE 
         );
     """)
+    
+    # [MEJORA] Índice único insensible a mayúsculas para usuarios
+    # Evita crear "Admin" si ya existe "admin".
+    try:
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower ON users (LOWER(username));")
+    except Exception: pass
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS user_companies (
             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -327,6 +345,13 @@ def create_schema(conn):
         "CREATE INDEX IF NOT EXISTS idx_sml_move_id ON stock_move_lines (move_id);",
         "CREATE INDEX IF NOT EXISTS idx_lots_product ON stock_lots (product_id);",
         "CREATE INDEX IF NOT EXISTS idx_user_warehouses_user ON user_warehouses(user_id);"
+
+        # E. HISTORIAL Y KARDEX (Crucial para velocidad de reportes)
+        # Permite filtrar movimientos por producto y ordenarlos por fecha instantáneamente
+        "CREATE INDEX IF NOT EXISTS idx_moves_kardex ON stock_moves (company_id, product_id, state);",
+        
+        # Acelera la búsqueda de movimientos dentro de un rango de fechas (Reportes mensuales)
+        "CREATE INDEX IF NOT EXISTS idx_pickings_date_range ON pickings (company_id, date_transfer);"
 
         # --- [NUEVO] ÍNDICES CRÍTICOS PARA REPORTES (ANTI-TIMEOUT) ---
         

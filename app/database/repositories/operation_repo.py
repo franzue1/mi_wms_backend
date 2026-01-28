@@ -84,8 +84,8 @@ def create_picking(name, picking_type_id, location_src_id, location_dest_id, com
 
 def update_picking_header(pid: int, updates: dict):
     """
-    Actualiza campos del picking y sincroniza en cascada.
-    [MEJORA] Si es ADJ, NO sincroniza ubicaciones a las líneas (protege la dirección mixta).
+    Actualiza campos del picking.
+    [BLINDADO] Bloquea edición si el picking ya no es borrador.
     """
     if not updates: return
 
@@ -93,15 +93,34 @@ def update_picking_header(pid: int, updates: dict):
     try:
         conn = get_db_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-            # 1. Identificar Tipo de Operación (Para proteger ADJ)
+
+            # 1. VERIFICAR ESTADO ACTUAL (Candado de Historia)
+            # [CORRECCIÓN]: El FOR UPDATE va DENTRO de las comillas
             cursor.execute("""
-                SELECT pt.code 
+                SELECT p.state, pt.code 
                 FROM pickings p 
                 JOIN picking_types pt ON p.picking_type_id = pt.id 
-                WHERE p.id = %s
+                WHERE p.id = %s 
+                FOR UPDATE
             """, (pid,))
-            res_code = cursor.fetchone()
-            pt_code = res_code['code'] if res_code else ''
+            
+            res = cursor.fetchone()
+            
+            if not res: return # O raise error
+            
+            current_state = res['state']
+            pt_code = res['code']
+
+            # [REGLA DE ORO] Si ya está hecho o cancelado, SOLO permitimos editar notas o referencias.
+            if current_state in ('done', 'cancelled'):
+                # Definir qué campos son "inofensivos" para editar post-cierre
+                safe_fields = {'notes', 'partner_ref', 'invoice_number', 'guide_number'}
+                
+                # Verificar si intentan tocar algo prohibido
+                unsafe_keys = [k for k in updates.keys() if k not in safe_fields]
+                
+                if unsafe_keys:
+                    raise ValueError(f"No se puede editar el documento porque está '{current_state}'. Campos bloqueados: {', '.join(unsafe_keys)}")
 
             # 2. Preparar actualización
             fields_to_update = {}
@@ -141,8 +160,7 @@ def update_picking_header(pid: int, updates: dict):
             }
 
             # [PROTECCIÓN CRÍTICA] 
-            # Si es Ajuste (ADJ), las líneas tienen direcciones propias (entrada/salida mixta).
-            # NO debemos sobrescribir sus ubicaciones con la de la cabecera.
+            # Si es Ajuste (ADJ), NO sobrescribir ubicaciones de líneas con la cabecera.
             if pt_code == 'ADJ':
                 cascade_map.pop('location_src_id', None)
                 cascade_map.pop('location_dest_id', None)
@@ -168,18 +186,30 @@ def update_picking_header(pid: int, updates: dict):
         if conn: return_db_connection(conn)
 
 def cancel_picking(picking_id):
+    """
+    [BLINDADO] Cancela un picking asegurando que nadie lo esté validando en ese instante.
+    """
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-            cursor.execute("SELECT state FROM pickings WHERE id = %s", (picking_id,))
+            # 1. BLOQUEO ATÓMICO
+            cursor.execute("SELECT id, state FROM pickings WHERE id = %s FOR UPDATE", (picking_id,))
             picking = cursor.fetchone()
             
             if not picking: return False, "El albarán no existe."
-            if picking['state'] not in ('draft', 'listo'):
-                return False, f"Estado inválido: {picking['state']}."
+            
+            # 2. VALIDACIÓN DE ESTADO POST-BLOQUEO
+            # Si alguien logró validarlo milisegundos antes, el estado ya será 'done'.
+            if picking['state'] == 'done':
+                return False, "No se puede cancelar: El albarán YA FUE VALIDADO/PROCESADO."
+            
+            if picking['state'] == 'cancelled':
+                return True, "Ya estaba cancelado."
 
+            # 3. EJECUCIÓN SEGURA
             cursor.execute("UPDATE pickings SET state = 'cancelled' WHERE id = %s", (picking_id,))
+            # Cancelar también los movimientos hijos para liberar reservas si las hubiera
             cursor.execute("UPDATE stock_moves SET state = 'cancelled' WHERE picking_id = %s", (picking_id,))
             
         conn.commit()
@@ -193,16 +223,24 @@ def cancel_picking(picking_id):
         if conn: return_db_connection(conn)
 
 def delete_picking(picking_id):
+    """
+    [BLINDADO] Borra un picking solo si es borrador y nadie lo está tocando.
+    """
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-            cursor.execute("SELECT state FROM pickings WHERE id = %s", (picking_id,))
+            # 1. BLOQUEO ATÓMICO
+            cursor.execute("SELECT id, state FROM pickings WHERE id = %s FOR UPDATE", (picking_id,))
             picking = cursor.fetchone()
             
             if not picking: return False, "No existe."
-            if picking['state'] != 'draft': return False, "Solo borradores."
+            
+            # 2. VALIDACIÓN ESTRICTA
+            if picking['state'] != 'draft': 
+                return False, f"No se puede borrar: El estado es '{picking['state']}' (solo borradores)."
 
+            # 3. EJECUCIÓN
             cursor.execute("SELECT id FROM stock_moves WHERE picking_id = %s", (picking_id,))
             moves = cursor.fetchall()
 
@@ -212,8 +250,9 @@ def delete_picking(picking_id):
                 cursor.execute("DELETE FROM stock_moves WHERE picking_id = %s", (picking_id,))
             
             cursor.execute("DELETE FROM pickings WHERE id = %s", (picking_id,))
+            
             conn.commit()
-            return True, "Eliminado."
+            return True, "Eliminado correctamente."
 
     except Exception as e:
         if conn: conn.rollback()
@@ -286,71 +325,115 @@ def mark_picking_as_ready(picking_id):
         if conn: return_db_connection(conn)
 
 def return_picking_to_draft(picking_id):
+    """
+    [BLINDADO & CORREGIDO] Regresa a borrador solo si está en 'listo'.
+    Corrección: Se agrega cursor_factory para evitar el error de tupla vs dict.
+    """
     conn = None
     try:
         conn = get_db_connection()
-        with conn.cursor() as cursor:
-            cursor.execute("UPDATE pickings SET state = 'draft' WHERE id = %s AND state = 'listo'", (picking_id,))
-            if cursor.rowcount > 0:
-                conn.commit()
-                return True, "Regresado a borrador."
-            return False, "No se pudo actualizar."
+        # --- CORRECCIÓN AQUÍ: Agregamos el factory ---
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+            
+            # 1. BLOQUEO ATÓMICO
+            cursor.execute("SELECT id, state FROM pickings WHERE id = %s FOR UPDATE", (picking_id,))
+            row = cursor.fetchone()
+            
+            if not row: return False, "No encontrado."
+            
+            # 2. VALIDACIÓN (Ahora row['state'] funcionará porque es un DictCursor)
+            if row['state'] == 'done':
+                return False, "Imposible regresar a borrador: El documento YA FUE VALIDADO."
+            
+            if row['state'] == 'draft':
+                return True, "Ya está en borrador."
+
+            # 3. EJECUCIÓN (De 'listo'/'cancelled' a 'draft')
+            # Primero actualizamos la cabecera
+            cursor.execute("UPDATE pickings SET state = 'draft' WHERE id = %s", (picking_id,))
+            
+            # Luego liberamos las reservas en los movimientos
+            cursor.execute("UPDATE stock_moves SET state = 'draft' WHERE picking_id = %s", (picking_id,))
+            
+            conn.commit()
+            return True, "Regresado a borrador exitosamente."
+            
     except Exception as e:
         if conn: conn.rollback()
+        # Imprimimos el error en consola para que lo veas en los logs de Render si vuelve a pasar
+        print(f"[ERROR RETURN DRAFT] {e}")
         return False, str(e)
     finally:
         if conn: return_db_connection(conn)
 
 def get_next_picking_name(picking_type_id, company_id):
     """
-    [BLINDADO v4 - PREFIJO DE COMPAÑÍA] 
-    Genera secuencia única por empresa: C{id}/{TIPO}/00001
-    Ejemplo: C2/IN/00001
+    [BLINDADO CON ADVISORY LOCK] 
+    Genera secuencia única por empresa de forma segura.
+    Usa un bloqueo ligero a nivel de aplicación DB para evitar colisiones.
     """
-    # 1. Obtener solo el código del tipo de operación (IN, OUT, INT)
-    pt = execute_query(
-        "SELECT code as pt_code FROM picking_types WHERE id = %s", 
-        (picking_type_id,), fetchone=True
-    )
-    
-    # NUEVO FORMATO: C{company_id}/{TIPO}/
-    prefix = f"C{company_id}/{pt['pt_code']}/"
-    
-    # 2. Buscar último usado con este prefijo exacto
-    last_res = execute_query(
-        "SELECT name FROM pickings WHERE name LIKE %s AND company_id = %s ORDER BY id DESC LIMIT 1", 
-        (f"{prefix}%", company_id), fetchone=True
-    )
-    
-    current_sequence = 0
-    if last_res:
-        try:
-            # Extraer número final
-            current_sequence = int(last_res['name'].split('/')[-1])
-        except ValueError:
-            pass
+    # 1. Obtener código
+    pt = execute_query("SELECT code FROM picking_types WHERE id = %s", (picking_type_id,), fetchone=True)
+    pt_code = pt['code']
+    prefix = f"C{company_id}/{pt_code}/"
 
-    # 3. Bucle de Seguridad
-    while True:
-        current_sequence += 1
-        new_name = f"{prefix}{str(current_sequence).zfill(5)}"
-        
-        # Verificar colisión
-        exists = execute_query("SELECT 1 FROM pickings WHERE name = %s", (new_name,), fetchone=True)
-        if not exists:
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            # 2. ADVISORY LOCK (Basado en un hash del prefijo para no bloquear todo el sistema)
+            # Esto pone en "fila india" solo a quienes intentan generar un código con este prefijo.
+            lock_id = abs(hash(prefix)) % 2147483647 # Postgres integer limit
+            cursor.execute("SELECT pg_advisory_xact_lock(%s)", (lock_id,))
+            
+            # 3. Ahora que tenemos el turno exclusivo, buscamos el último
+            cursor.execute(
+                "SELECT name FROM pickings WHERE name LIKE %s AND company_id = %s ORDER BY id DESC LIMIT 1",
+                (f"{prefix}%", company_id)
+            )
+            last_res = cursor.fetchone()
+            
+            current_sequence = 0
+            if last_res:
+                try: current_sequence = int(last_res[0].split('/')[-1])
+                except: pass
+
+            new_name = f"{prefix}{str(current_sequence + 1).zfill(5)}"
+            
+            # El lock se libera automáticamente al terminar la transacción (commit/rollback)
+            # o al devolver la conexión si usamos advisory_xact_lock
             return new_name
+    finally:
+        if conn: return_db_connection(conn)
 
 def get_next_remission_number(company_id):
     """
-    [BLINDADO] Busca la última guía SOLO de esta empresa.
+    [BLINDADO CON ADVISORY LOCK] Secuencia para Guías de Remisión.
     """
-    res = execute_query(
-        "SELECT remission_number FROM pickings WHERE remission_number IS NOT NULL AND company_id = %s ORDER BY remission_number DESC LIMIT 1", 
-        (company_id,), 
-        fetchone=True
-    )
-    last = int(res['remission_number'].replace("GR-", "")) if res else 0
-    return f"GR-{str(last + 1).zfill(5)}"
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            # Lock específico para guías de esta empresa
+            lock_key = f"GR-{company_id}"
+            lock_id = abs(hash(lock_key)) % 2147483647
+            cursor.execute("SELECT pg_advisory_xact_lock(%s)", (lock_id,))
+
+            cursor.execute(
+                "SELECT remission_number FROM pickings WHERE remission_number IS NOT NULL AND company_id = %s ORDER BY remission_number DESC LIMIT 1",
+                (company_id,)
+            )
+            res = cursor.fetchone()
+            
+            last = 0
+            if res:
+                # Asumiendo formato GR-00001. Si cambia, ajustar parseo.
+                try: last = int(res[0].replace("GR-", ""))
+                except: pass
+                
+            return f"GR-{str(last + 1).zfill(5)}"
+    finally:
+        if conn: return_db_connection(conn)
 
 # --- MOVIMIENTOS DE STOCK (Moves) ---
 
@@ -629,103 +712,99 @@ def update_stock_quant(cursor, product_id, location_id, quantity_change, lot_id=
 
 def _check_stock_with_cursor(cursor, picking_id, picking_type_code):
     """
-    [CORREGIDO] Valida disponibilidad sumando (Stock Proyecto + Stock General).
-    NOTA: Se eliminó 'FOR UPDATE' porque no se puede usar con GROUP BY.
-    El bloqueo se debe hacer ANTES, sobre la tabla 'products'.
+    [CORREGIDO - LÓGICA UNIVERSAL]
+    Valida disponibilidad REAL.
+    Disponible = (Físico Total) - (Reservado por TODOS en Moves 'listo').
     """
-    # 1. Obtener líneas
+    # 1. Obtener demanda del Picking Actual
     cursor.execute("""
-        SELECT sm.product_uom_qty, sm.product_id, sm.location_src_id, sm.project_id, p.name, l.path 
+        SELECT sm.product_id, sm.location_src_id, 
+               SUM(sm.product_uom_qty) as qty_needed, 
+               MAX(p.name) as prod_name
         FROM stock_moves sm 
         JOIN products p ON sm.product_id = p.id 
         JOIN locations l ON sm.location_src_id = l.id
         WHERE sm.picking_id = %s AND l.type = 'internal'
+        GROUP BY sm.product_id, sm.location_src_id
     """, (picking_id,))
-    moves = cursor.fetchall()
+    demands = cursor.fetchall()
     
-    if not moves: return True, "Ok"
+    if not demands: return True, "Ok"
 
-    # 2. Cargar Stock Físico (Proyecto Y General)
-    # [CORRECCIÓN] Quitamos cualquier "FOR UPDATE" de aquí
-    cursor.execute("""
-        SELECT sq.product_id, sq.location_id, sq.project_id, SUM(sq.quantity) as total
-        FROM stock_quants sq
-        JOIN stock_moves sm ON sq.product_id = sm.product_id 
-                            AND sq.location_id = sm.location_src_id
-        WHERE sm.picking_id = %s
-        GROUP BY sq.product_id, sq.location_id, sq.project_id
-    """, (picking_id,))
-    
-    phys_rows = cursor.fetchall()
-    physical_map = {(r['product_id'], r['location_id'], r['project_id']): r['total'] for r in phys_rows}
-
-    # 3. Cargar Reservas (de otros pickings ya listos)
-    reserved_map = {}
-    if picking_type_code != 'ADJ':
-        cursor.execute("""
-            SELECT sm_other.product_id, sm_other.location_src_id, sm_other.project_id, SUM(sm_other.product_uom_qty) as reserved
-            FROM stock_moves sm_other
-            JOIN pickings p_other ON sm_other.picking_id = p_other.id
-            JOIN stock_moves sm_curr ON sm_other.product_id = sm_curr.product_id 
-                                    AND sm_other.location_src_id = sm_curr.location_src_id
-            WHERE p_other.state = 'listo'
-              AND p_other.id != %s
-              AND sm_curr.picking_id = %s
-              AND sm_other.state != 'cancelled'
-            GROUP BY sm_other.product_id, sm_other.location_src_id, sm_other.project_id
-        """, (picking_id, picking_id))
-        reserved_map = {(r['product_id'], r['location_src_id'], r['project_id']): r['reserved'] for r in cursor.fetchall()}
-
-    # --- VALIDACIÓN CON CASCADA ---
     errors = []
-    for m in moves:
-        pid, loc, proj = m['product_id'], m['location_src_id'], m['project_id']
-        needed = m['product_uom_qty']
+    
+    for row in demands:
+        pid = row['product_id']
+        loc = row['location_src_id']
+        needed = float(row['qty_needed'])
+        p_name = row['prod_name']
 
-        # A) Calcular Disponible Específico del Proyecto
-        phys_proj = physical_map.get((pid, loc, proj), 0.0)
-        res_proj = reserved_map.get((pid, loc, proj), 0.0)
-        avail_proj = max(0.0, phys_proj - res_proj)
+        # 2. Calcular Físico (Lo que existe en la estantería)
+        # Sumamos TODO lo que hay en esa ubicación (General + Proyectos)
+        # Porque si está en la ubicación, físicamente está ahí.
+        cursor.execute("""
+            SELECT COALESCE(SUM(quantity), 0) 
+            FROM stock_quants 
+            WHERE product_id = %s AND location_id = %s
+        """, (pid, loc))
+        physical_qty = float(cursor.fetchone()[0])
 
-        # B) Calcular Disponible General
-        avail_general = 0.0
-        if proj is not None:
-            phys_gen = physical_map.get((pid, loc, None), 0.0)
-            res_gen = reserved_map.get((pid, loc, None), 0.0)
-            avail_general = max(0.0, phys_gen - res_gen)
+        # 3. Calcular Reservado TOTAL (La Competencia)
+        # Sumamos TODO lo que otros pickings 'listo' ya apartaron de esa ubicación.
+        # NO filtramos por proyecto. Si la Obra A reservó 3, esas 3 ya no existen para nadie.
+        cursor.execute("""
+            SELECT COALESCE(SUM(sm.product_uom_qty), 0)
+            FROM stock_moves sm
+            JOIN pickings p ON sm.picking_id = p.id
+            WHERE sm.product_id = %s 
+              AND sm.location_src_id = %s
+              AND p.state = 'listo'
+              AND p.id != %s  -- Excluirnos a nosotros mismos para no autobloquearnos
+              AND sm.state != 'cancelled'
+        """, (pid, loc, picking_id))
+        reserved_global = float(cursor.fetchone()[0])
 
-        total_available = avail_proj + avail_general
+        # 4. Cálculo Final
+        available_real = physical_qty - reserved_global
 
         if picking_type_code == 'ADJ':
-             if needed < 0 and phys_proj < abs(needed):
-                 errors.append(f"- {m['name']}: Físico {phys_proj} < Ajuste {abs(needed)}")
+            # Para ajustes negativos (restar stock), validamos contra físico puro
+            if needed < 0 and physical_qty < abs(needed):
+                 errors.append(f"- {p_name}: Físico {physical_qty} < Ajuste {abs(needed)}")
         else:
-            if total_available < needed:
-                proj_msg = f" (Proy: {avail_proj} + Gen: {avail_general})" if proj else ""
-                errors.append(f"- {m['name']}: Req {needed} > Disp Total {total_available}{proj_msg}")
+            # Para salidas normales, validamos contra disponible neto
+            if available_real < needed:
+                errors.append(
+                    f"- {p_name}: Requerido {needed} > Disponible {available_real} "
+                    f"(Físico: {physical_qty} - Reservado Global: {reserved_global})"
+                )
 
     if errors: return False, "Stock insuficiente:\n" + "\n".join(errors)
     return True, "Ok"
 
 def _update_product_weighted_cost(cursor, product_id, incoming_qty, incoming_price):
     """
-    [NUEVO] Recalcula el Precio Estándar (Costo Promedio) del producto.
-    Fórmula: ((StockActual * PrecioActual) + (CantEntrante * PrecioEntrante)) / (StockActual + CantEntrante)
+    [BLINDADO FINANCIERO] Recalcula el Precio Estándar (Costo Promedio).
+    Usa 'FOR UPDATE' en la tabla products para evitar corrupción de costos 
+    si entran dos compras simultáneas.
     """
     if incoming_qty <= 0 or incoming_price < 0: return
 
-    # 1. Obtener Stock Físico Actual (Global de la empresa)
+    # 1. BLOQUEO ATÓMICO DEL PRODUCTO
+    # Esto evita que otro hilo lea el precio/stock antiguo mientras nosotros calculamos.
+    cursor.execute("SELECT standard_price FROM products WHERE id = %s FOR UPDATE", (product_id,))
+    res_price = cursor.fetchone()
+    current_price = res_price['standard_price'] if res_price else 0.0
+
+    # 2. Obtener Stock Físico Actual (Global de la empresa)
+    # Nota: No necesitamos bloquear stock_quants porque ya bloqueamos el producto "padre",
+    # lo que actúa como semáforo para cualquier operación de re-costeo de este producto.
     cursor.execute("SELECT SUM(quantity) as total FROM stock_quants WHERE product_id = %s", (product_id,))
     res_qty = cursor.fetchone()
     current_qty = res_qty['total'] if res_qty and res_qty['total'] else 0.0
     
     # Protegernos contra stocks negativos teóricos al valorar
     current_qty = max(0.0, current_qty) 
-
-    # 2. Obtener Precio Estándar Actual
-    cursor.execute("SELECT standard_price FROM products WHERE id = %s", (product_id,))
-    res_price = cursor.fetchone()
-    current_price = res_price['standard_price'] if res_price else 0.0
 
     # 3. Calcular Nuevo Precio Promedio
     new_total_qty = current_qty + incoming_qty
@@ -736,21 +815,46 @@ def _update_product_weighted_cost(cursor, product_id, incoming_qty, incoming_pri
     new_avg_price = total_value / new_total_qty if new_total_qty > 0 else incoming_price
 
     # 4. Actualizar Maestro de Productos
-    if abs(new_avg_price - current_price) > 0.0001: # Solo actualizar si cambió significativamente
+    # Usamos redondeo a 4 decimales para evitar micro-cambios irrelevantes
+    if abs(new_avg_price - current_price) > 0.0001:
         cursor.execute("UPDATE products SET standard_price = %s WHERE id = %s", (new_avg_price, product_id))
-        print(f"[WAC] Prod {product_id}: Precio {current_price:.2f} -> {new_avg_price:.2f} (Entran {incoming_qty} a S/ {incoming_price})")
+        print(f"[WAC-SAFE] Prod {product_id}: {current_price:.2f} -> {new_avg_price:.2f} (Base: {current_qty} uds, Entran: {incoming_qty} @ {incoming_price})")
 
 def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_tracking):
     """
-    [BLINDADO] Valida y ejecuta el movimiento de stock.
-    Incluye validaciones estrictas para SERIES DUPLICADAS y CANTIDADES > 1.
+    [BLINDADO v2 - PREVENCIÓN DOBLE CLIC] 
+    Valida y ejecuta el movimiento de stock.
+    Usa 'FOR UPDATE' para bloquear la fila y evitar condiciones de carrera.
     """
-    cursor.execute("SELECT p.*, pt.code FROM pickings p JOIN picking_types pt ON p.picking_type_id = pt.id WHERE p.id = %s", (picking_id,))
+    # 1. BLOQUEO ATÓMICO (Critical Section)
+    # Al usar FOR UPDATE, si llega un segundo clic, se quedará esperando aquí 
+    # hasta que el primero termine.
+    cursor.execute("""
+        SELECT p.*, pt.code 
+        FROM pickings p 
+        JOIN picking_types pt ON p.picking_type_id = pt.id 
+        WHERE p.id = %s 
+        FOR UPDATE
+    """, (picking_id,))
+    
     picking = cursor.fetchone()
+    
+    # 2. VERIFICACIÓN DE ESTADO POST-BLOQUEO
+    # Cuando el segundo clic logre entrar (después de que el primero termine),
+    # se encontrará con que el estado ya es 'done' y será rechazado.
+    if not picking: 
+        return False, "El albarán no existe."
+    
+    if picking['state'] == 'done':
+        return False, "TRANQUILO: Este ajuste ya fue validado procesado exitosamente por una petición anterior."
+        
+    if picking['state'] == 'cancelled':
+        return False, "El albarán está cancelado."
+
     p_code = picking['code']
     project_id = picking['project_id'] 
 
-    # 1. Obtener Ubicaciones Virtuales (para IN/OUT)
+    # 1.1 Obtener Ubicaciones Virtuales (para IN/OUT)
     v_loc, c_loc = None, None
     if p_code in ('IN', 'OUT'):
         cursor.execute("SELECT id, category FROM locations WHERE category IN ('PROVEEDOR', 'CLIENTE')")
@@ -758,12 +862,10 @@ def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_track
             if r['category'] == 'PROVEEDOR': v_loc = r['id']
             elif r['category'] == 'CLIENTE': c_loc = r['id']
 
-    # 2. Asegurar project_id en moves (CORREGIDO)
-    # Sincronizamos incondicionalmente. Si project_id es None, limpiamos las líneas.
+    # 2. Asegurar project_id en moves
     cursor.execute("UPDATE stock_moves SET project_id = %s WHERE picking_id = %s", (project_id, picking_id))
 
-    # 3. Obtener Movimientos con datos de Tracking del Producto
-    # --- CAMBIO AQUÍ: AGREGAR p.ownership A LA CONSULTA ---
+    # 3. Obtener Movimientos
     cursor.execute("""
         SELECT sm.*, p.tracking, p.ownership, p.name as product_name 
         FROM stock_moves sm 
@@ -772,23 +874,21 @@ def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_track
     """, (picking_id,))
     moves = cursor.fetchall()
 
-    # 4. Validar Stock Numérico General (Tu lógica de cascada existente)
+    # 4. Validar Stock Numérico General
     ok, msg = _check_stock_with_cursor(cursor, picking_id, p_code)
     if not ok: return False, msg
 
     processed_serials_in_transaction = set()
     
-
     for m in moves:
-        # --- CAMBIO AQUÍ: INICIO DE LÓGICA DE VALORACIÓN ---
-        # Si es una COMPRA (IN) y el producto es PROPIO (owned), actualizamos el costo promedio.
+        # ... (INICIO DE LÓGICA DE VALORACIÓN - IGUAL QUE ANTES) ...
         if p_code == 'IN' and m['ownership'] == 'owned':
             qty_in = m['quantity_done']
             cost_in = m['price_unit']
-            # Solo recalculamos si hay cantidad y un precio válido (mayor a 0)
             if qty_in > 0 and cost_in > 0:
                 _update_product_weighted_cost(cursor, m['product_id'], qty_in, cost_in)
         # ---------------------------------------------------
+
         src, dest = m['location_src_id'], m['location_dest_id']
         if p_code == 'IN': src = v_loc
         elif p_code == 'OUT': dest = c_loc
@@ -797,64 +897,46 @@ def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_track
         m_proj = m['project_id']
         
         # --- VALIDACIÓN DE LOTE/SERIE ---
-        lot_ids_to_process = [] # Lista de (lot_id, qty)
+        lot_ids_to_process = [] 
 
         if m['tracking'] == 'none':
             lot_ids_to_process.append((None, qty_total))
         else:
-            # Recuperamos las series enviadas desde el frontend
             t_data = moves_with_tracking.get(str(m['id'])) or moves_with_tracking.get(m['id']) or {}
             
-            # A) REGLA DE INTEGRIDAD: Cantidad vs Series
-            # Si digo que muevo 5, debo tener 5 series.
             total_tracking_qty = sum(t_data.values())
             if abs(qty_total - total_tracking_qty) > 0.001:
-                 return False, f"Error en '{m['product_name']}': La cantidad a mover ({qty_total}) no coincide con la cantidad de series/lotes seleccionados ({total_tracking_qty})."
+                 return False, f"Error en '{m['product_name']}': Cantidad ({qty_total}) vs Series ({total_tracking_qty}) no coinciden."
 
             for lname, lqty in t_data.items():
-                lname = lname.strip().upper() # Seguridad extra
+                lname = lname.strip().upper()
                 
-                # B) REGLA DE UNICIDAD EN TRANSACCIÓN
-                # No puedo procesar la misma serie dos veces en el mismo clic
                 if (m['product_id'], lname) in processed_serials_in_transaction: 
                     return False, f"Serie duplicada en esta operación: {lname}"
                 processed_serials_in_transaction.add((m['product_id'], lname))
                 
-                # C) REGLA DE 'SERIE ÚNICA' (SERIAL = 1)
-                # Un producto serializado no puede tener cantidad > 1 por línea de serie
                 if m['tracking'] == 'serial' and lqty > 1:
-                    return False, f"Error de Integridad: La serie '{lname}' tiene cantidad {lqty}. Los productos seriados deben ser unitarios."
+                    return False, f"Error: La serie '{lname}' tiene cantidad {lqty}. Debe ser 1."
 
-                # D) REGLA DE LA VIRGINIDAD (Solo Entradas - IN)
-                # Si estoy comprando/recibiendo, la serie NO debe existir en mi inventario interno
-                # (Independientemente del almacén o proyecto, una serie única es única en toda la empresa)
+                # REGLA DE LA VIRGINIDAD (Solo Entradas - IN)
                 if p_code == 'IN' and m['tracking'] == 'serial':
                     cursor.execute("""
-                        SELECT w.name 
-                        FROM stock_quants sq 
+                        SELECT w.name FROM stock_quants sq 
                         JOIN stock_lots sl ON sq.lot_id = sl.id 
                         JOIN locations l ON sq.location_id = l.id 
                         JOIN warehouses w ON l.warehouse_id = w.id
-                        WHERE sl.name = %s 
-                          AND sl.product_id = %s 
-                          AND sq.quantity > 0 
-                          AND l.type = 'internal'
+                        WHERE sl.name = %s AND sl.product_id = %s AND sq.quantity > 0 AND l.type = 'internal'
                         LIMIT 1
                     """, (lname, m['product_id']))
                     existing = cursor.fetchone()
                     if existing:
-                        return False, f"La serie '{lname}' YA EXISTE en el '{existing['name']}'. No puedes recibirla de nuevo sin haberla sacado antes."
+                        return False, f"La serie '{lname}' YA EXISTE en '{existing['name']}'."
 
-                # Crear/Obtener ID del lote
                 lot_id = create_lot(cursor, m['product_id'], lname)
                 lot_ids_to_process.append((lot_id, lqty))
-                
-                # Registrar traza
                 cursor.execute("INSERT INTO stock_move_lines (move_id, lot_id, qty_done) VALUES (%s, %s, %s)", (m['id'], lot_id, lqty))
 
-        # --- LÓGICA DE STOCK Y PROYECTOS (Tu lógica existente de cascada) ---
-        
-        # 1. Consultar si el destino es 'ALMACEN PRINCIPAL' (Lavado de Proyecto)
+        # --- LÓGICA DE STOCK Y PROYECTOS ---
         cursor.execute("""
             SELECT wc.name FROM locations l 
             JOIN warehouses w ON l.warehouse_id = w.id 
@@ -863,21 +945,14 @@ def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_track
         """, (dest,))
         dest_cat_row = cursor.fetchone()
         is_dest_main = (dest_cat_row and dest_cat_row['name'] == 'ALMACEN PRINCIPAL')
-
         dest_proj_id = None if is_dest_main else m_proj
 
-        # EJECUCIÓN DE MOVIMIENTOS
         for lot_id, qty in lot_ids_to_process:
-            
-            # 1. Entrada (IN) o Ajuste Positivo
             if p_code == 'IN' or (p_code == 'ADJ' and qty > 0):
                 update_stock_quant(cursor, m['product_id'], dest, qty, lot_id, dest_proj_id)
                 if p_code == 'ADJ': update_stock_quant(cursor, m['product_id'], src, -qty, lot_id, m_proj)
-
-            # 2. Salida / Transferencia / Devolución
             else:
                 qty_to_deduct = qty
-                
                 # A) DESCONTAR DEL ORIGEN (Proyecto específico primero)
                 if m_proj is not None:
                     cursor.execute("SELECT quantity FROM stock_quants WHERE product_id=%s AND location_id=%s AND project_id=%s " + ("AND lot_id=%s" if lot_id else "AND lot_id IS NULL"), 
@@ -892,8 +967,6 @@ def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_track
                 
                 # B) Si falta, descontar del Stock GENERAL
                 if qty_to_deduct > 0:
-                    # Verificación extra: Si es seriado, no deberíamos estar dividiendo stock entre proyectos
-                    # para una misma unidad física, pero por robustez matemática lo dejamos.
                     update_stock_quant(cursor, m['product_id'], src, -qty_to_deduct, lot_id, None) 
 
                 # C) SUMAR AL DESTINO
@@ -905,10 +978,8 @@ def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_track
 
     cursor.execute("UPDATE stock_moves SET state = 'done' WHERE picking_id = %s", (picking_id,))
     cursor.execute("UPDATE pickings SET state = 'done', date_done = NOW() WHERE id = %s", (picking_id,))
-    # [NUEVO] GATILLO DE MÁQUINA DE ESTADOS
-    # Si la operación afecta a un proyecto, le pedimos que recalcule su fase.
+    
     if project_id:
-        # Nota: Pasamos el ID. La función interna se encarga de revisar el stock y decidir.
         project_repo.check_and_update_project_phase(project_id)
 
     return True, "Validado correctamente."
@@ -1117,54 +1188,41 @@ def get_stock_for_product_location(product_id, location_id):
 
 def get_real_available_stock(product_id, location_id, project_id=None):
     """
-    Calcula disponible (Físico Accesible - TODO lo Reservado).
-    [CORRECCIÓN LÓGICA] Las reservas se restan globalmente. 
-    Si la Obra A reserva 20, la Obra B no debe verlas como disponibles.
+    [CORREGIDO - LÓGICA UNIVERSAL]
+    Calcula disponible para mostrar en la UI.
+    Disponible = (Físico Total) - (Reservado Total).
+    El parámetro project_id se ignora para el cálculo de disponibilidad neta
+    porque el stock físico es un recurso compartido en la ubicación.
     """
     if not product_id or not location_id: return 0.0
     
-    # --- 1. CALCULAR STOCK FÍSICO ACCESIBLE ---
-    # Aquí SÍ aplicamos filtro: Solo veo mi stock propio o el stock general.
-    # No puedo contar como "mío" el stock físico que ya está asignado a otro proyecto.
+    # 1. Físico Total
+    res_phy = execute_query("""
+        SELECT COALESCE(SUM(quantity), 0) as total 
+        FROM stock_quants 
+        WHERE product_id = %s AND location_id = %s
+    """, (product_id, location_id), fetchone=True)
+    physical = float(res_phy['total'])
     
-    params_phy = [product_id, location_id]
-    proj_filter_quant = ""
-    
-    if project_id is not None:
-        proj_filter_quant = "AND (project_id = %s OR project_id IS NULL)"
-        params_phy.append(project_id)
-    
-    query_phy = f"SELECT SUM(quantity) as total FROM stock_quants WHERE product_id = %s AND location_id = %s {proj_filter_quant}"
-    res_phy = execute_query(query_phy, tuple(params_phy), fetchone=True)
-    physical = res_phy['total'] if res_phy and res_phy['total'] else 0.0
-    
-    # --- 2. CALCULAR STOCK RESERVADO GLOBALMENTE ---
-    # [CAMBIO CRÍTICO] AQUÍ NO FILTRAMOS POR PROYECTO.
-    # Si hay una reserva en esta ubicación física, resta capacidad para TODOS.
-    # Una unidad reservada para Obra A deja de estar disponible para Obra B.
-    
-    query_res = """
-        SELECT SUM(sm.product_uom_qty) as reserved 
-        FROM stock_moves sm 
+    # 2. Reservado Total (Global)
+    # Sumamos todas las reservas activas en esa ubicación, sin importar quién las pidió.
+    res_res = execute_query("""
+        SELECT COALESCE(SUM(sm.product_uom_qty), 0) as reserved
+        FROM stock_moves sm
         JOIN pickings p ON sm.picking_id = p.id
         WHERE sm.product_id = %s 
-          AND sm.location_src_id = %s 
-          AND p.state = 'listo' 
+          AND sm.location_src_id = %s
+          AND p.state = 'listo'
           AND sm.state != 'cancelled'
-    """
-    # Solo pasamos producto y ubicación
-    res_res = execute_query(query_res, (product_id, location_id), fetchone=True)
-    reserved = res_res['reserved'] if res_res and res_res['reserved'] else 0.0
-    
-    # --- 3. RESULTADO ---
+    """, (product_id, location_id), fetchone=True)
+    reserved = float(res_res['reserved'])
+
+    # 3. Resultado
     available = max(0.0, physical - reserved)
-
-    # Debug para que verifiques en consola
-    print(f"[STOCK-LOGIC] Prod: {product_id} | Loc: {location_id} | ReqProj: {project_id}")
-    print(f"              Físico Accesible: {physical}")
-    print(f"              Reservado Total (Cualquier Obra): {reserved}")
-    print(f"              Disponible Real: {available}")
-
+    
+    # Debug
+    # print(f"[STOCK-CHECK] Prod {product_id} @ Loc {location_id}: Fis {physical} - Res {reserved} = {available}")
+    
     return available
 
 def get_products_with_stock_at_location(location_id):

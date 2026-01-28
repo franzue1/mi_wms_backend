@@ -479,10 +479,9 @@ def check_and_update_project_phase(project_id: int):
 
 def upsert_project_from_import(company_id, name, code, macro_project_id, address, status, phase, start_date, end_date, budget, department, province, district, cost_center=None):
     """
-    [SMART UPSERT V2] Lógica corregida para Código PEP único por Macro.
-    1. Busca si existe un proyecto con ese (macro_project_id, code).
-    2. Si existe -> UPDATE (Parcial, no borra datos si el CSV viene vacío).
-    3. Si no existe -> INSERT.
+    [BLINDADO - ATOMIC UPSERT] 
+    Usa INSERT ... ON CONFLICT para manejar la concurrencia de forma nativa en BD.
+    Evita condiciones de carrera entre INSERT y UPDATE.
     """
     conn = None
     
@@ -491,79 +490,59 @@ def upsert_project_from_import(company_id, name, code, macro_project_id, address
     clean_code = code.strip().upper() if code else None
     clean_addr = address.strip().upper() if address else None
     
-    # Validación previa: El código es obligatorio para la unicidad
+    # Validación previa
     if not clean_code:
-        raise ValueError(f"El proyecto '{clean_name}' no tiene Código PEP. Es obligatorio para la importación.")
+        raise ValueError(f"El proyecto '{clean_name}' no tiene Código PEP. Es obligatorio.")
 
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
-            project_id = None
             
-            # 1. BÚSQUEDA JERÁRQUICA: (MacroID + Código)
-            # Esta es la única llave válida ahora. El nombre puede repetirse.
-            cursor.execute(
-                "SELECT id FROM projects WHERE macro_project_id = %s AND code = %s", 
-                (macro_project_id, clean_code)
-            )
-            res = cursor.fetchone()
-            
-            if res:
-                # --- UPDATE PARCIAL ---
-                project_id = res[0]
-                
-                fields = []
-                values = []
-                
-                # Mapeo de campos a actualizar
-                # Nota: 'company_id' y 'code' no se tocan porque son la llave de búsqueda o inmutables lógicamente
-                updates_map = {
-                    'name': clean_name, # El nombre sí se puede corregir
-                    'address': clean_addr,
-                    'status': status,
-                    'phase': phase,
-                    'budget': budget,
-                    'start_date': start_date,
-                    'end_date': end_date,
-                    'department': department,
-                    'province': province,
-                    'district': district
-                }
-                
-                for col, val in updates_map.items():
-                    if val is not None: # Solo si el CSV trajo un valor
-                        fields.append(f"{col}=%s")
-                        values.append(val)
-                
-                if fields:
-                    values.append(project_id)
-                    sql = f"UPDATE projects SET {', '.join(fields)} WHERE id=%s"
-                    cursor.execute(sql, tuple(values))
-                
-                action = "updated"
-            else:
-                # --- INSERT ---
-                # Aquí sí usamos todos los campos obligatorios
-                query = """
-                    INSERT INTO projects (
-                        company_id, macro_project_id, name, code, address, status, phase,
-                        start_date, end_date, budget, department, province, district
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    RETURNING id
-                """
-                cursor.execute(query, (
-                    company_id, macro_project_id, clean_name, clean_code, clean_addr, 
-                    status or 'active', phase or 'Sin Iniciar', 
-                    start_date, end_date, budget or 0, 
+            # --- UPSERT ATÓMICO (PostgreSQL) ---
+            # Requiere que exista un índice UNIQUE en (macro_project_id, code)
+            query = """
+                INSERT INTO projects (
+                    company_id, macro_project_id, name, code, address, 
+                    status, phase, start_date, end_date, budget, 
                     department, province, district
-                ))
-                action = "created"
+                ) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (macro_project_id, code) 
+                DO UPDATE SET
+                    name = EXCLUDED.name,
+                    address = COALESCE(EXCLUDED.address, projects.address),
+                    status = COALESCE(EXCLUDED.status, projects.status),
+                    phase = COALESCE(EXCLUDED.phase, projects.phase),
+                    budget = COALESCE(EXCLUDED.budget, projects.budget),
+                    start_date = COALESCE(EXCLUDED.start_date, projects.start_date),
+                    end_date = COALESCE(EXCLUDED.end_date, projects.end_date),
+                    department = COALESCE(EXCLUDED.department, projects.department),
+                    province = COALESCE(EXCLUDED.province, projects.province),
+                    district = COALESCE(EXCLUDED.district, projects.district)
+                RETURNING (xmax = 0) AS inserted
+            """
+            
+            # Nota: Usamos COALESCE para no sobrescribir datos existentes con NULLs si el Excel viene vacío en esas columnas
+            
+            params = (
+                company_id, macro_project_id, clean_name, clean_code, clean_addr, 
+                status or 'active', phase or 'Sin Iniciar', 
+                start_date, end_date, budget or 0, 
+                department, province, district
+            )
+            
+            cursor.execute(query, params)
+            result = cursor.fetchone()
+            was_inserted = result[0] if result else False
             
             conn.commit()
-            return action
+            return "created" if was_inserted else "updated"
 
     except Exception as e:
         if conn: conn.rollback()
+        # Capturamos error si el índice único no existe o falla otra cosa
+        if "unique constraint" in str(e):
+             raise ValueError(f"Conflicto de integridad: El código '{clean_code}' ya existe en otro contexto.")
         raise e
     finally:
         if conn: return_db_connection(conn)

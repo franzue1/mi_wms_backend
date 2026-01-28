@@ -217,13 +217,33 @@ def save_liquidation_progress(wo_id, wo_updates: dict, consumo_data: dict, retir
         if conn: return_db_connection(conn)
 
 def process_full_liquidation(wo_id, consumptions, retiros, service_act_number, date_attended_db, current_ui_location_id, user_name, company_id):
-    """Finaliza la liquidación: Guarda, Valida Stocks y Cierra la OT."""
-    print(f"[DB-LIQ-FULL] Finalizando WO {wo_id}...")
+    """
+    [BLINDADO ATÓMICO] Finaliza la liquidación: Guarda, Valida Stocks y Cierra la OT.
+    Previene duplicidad por race conditions usando bloqueo de fila.
+    """
+    print(f"[DB-LIQ-FULL] Finalizando WO {wo_id} (Blindado)...")
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-            # 0. Obtener datos del Almacén origen
+            
+            # 1. BLOQUEO ATÓMICO (Critical Section)
+            # Bloqueamos la OT para que nadie más pueda tocarla simultáneamente.
+            cursor.execute("SELECT id, phase FROM work_orders WHERE id = %s FOR UPDATE", (wo_id,))
+            wo_status = cursor.fetchone()
+
+            if not wo_status:
+                raise ValueError("La Orden de Trabajo no existe.")
+            
+            # 2. VERIFICACIÓN DE ESTADO POST-BLOQUEO
+            # Si el segundo clic llega aquí, verá que ya está 'Liquidado' y fallará.
+            if wo_status['phase'] == 'Liquidado':
+                # Mensaje amigable para el frontend (no es un error grave, solo concurrencia)
+                return True, "La OT ya había sido liquidada exitosamente por una petición anterior."
+
+            # 3. LÓGICA DE NEGOCIO (Solo si pasamos el bloqueo)
+            
+            # 3.1 Obtener datos del Almacén origen
             cursor.execute("SELECT warehouse_id FROM locations WHERE id = %s", (current_ui_location_id,))
             loc_row = cursor.fetchone()
             if not loc_row: raise ValueError("Ubicación origen inválida")
@@ -232,7 +252,7 @@ def process_full_liquidation(wo_id, consumptions, retiros, service_act_number, d
             pid_out, tracking_out = None, {}
             pid_ret, tracking_ret = None, {}
 
-            # 1. Guardar Borradores
+            # 3.2 Guardar Borradores (Pickings)
             if consumptions:
                 c_data = {'warehouse_id': wh_id, 'date_attended_db': date_attended_db, 'service_act_number': service_act_number, 'lines_data': consumptions}
                 pid_out, tracking_out = _create_or_update_draft_picking_internal(cursor, wo_id, 'OUT', c_data, company_id, user_name)
@@ -241,7 +261,10 @@ def process_full_liquidation(wo_id, consumptions, retiros, service_act_number, d
                 r_data = {'warehouse_id': wh_id, 'date_attended_db': date_attended_db, 'service_act_number': service_act_number, 'lines_data': retiros}
                 pid_ret, tracking_ret = _create_or_update_draft_picking_internal(cursor, wo_id, 'RET', r_data, company_id, user_name)
 
-            # 2. Validar Stocks y Confirmar (Usando operation_repo)
+            # 3.3 Validar Stocks y Confirmar (Usando la función BLINDADA de operation_repo)
+            # Nota: _process_picking_validation_with_cursor TAMBIÉN tiene su propio FOR UPDATE sobre pickings,
+            # lo cual está bien (bloqueo en cascada seguro).
+            
             if pid_out:
                 ok, msg = operation_repo._process_picking_validation_with_cursor(cursor, pid_out, tracking_out)
                 if not ok: raise ValueError(f"Error validando Consumo: {msg}")
@@ -250,14 +273,16 @@ def process_full_liquidation(wo_id, consumptions, retiros, service_act_number, d
                 ok, msg = operation_repo._process_picking_validation_with_cursor(cursor, pid_ret, tracking_ret)
                 if not ok: raise ValueError(f"Error validando Retiro: {msg}")
 
-            # 3. Cerrar OT
+            # 3.4 Cerrar OT (Cambio de estado final)
             cursor.execute("UPDATE work_orders SET phase = 'Liquidado' WHERE id = %s", (wo_id,))
 
         conn.commit()
         return True, "Liquidación exitosa."
+
     except Exception as e:
         if conn: conn.rollback()
         print(f"[ERROR LIQ] {e}")
+        # Retornamos el error limpio para que el frontend lo muestre
         return False, str(e)
     finally:
         if conn: return_db_connection(conn)
@@ -265,46 +290,62 @@ def process_full_liquidation(wo_id, consumptions, retiros, service_act_number, d
 def update_work_order_fields(wo_id, fields_to_update: dict):
     """
     Actualiza campos específicos de una Orden de Trabajo.
-    [REFACTORIZADO] Usa el pool y maneja la transacción manualmente para retornar rowcount.
+    [BLINDADO] Impide cambios si la OT ya está Liquidada.
     """
-    allowed_fields = [
+    allowed_fields = {
         "customer_name", "address", "warehouse_id", "date_attended",
         "service_type", "job_type", "phase"
-    ]
-    update_dict = {k: v for k, v in fields_to_update.items() if k in allowed_fields and v is not None}
+    }
+
+    update_dict = {
+        k: v for k, v in fields_to_update.items()
+        if k in allowed_fields and v is not None
+    }
 
     if not update_dict:
         print(f"[DB-WARN] No se proporcionaron campos válidos para actualizar la OT {wo_id}.")
         return 0
 
-    set_clause = ", ".join([f"{key} = %s" for key in update_dict.keys()])
+    set_clause = ", ".join(f"{key} = %s" for key in update_dict.keys())
     params = list(update_dict.values()) + [wo_id]
-
-    # ELIMINADO: global db_pool...
 
     conn = None
     try:
-        conn = get_db_connection() # <-- USAR HELPER
-        
+        conn = get_db_connection()
         with conn.cursor() as cursor:
-            query = f"UPDATE work_orders SET {set_clause} WHERE id = %s"
-            
-            print(f"[ESPÍA DB SAVE] SQL: {query}")
-            print(f"[ESPÍA DB SAVE] Params: {tuple(params)}")
 
+            # 1. CANDADO DE HISTORIA
+            cursor.execute(
+                "SELECT phase FROM work_orders WHERE id = %s FOR UPDATE",
+                (wo_id,)
+            )
+            res = cursor.fetchone()
+
+            if not res:
+                raise ValueError(f"Orden de Trabajo {wo_id} no encontrada.")
+
+            if res[0] == 'Liquidado':
+                raise ValueError(
+                    "Acción denegada: La Orden de Trabajo está LIQUIDADA y no se puede modificar."
+                )
+
+            # 2. UPDATE REAL
+            query = f"UPDATE work_orders SET {set_clause} WHERE id = %s"
             cursor.execute(query, tuple(params))
-            
+
             conn.commit()
-            return cursor.rowcount 
+            return cursor.rowcount
 
     except Exception as e:
-        if conn: conn.rollback()
-        print(f"Error en update_work_order_fields para OT {wo_id}: {e}")
-        traceback.print_exc()
-        raise e 
-        
+        if conn:
+            conn.rollback()
+        print(f"[ERROR] update_work_order_fields OT {wo_id}: {e}")
+        raise
+
     finally:
-        if conn: return_db_connection(conn) # <-- USAR HELPER
+        if conn:
+            return_db_connection(conn)
+
 
 def create_work_order_from_import(company_id, ot_number, customer, address, service, job_type):
     """
@@ -662,4 +703,72 @@ def upsert_work_order_from_import(company_id, data):
     finally:
         if conn: return_db_connection(conn)
 
+def delete_work_order(wo_id):
+    """
+    [BLINDADO] Elimina una Orden de Trabajo y sus borradores asociados.
+    Reglas de Protección:
+    1. No se puede borrar si ya está 'Liquidado'.
+    2. No se puede borrar si tiene movimientos de stock validados ('done').
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+            
+            # 1. BLOQUEO ATÓMICO (Evita que alguien la liquide mientras intentamos borrarla)
+            cursor.execute("SELECT id, phase, ot_number FROM work_orders WHERE id = %s FOR UPDATE", (wo_id,))
+            wo = cursor.fetchone()
 
+            if not wo:
+                return False, "La Orden de Trabajo no existe."
+
+            # 2. REGLA DE INMUTABILIDAD HISTÓRICA
+            if wo['phase'] == 'Liquidado':
+                return False, f"🚫 Acción Bloqueada: La OT '{wo['ot_number']}' está LIQUIDADA. No se puede eliminar la historia."
+
+            # 3. REGLA DE INTEGRIDAD DE STOCK
+            # Verificamos si existen Pickings YA VALIDADOS (que movieron stock real).
+            # Si existen, prohibimos el borrado para no dejar 'huecos' en el Kardex.
+            cursor.execute("""
+                SELECT count(*) as total 
+                FROM pickings 
+                WHERE work_order_id = %s AND state = 'done'
+            """, (wo_id,))
+            
+            if cursor.fetchone()['total'] > 0:
+                return False, "🚫 Acción Bloqueada: Esta OT tiene movimientos de inventario ya procesados. Debe anularlos primero (si es posible) o crear una devolución."
+
+            # 4. LIMPIEZA EN CASCADA (Solo Borradores/Cancelados)
+            # Si llegamos aquí, es seguro borrar porque solo hay 'papeles sucios' (borradores) sin impacto real.
+            print(f"[DB-DELETE] Limpiando dependencias de OT {wo_id}...")
+
+            # A. Borrar Líneas de detalle (Series/Lotes) de los pickings asociados
+            cursor.execute("""
+                DELETE FROM stock_move_lines 
+                WHERE move_id IN (
+                    SELECT id FROM stock_moves 
+                    WHERE picking_id IN (SELECT id FROM pickings WHERE work_order_id = %s)
+                )
+            """, (wo_id,))
+
+            # B. Borrar Movimientos (Stock Moves)
+            cursor.execute("""
+                DELETE FROM stock_moves 
+                WHERE picking_id IN (SELECT id FROM pickings WHERE work_order_id = %s)
+            """, (wo_id,))
+
+            # C. Borrar Pickings (Cabeceras)
+            cursor.execute("DELETE FROM pickings WHERE work_order_id = %s", (wo_id,))
+
+            # D. Finalmente, borrar la OT
+            cursor.execute("DELETE FROM work_orders WHERE id = %s", (wo_id,))
+
+            conn.commit()
+            return True, "Orden de Trabajo eliminada correctamente (se limpiaron los borradores asociados)."
+
+    except Exception as e:
+        if conn: conn.rollback()
+        print(f"[ERROR DELETE WO] {e}")
+        return False, f"Error al eliminar: {str(e)}"
+    finally:
+        if conn: return_db_connection(conn)

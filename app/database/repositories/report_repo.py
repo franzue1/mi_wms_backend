@@ -932,17 +932,20 @@ def get_project_kardex(company_id, project_id):
 
 def get_warehouses_kpi_paginated(company_id, user_id, role_name, search=None, limit=12, offset=0):
     """
-    [OPTIMIZADO] Obtiene lista paginada de almacenes con KPIs.
+    [OPTIMIZADO V2 - CTE] Estrategia 'Divide y Vencerás'.
+    1. Primero filtra y pagina los almacenes (tabla pequeña).
+    2. Luego une solo esos 12 almacenes con el inventario (tabla gigante).
+    Esto evita scans secuenciales masivos y timeouts.
     """
     params = [company_id]
     where_clauses = ["w.company_id = %s", "w.status = 'activo'"]
 
-    # Filtro de Permisos
+    # 1. Filtro de Permisos
     if role_name != 'Administrador':
         where_clauses.append("w.id IN (SELECT warehouse_id FROM user_warehouses WHERE user_id = %s)")
         params.append(user_id)
 
-    # Filtro de Búsqueda
+    # 2. Filtro de Búsqueda
     if search:
         where_clauses.append("(w.name ILIKE %s OR wc.name ILIKE %s)")
         term = f"%{search}%"
@@ -950,24 +953,37 @@ def get_warehouses_kpi_paginated(company_id, user_id, role_name, search=None, li
 
     where_sql = " AND ".join(where_clauses)
 
+    # --- QUERY OPTIMIZADA CON CTE (Common Table Expression) ---
     query = f"""
+        WITH TargetWarehouses AS (
+            -- Paso 1: Obtener solo los IDs de la página actual
+            -- Esto es rapidísimo porque solo toca la tabla 'warehouses'
+            SELECT w.id, w.name, wc.name as category
+            FROM warehouses w
+            JOIN warehouse_categories wc ON w.category_id = wc.id
+            WHERE {where_sql}
+            ORDER BY wc.name, w.name
+            LIMIT %s OFFSET %s
+        )
+        -- Paso 2: Calcular KPIs SOLO para los almacenes filtrados
         SELECT 
-            w.id, w.name, wc.name as category,
+            tw.id, tw.name, tw.category,
             COUNT(DISTINCT sq.product_id) as items_count,
             COALESCE(SUM(sq.quantity * p.standard_price), 0) as total_value
-        FROM warehouses w
-        JOIN warehouse_categories wc ON w.category_id = wc.id
-        LEFT JOIN locations l ON w.id = l.warehouse_id AND l.type = 'internal'
+        FROM TargetWarehouses tw
+        LEFT JOIN locations l ON tw.id = l.warehouse_id AND l.type = 'internal'
         LEFT JOIN stock_quants sq ON l.id = sq.location_id AND sq.quantity > 0
         LEFT JOIN products p ON sq.product_id = p.id
-        WHERE {where_sql}
-        GROUP BY w.id, w.name, wc.name
-        ORDER BY wc.name, w.name
-        LIMIT %s OFFSET %s
+        GROUP BY tw.id, tw.name, tw.category
+        ORDER BY tw.category, tw.name
     """
-    # Añadir limit y offset a params al final
+    
+    # Añadir limit y offset al final de los parámetros
     params.extend([limit, offset])
     
+    # Debug: Imprimir si quieres ver qué ejecuta
+    # print(f"[DB-PERF] Executing optimized KPI query with params: {params}")
+
     results = execute_query(query, tuple(params), fetchall=True)
     return results
 
