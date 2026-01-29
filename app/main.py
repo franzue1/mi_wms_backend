@@ -20,7 +20,8 @@ from app.api import (
     work_orders,
     reports,
     configuration,
-    projects
+    projects,
+    employees
 )
 
 @asynccontextmanager
@@ -86,7 +87,8 @@ app.include_router(adjustments.router, prefix="/adjustments", tags=["Adjustments
 app.include_router(work_orders.router, prefix="/work-orders", tags=["Work Orders"])
 app.include_router(configuration.router, prefix="/config", tags=["Configuration"])
 app.include_router(reports.router, prefix="/reports", tags=["Reports"])
-app.include_router(projects.router, prefix="/projects", tags=["Projects"]) 
+app.include_router(projects.router, prefix="/projects", tags=["Projects"])
+app.include_router(employees.router, prefix="/employees", tags=["Employees"])
 
 @app.get("/")
 def read_root():

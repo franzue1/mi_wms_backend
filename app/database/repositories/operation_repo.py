@@ -17,7 +17,7 @@ ALLOWED_PICKING_FIELDS_TO_UPDATE = {
     'service_act_number', 'date_attended', 'warehouse_id',
     'location_src_id', 'location_dest_id', 'partner_ref', 'date_transfer',
     'purchase_order', 'custom_operation_type', 'adjustment_reason', 'loss_confirmation', 'notes',
-    'project_id' # <-- NUEVO: Permitir actualizar el proyecto
+    'project_id', 'employee_id', 'operations_instructions', 'warehouse_observations'
 }
 
 # --- PICKING CRUD (Cabecera) ---
@@ -51,28 +51,30 @@ def get_picking_details(picking_id, company_id):
     
     return p_info, moves
 
-
-def create_picking(name, picking_type_id, location_src_id, location_dest_id, company_id, responsible_user, work_order_id=None, project_id=None, warehouse_id=None):
+def create_picking(name, picking_type_id, location_src_id, location_dest_id, company_id, responsible_user, 
+                   work_order_id=None, project_id=None, warehouse_id=None,
+                   employee_id=None, operations_instructions=None, warehouse_observations=None): # <--- Nuevos Args
     """
     [CORREGIDO] Crea un nuevo picking base.
-    Ahora guarda el warehouse_id para que los reportes por almacén funcionen.
+    Soporta employee_id y comentarios iniciales.
     """
-    s_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    s_date = datetime.now() # Usamos objeto datetime, psycopg2 lo formatea
     
-    # [FIX] Agregamos warehouse_id a la consulta
     query = """
         INSERT INTO pickings (
             company_id, name, picking_type_id, 
             location_src_id, location_dest_id, warehouse_id, 
-            scheduled_date, state, work_order_id, responsible_user, project_id
+            scheduled_date, state, work_order_id, responsible_user, project_id,
+            employee_id, operations_instructions, warehouse_observations -- <--- Columnas Nuevas
         ) 
-        VALUES (%s, %s, %s, %s, %s, %s, %s, 'draft', %s, %s, %s) 
+        VALUES (%s, %s, %s, %s, %s, %s, %s, 'draft', %s, %s, %s, %s, %s, %s) 
         RETURNING id
     """
     params = (
         company_id, name, picking_type_id, 
         location_src_id, location_dest_id, warehouse_id, 
-        s_date, work_order_id, responsible_user, project_id
+        s_date, work_order_id, responsible_user, project_id,
+        employee_id, operations_instructions, warehouse_observations # <--- Valores Nuevos
     )
     
     new_id_row = execute_commit_query(query, params, fetchone=True)
@@ -263,7 +265,7 @@ def delete_picking(picking_id):
 def mark_picking_as_ready(picking_id):
     """
     Cambia el estado a 'listo' (reserva stock).
-    [CORREGIDO] Sincroniza el project_id de la cabecera a las líneas ANTES de validar stock.
+    [ACTUALIZADO] Valida que se haya seleccionado un Empleado si el destino es 'CUADRILLA INTERNA'.
     """
     conn = None
     try:
@@ -272,7 +274,7 @@ def mark_picking_as_ready(picking_id):
             
             # 1. Bloquear y Obtener datos de cabecera
             cursor.execute("""
-                SELECT p.id, p.state, pt.code, p.project_id 
+                SELECT p.id, p.state, pt.code, p.project_id, p.location_src_id, p.location_dest_id, p.employee_id
                 FROM pickings p 
                 JOIN picking_types pt ON p.picking_type_id = pt.id 
                 WHERE p.id = %s FOR UPDATE
@@ -282,16 +284,37 @@ def mark_picking_as_ready(picking_id):
             if not p: raise ValueError("El albarán no existe.")
             if p['state'] != 'draft': raise ValueError(f"Estado inválido: {p['state']}. Debe estar en borrador.")
 
-            # --- [FIX DEFINITIVO] SINCRONIZACIÓN ABSOLUTA DE PROYECTO ---
-            # Actualizamos SIEMPRE. Si p['project_id'] es None, las líneas pasan a None (Stock General).
-            # Esto corrige el bug de "volver a borrador -> cambiar a sin proyecto".
+            # --- [NUEVO] VALIDACIÓN DE REGLA DE NEGOCIO (EMPLEADOS) ---
+            # Verificamos si Origen O Destino son 'CUADRILLA INTERNA'
+            loc_ids = []
+            if p['location_src_id']: loc_ids.append(p['location_src_id'])
+            if p['location_dest_id']: loc_ids.append(p['location_dest_id'])
+            
+            if loc_ids:
+                cursor.execute(f"""
+                    SELECT wc.name as category_name
+                    FROM locations l
+                    JOIN warehouses w ON l.warehouse_id = w.id
+                    JOIN warehouse_categories wc ON w.category_id = wc.id
+                    WHERE l.id IN %s
+                """, (tuple(loc_ids),))
+                
+                categories_found = [row['category_name'] for row in cursor.fetchall()]
+                
+                if 'CUADRILLA INTERNA' in categories_found:
+                    # Si cualquiera de los dos lados es cuadrilla, exigimos responsable
+                    if not p['employee_id']:
+                        raise ValueError("🛑 REGLA DE NEGOCIO:\n\nEsta operación involucra a una 'Cuadrilla Interna'.\nEs OBLIGATORIO indicar el Empleado Responsable (Técnico/Chofer).")
+            # ---------------------------------------------------
+
+            # [FIX] SINCRONIZACIÓN ABSOLUTA DE PROYECTO
             cursor.execute("""
                 UPDATE stock_moves 
                 SET project_id = %s 
                 WHERE picking_id = %s
             """, (p['project_id'], picking_id))
 
-            # 2. Validación de Integridad
+            # 2. Validación de Integridad (Líneas vacías)
             cursor.execute("SELECT COUNT(*) as count FROM stock_moves WHERE picking_id = %s", (picking_id,))
             if cursor.fetchone()['count'] == 0:
                 raise ValueError("El albarán está vacío. Agregue productos primero.")
@@ -304,8 +327,7 @@ def mark_picking_as_ready(picking_id):
                 FOR UPDATE
             """, (picking_id,))
 
-            # 4. Validación de Stock
-            # (Ahora las líneas ya tienen el project_id correcto, así que la verificación buscará en el stock del proyecto)
+            # 4. Validación de Stock (Lógica Universal que corregimos antes)
             if p['code'] not in ('IN',):
                 ok, msg = _check_stock_with_cursor(cursor, picking_id, p['code'])
                 if not ok:
@@ -323,6 +345,7 @@ def mark_picking_as_ready(picking_id):
         raise e 
     finally:
         if conn: return_db_connection(conn)
+
 
 def return_picking_to_draft(picking_id):
     """
@@ -1022,7 +1045,8 @@ def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id'
         'warehouse_src_name': "w_src.name", 'warehouse_dest_name': "w_dest.name",
         'date': "p.scheduled_date", 'transfer_date': "p.date_transfer",
         'state': "p.state", 'id': "p.id", 'custom_operation_type': 'p.custom_operation_type',
-        'partner_ref': 'p.partner_ref', 'responsible_user': 'p.responsible_user'
+        'partner_ref': 'p.partner_ref', 'responsible_user': 'p.responsible_user',
+        'employee_name': "emp.last_name"
     }
     order_by_column = sort_map.get(sort_by, "p.id")
     direction = "ASC" if ascending else "DESC"
@@ -1031,8 +1055,10 @@ def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id'
     where_clauses = []
 
     # --- Lógica de Filtros ---
+    # --- Lógica de Filtros ---
     for key, value in filters.items():
          if value:
+            # 1. Filtros de Fecha
             if key in ["date_transfer_from", "date_transfer_to"]:
                 try:
                     db_date = datetime.strptime(value, "%d/%m/%Y").strftime("%Y-%m-%d")
@@ -1041,17 +1067,25 @@ def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id'
                     query_params.append(db_date)
                 except ValueError: pass
             
+            # 2. Filtro de Estado
             elif key == 'p.state':
                 where_clauses.append("p.state = %s"); query_params.append(value)
             
-            # [CORRECCIÓN] Filtro de Proyecto busca en Código o Macro Nombre
+            elif key == 'employee_name':
+                 # Buscamos coincidencias en nombre O apellido
+                 where_clauses.append("(emp.first_name ILIKE %s OR emp.last_name ILIKE %s)")
+                 query_params.extend([f"%{value}%", f"%{value}%"])
+
+            # 4. Filtro de Proyecto (Código o Nombre Macro)
             elif key == 'project_name':
                  where_clauses.append("(proj.code ILIKE %s OR mp.name ILIKE %s)")
                  query_params.extend([f"%{value}%", f"%{value}%"])
 
+            # 5. Filtros Genéricos de Texto (Referencia, Tipo, Nombre, OC, Usuario Creador)
             elif key in ["p.partner_ref", "p.custom_operation_type", "p.name", "p.purchase_order", "p.responsible_user"]:
                 where_clauses.append(f"{key} ILIKE %s"); query_params.append(f"%{value}%")
             
+            # 6. Filtros de Ubicación/Almacén
             elif key == 'src_path_display':
                 where_clauses.append("CASE WHEN pt.code = 'IN' THEN partner.name ELSE l_src.path END ILIKE %s")
                 query_params.append(f"%{value}%")
@@ -1071,6 +1105,10 @@ def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id'
         TO_CHAR(p.scheduled_date, 'DD/MM/YYYY') as date,
         TO_CHAR(p.date_transfer, 'DD/MM/YYYY') as transfer_date,
         pt.code as type_code,
+        CASE 
+            WHEN emp.id IS NOT NULL THEN CONCAT(emp.last_name, ', ', emp.first_name) 
+            ELSE NULL 
+        END as employee_name,
         
         CASE WHEN pt.code = 'IN' THEN partner.name ELSE l_src.path END as src_path_display,
         CASE WHEN pt.code = 'OUT' THEN partner.name ELSE l_dest.path END as dest_path_display,
@@ -1091,6 +1129,7 @@ def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id'
     LEFT JOIN partners partner ON p.partner_id = partner.id
     LEFT JOIN warehouses w_src ON l_src.warehouse_id = w_src.id
     LEFT JOIN warehouses w_dest ON l_dest.warehouse_id = w_dest.id
+    LEFT JOIN employees emp ON p.employee_id = emp.id
     
     -- Joins de Proyecto
     LEFT JOIN projects proj ON p.project_id = proj.id
@@ -1525,25 +1564,42 @@ def get_adjustments_filtered_sorted(company_id, filters={}, sort_by='id', ascend
 
 def get_picking_ui_details_optimized(picking_id, company_id):
     """
-    [OPTIMIZADO-JSON-CORREGIDO] Obtiene Picking, Moves (con ownership), Serials, Dropdowns Y PRODUCTOS.
+    [OPTIMIZADO-JSON-CORREGIDO] 
+    Agregado: Recuperación de employee_id y employee_name para la UI.
     """
     sql = """
     WITH 
     -- 1. Cabecera y Regla
     picking_data AS (
-        SELECT p.*, pt.code as type_code, w.name as warehouse_name, -- <--- AGREGAR ESTO
-               json_build_object('id', ot.id, 'name', ot.name, 'source_location_category', ot.source_location_category, 'destination_location_category', ot.destination_location_category) as op_rule
-        FROM pickings p JOIN picking_types pt ON p.picking_type_id = pt.id 
-        LEFT JOIN warehouses w ON p.warehouse_id = w.id -- <--- AGREGAR ESTE JOIN
+        SELECT 
+            p.*, 
+            pt.code as type_code, 
+            w.name as warehouse_name,
+            -- [NUEVO] Traemos el nombre del empleado para el tooltip
+            CONCAT(emp.last_name, ', ', emp.first_name) as employee_name,
+            
+            json_build_object(
+                'id', ot.id, 
+                'name', ot.name, 
+                'source_location_category', ot.source_location_category, 
+                'destination_location_category', ot.destination_location_category
+            ) as op_rule
+
+        FROM pickings p 
+        JOIN picking_types pt ON p.picking_type_id = pt.id 
+        LEFT JOIN warehouses w ON p.warehouse_id = w.id
         LEFT JOIN operation_types ot ON p.custom_operation_type = ot.name
+        -- [NUEVO] Join para sacar el nombre del técnico
+        LEFT JOIN employees emp ON p.employee_id = emp.id
+        
         WHERE p.id = %(pid)s AND p.company_id = %(cid)s
     ),
-    -- 2. Movimientos (CORREGIDO: Se agregó ownership)
+    -- 2. Movimientos
     moves_data AS (
         SELECT COALESCE(json_agg(json_build_object(
             'id', sm.id, 
             'product_id', pr.id,
-            'location_src_id', sm.location_src_id, -- <--- ¡AGREGA ESTA LÍNEA!
+            'location_src_id', sm.location_src_id,
             'name', pr.name, 
             'sku', pr.sku, 
             'product_uom_qty', sm.product_uom_qty, 
@@ -1554,7 +1610,7 @@ def get_picking_ui_details_optimized(picking_id, company_id):
             'project_id', sm.project_id,
             'standard_price', pr.standard_price,
             'cost_at_adjustment', sm.cost_at_adjustment,
-            'ownership', pr.ownership -- <--- ¡AQUÍ FALTABA!
+            'ownership', pr.ownership
         )), '[]'::json) as moves
         FROM stock_moves sm 
         JOIN products pr ON sm.product_id = pr.id 
@@ -1699,24 +1755,28 @@ def create_full_picking_transaction(data: dict):
         final_src = data.get('location_src_id')
         final_dest = data.get('location_dest_id')
 
-        # 4. Insertar Cabecera
+        # 4. Insertar Cabecera [ACTUALIZADO]
         cursor.execute("""
             INSERT INTO pickings (
                 company_id, name, picking_type_id, state, responsible_user,
                 location_src_id, location_dest_id, warehouse_id,
                 partner_id, partner_ref, purchase_order, date_transfer,
-                custom_operation_type, project_id, scheduled_date
+                custom_operation_type, project_id, scheduled_date,
+                employee_id, operations_instructions, warehouse_observations -- <--- AGREGADO
             ) VALUES (
                 %s, %s, %s, 'draft', %s,
                 %s, %s, %s,
                 %s, %s, %s, %s,
-                %s, %s, NOW()
+                %s, %s, NOW(),
+                %s, %s, %s -- <--- AGREGADO
             ) RETURNING id
         """, (
             data['company_id'], new_name, data['picking_type_id'], data['responsible_user'],
-            final_src, final_dest, wh_id, # <--- Aquí es donde fallaba antes
+            final_src, final_dest, wh_id,
             data.get('partner_id'), data.get('partner_ref'), data.get('purchase_order'), data.get('date_transfer'),
-            data.get('custom_operation_type'), data.get('project_id')
+            data.get('custom_operation_type'), data.get('project_id'),
+            # Nuevos campos (get devuelve None si no existen)
+            data.get('employee_id'), data.get('operations_instructions'), data.get('warehouse_observations') 
         ))
         new_picking_id = cursor.fetchone()[0]
 
@@ -2058,15 +2118,12 @@ def import_smart_adjustments_transaction(company_id, user_name, rows):
     finally:
         if conn: return_db_connection(conn)
 
-    # --- EXPORTACIÓN CSV (Agregado a operation_repo.py) ---
-
+# --- EXPORTACIÓN CSV (Agregado a operation_repo.py) ---
 def get_data_for_export(company_id, export_type, selected_ids=None):
     """
     Obtiene los datos para el CSV.
+    [MEJORA v3] Agregado Técnico (Empleado), Instrucciones y Observaciones.
     [MEJORA v2] Lógica Inteligente para Nombres de Proveedores/Clientes.
-    - Si es IN (Recepción): Origen = Nombre del Partner (Proveedor).
-    - Si es OUT (Entrega): Destino = Nombre del Partner (Cliente).
-    - Mantiene la columna 'notes' (Comentarios).
     """
     params = [company_id]
     filter_clause = ""
@@ -2078,11 +2135,10 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
     notes_col = "p.notes as comentarios,"
 
     # Definimos la lógica de visualización de ubicaciones
-    # Se usa tanto en 'headers' como en 'full'
     smart_locations_sql = """
         -- LOGICA INTELIGENTE ORIGEN
         CASE 
-            WHEN pt.code = 'IN' THEN part.name -- Si es Entrada, mostrar Proveedor
+            WHEN pt.code = 'IN' THEN part.name 
             WHEN l_src.type = 'internal' THEN w_src.name 
             ELSE l_src.path 
         END as almacen_origen,
@@ -2094,7 +2150,7 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
         
         -- LOGICA INTELIGENTE DESTINO
         CASE 
-            WHEN pt.code = 'OUT' THEN part.name -- Si es Salida, mostrar Cliente
+            WHEN pt.code = 'OUT' THEN part.name 
             WHEN l_dest.type = 'internal' THEN w_dest.name 
             ELSE l_dest.path 
         END as almacen_destino,
@@ -2103,6 +2159,13 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
             WHEN pt.code = 'OUT' THEN part.name 
             ELSE l_dest.path 
         END as ubicacion_destino
+    """
+
+    # --- NUEVAS COLUMNAS (SQL Reutilizable) ---
+    new_cols_sql = """
+        CONCAT(emp.last_name, ', ', emp.first_name) as employee_name,
+        p.operations_instructions,
+        p.warehouse_observations,
     """
 
     if export_type == 'headers':
@@ -2114,25 +2177,32 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
                 p.custom_operation_type,
                 proj.name as project_name,
                 
-                {smart_locations_sql}, -- <--- Lógica inyectada aquí
+                {smart_locations_sql},
                 
                 p.partner_ref, 
                 p.purchase_order,
                 TO_CHAR(p.date_transfer, 'DD/MM/YYYY') as date_transfer, 
                 p.responsible_user,
+
+                -- [NUEVO] Columnas de RRHH y Operaciones
+                {new_cols_sql}
+
                 {notes_col}
 
-                -- Dummy columns
+                -- Dummy columns (para mantener estructura si el frontend lo requiere)
                 '' as product_sku, '' as product_name, 0 as quantity, 0 as price_unit, '' as serial
 
             FROM pickings p
             JOIN picking_types pt ON p.picking_type_id = pt.id
-            LEFT JOIN partners part ON p.partner_id = part.id  -- <--- JOIN CLAVE
+            LEFT JOIN partners part ON p.partner_id = part.id 
             LEFT JOIN projects proj ON p.project_id = proj.id
             LEFT JOIN locations l_src ON p.location_src_id = l_src.id
             LEFT JOIN locations l_dest ON p.location_dest_id = l_dest.id
             LEFT JOIN warehouses w_src ON l_src.warehouse_id = w_src.id
             LEFT JOIN warehouses w_dest ON l_dest.warehouse_id = w_dest.id
+            
+            -- [NUEVO] Join con Empleados
+            LEFT JOIN employees emp ON p.employee_id = emp.id
             
             WHERE p.company_id = %s 
               AND pt.code != 'ADJ'
@@ -2149,12 +2219,15 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
                 p.custom_operation_type,
                 proj.name as project_name,
                 
-                {smart_locations_sql}, -- <--- Lógica inyectada aquí
+                {smart_locations_sql},
                 
                 p.partner_ref, 
                 p.purchase_order,
                 TO_CHAR(p.date_transfer, 'DD/MM/YYYY') as date_transfer, 
                 p.responsible_user,
+                
+                -- [NUEVO] Columnas de RRHH y Operaciones
+                {new_cols_sql}
                 
                 prod.sku as product_sku,
                 prod.name as product_name,
@@ -2174,12 +2247,15 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
             JOIN stock_moves sm ON sm.picking_id = p.id
             JOIN products prod ON sm.product_id = prod.id
             JOIN picking_types pt ON p.picking_type_id = pt.id
-            LEFT JOIN partners part ON p.partner_id = part.id -- <--- JOIN CLAVE
+            LEFT JOIN partners part ON p.partner_id = part.id
             LEFT JOIN projects proj ON p.project_id = proj.id
             LEFT JOIN locations l_src ON p.location_src_id = l_src.id
             LEFT JOIN locations l_dest ON p.location_dest_id = l_dest.id
             LEFT JOIN warehouses w_src ON l_src.warehouse_id = w_src.id
             LEFT JOIN warehouses w_dest ON l_dest.warehouse_id = w_dest.id
+
+            -- [NUEVO] Join con Empleados
+            LEFT JOIN employees emp ON p.employee_id = emp.id
             
             WHERE p.company_id = %s 
               AND pt.code != 'ADJ'

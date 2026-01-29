@@ -185,6 +185,9 @@ class PickingFullCreateRequest(BaseModel):
     date_transfer: Optional[date] = None
     custom_operation_type: Optional[str] = None
     project_id: Optional[int] = None
+    employee_id: Optional[int] = None
+    operations_instructions: Optional[str] = None
+    warehouse_observations: Optional[str] = None
     
     # IDs de Ubicación seleccionados en UI (Si no se envían, se usan defaults del tipo)
     location_src_id: Optional[int] = None
@@ -231,6 +234,10 @@ class PickingResponse(BaseModel):
     attention_date: Optional[date] = None
     project_id: Optional[int] = None
     project_name: Optional[str] = None
+    employee_id: Optional[int] = None
+    employee_name: Optional[str] = None # <-- Para mostrar el nombre en el frontend
+    operations_instructions: Optional[str] = None
+    warehouse_observations: Optional[str] = None
     # Lista de líneas de movimiento
     moves: List[StockMoveResponse] = []
 
@@ -702,3 +709,32 @@ class TokenResponse(BaseModel):
 class PasswordChangeRequest(BaseModel):
     old_password: str
     new_password: str
+
+# --- Schemas para Empleados (NUEVO) ---
+class EmployeeBase(BaseModel):
+    first_name: str
+    last_name: str
+    document_number: str
+    internal_code: Optional[str] = None
+    job_title: Optional[str] = None
+    status: Optional[str] = "active"
+
+class EmployeeCreate(EmployeeBase):
+    pass
+
+class EmployeeUpdate(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    document_number: Optional[str] = None
+    internal_code: Optional[str] = None
+    job_title: Optional[str] = None
+    status: Optional[str] = None
+
+class EmployeeResponse(EmployeeBase):
+    id: int
+    company_id: int
+    full_name: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True

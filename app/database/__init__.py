@@ -23,3 +23,10 @@ from .repositories.work_order_repo import *
 from .repositories.report_repo import *
 from .repositories.project_repo import *
 from .repositories.operation_repo import *
+from .repositories.employee_repo import (
+    create_employee,
+    update_employee,
+    get_employees_paginated,
+    get_employee_by_id,
+    search_employees_simple
+)

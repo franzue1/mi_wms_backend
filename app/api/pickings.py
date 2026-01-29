@@ -63,13 +63,12 @@ async def download_picking_pdf(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error generando PDF: {e}")
 
-
-
 class PickingCreateRequest(BaseModel):
     picking_type_id: int
     company_id: int
     responsible_user: str
     project_id: Optional[int] = None
+    employee_id: Optional[int] = None
 
 class PickingHeaderUpdate(BaseModel):
     location_src_id: Optional[int] = None
@@ -83,6 +82,9 @@ class PickingHeaderUpdate(BaseModel):
     loss_confirmation: Optional[str] = None
     notes: Optional[str] = None
     project_id: Optional[int] = None
+    employee_id: Optional[int] = None
+    operations_instructions: Optional[str] = None
+    warehouse_observations: Optional[str] = None
 
 class StockMoveCreate(BaseModel):
     product_id: int
@@ -105,7 +107,8 @@ def _build_picking_filters(type_code: str, filters_in: dict):
         'warehouse_src_name': 'w_src.name', 'warehouse_dest_name': 'w_dest.name',
         'state': 'p.state', 'custom_operation_type': 'p.custom_operation_type',
         'partner_ref': 'p.partner_ref', 'responsible_user': 'p.responsible_user',
-        'date_transfer_from': 'date_transfer_from', 'date_transfer_to': 'date_transfer_to'
+        'date_transfer_from': 'date_transfer_from', 'date_transfer_to': 'date_transfer_to',
+        'employee_name': 'employee_name'
     }
     clean_filters = {}
     for api_key, db_key in filter_map.items():
@@ -124,7 +127,8 @@ async def get_all_pickings(
     warehouse_src_name: Optional[str] = Query(None), warehouse_dest_name: Optional[str] = Query(None),
     state: Optional[str] = Query(None), custom_operation_type: Optional[str] = Query(None),
     partner_ref: Optional[str] = Query(None), responsible_user: Optional[str] = Query(None),
-    date_transfer_from: Optional[str] = Query(None), date_transfer_to: Optional[str] = Query(None)
+    date_transfer_from: Optional[str] = Query(None), date_transfer_to: Optional[str] = Query(None),
+    employee_name: Optional[str] = Query(None)
 ):
     verify_company_access(auth, company_id) # <--- BLINDAJE
     if "operations.can_view" not in auth.permissions:
@@ -239,9 +243,6 @@ async def create_full_picking(
         raise HTTPException(status_code=500, detail=f"Error transaccional: {e}")
 
 # --- 2. Endpoints de Import/Export (Antes que /{id}) ---
-
-# app/api/pickings.py
-
 @router.get("/export/csv", response_class=StreamingResponse)
 async def export_pickings_csv(
     auth: AuthDependency,
@@ -281,7 +282,10 @@ async def export_pickings_csv(
                 'almacen_origen', 'ubicacion_origen',
                 'almacen_destino', 'ubicacion_destino',
                 'partner_ref', 'purchase_order',
-                'date_transfer', 'responsible_user'
+                'date_transfer', 'responsible_user',
+                'employee_name', 
+                'operations_instructions', 
+                'warehouse_observations'
             ]
         elif export_type == 'full':
             headers = [
@@ -291,6 +295,9 @@ async def export_pickings_csv(
                 'almacen_destino', 'ubicacion_destino',
                 'partner_ref', 'purchase_order',
                 'date_transfer', 'responsible_user',
+                'employee_name', 
+                'operations_instructions', 
+                'warehouse_observations',
                 'product_sku', 'product_name', 'quantity', 'price_unit', 'serial'
             ]
         

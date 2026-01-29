@@ -349,7 +349,7 @@ def get_user_companies(user_id):
 def create_company(name: str, country_code: str = "PE", creator_user_id: int = None):
     """
     Crea una nueva compañía e inicializa su infraestructura base.
-    [MEJORA] Si se pasa creator_user_id, asigna automáticamente la compañía a ese usuario.
+    [ACTUALIZADO] Incluye la categoría 'CUADRILLA INTERNA'.
     """
     print(f" -> [DB] Iniciando creación de compañía: {name} ({country_code}) por Usuario ID: {creator_user_id}")
 
@@ -367,7 +367,7 @@ def create_company(name: str, country_code: str = "PE", creator_user_id: int = N
             new_company = cursor.fetchone()
             new_company_id = new_company['id']
 
-            # --- [NUEVO] VINCULAR AL CREADOR ---
+            # --- VINCULAR AL CREADOR ---
             if creator_user_id:
                 cursor.execute(
                     "INSERT INTO user_companies (user_id, company_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
@@ -376,8 +376,13 @@ def create_company(name: str, country_code: str = "PE", creator_user_id: int = N
                 print(f" -> [DB] Compañía {new_company_id} asignada al creador {creator_user_id}.")
             # -----------------------------------
 
-            # 2. Categorías de Almacén
-            wh_categories = [(new_company_id, "ALMACEN PRINCIPAL"), (new_company_id, "CONTRATISTA")]
+            # 2. Categorías de Almacén [ACTUALIZADO]
+            # Ahora incluimos 'CUADRILLA INTERNA' para que el módulo de empleados funcione desde el día 1.
+            wh_categories = [
+                (new_company_id, "ALMACEN PRINCIPAL"), 
+                (new_company_id, "CONTRATISTA"),
+                (new_company_id, "CUADRILLA INTERNA") # <--- ¡NUEVO!
+            ]
             cursor.executemany("INSERT INTO warehouse_categories (company_id, name) VALUES (%s, %s) ON CONFLICT (company_id, name) DO NOTHING", wh_categories)
             
             # 3. Categorías de Socio
@@ -399,13 +404,14 @@ def create_company(name: str, country_code: str = "PE", creator_user_id: int = N
                 ON CONFLICT (company_id, path) DO NOTHING
             """, virtual_locs)
 
-            # 6. Almacén Principal
+            # 6. Almacén Principal (Lógica existente correcta)
             cursor.execute("SELECT id FROM warehouse_categories WHERE company_id = %s AND name = 'ALMACEN PRINCIPAL'", (new_company_id,))
             main_wh_cat = cursor.fetchone()
             
             main_wh_id = None
             if main_wh_cat:
                 wh_code = f"PRI-{new_company_id}" 
+                # Asumo que _create_warehouse_with_cursor está importado desde utils
                 _create_warehouse_with_cursor(
                     cursor, "Almacén Principal", wh_code, main_wh_cat['id'], new_company_id, 
                     "", "", "", "", "", "activo"
