@@ -8,9 +8,12 @@ import functools
 from datetime import datetime, date, timedelta
 import re
 from collections import defaultdict
-import json 
+import json
 from ..core import get_db_connection, return_db_connection, execute_query, execute_commit_query
 from . import project_repo
+
+# Nota: PickingService se importa de forma lazy dentro de las funciones
+# para evitar dependencias circulares con app.services
 
 ALLOWED_PICKING_FIELDS_TO_UPDATE = {
     'name', 'partner_id', 'state', 'scheduled_date', 'responsible_user',
@@ -265,31 +268,43 @@ def delete_picking(picking_id):
 def mark_picking_as_ready(picking_id):
     """
     Cambia el estado a 'listo' (reserva stock).
-    [ACTUALIZADO] Valida que se haya seleccionado un Empleado si el destino es 'CUADRILLA INTERNA'.
+    [ACTUALIZADO] Valida integridad completa de cabecera y reglas de negocio.
     """
+    # Import lazy para evitar dependencias circulares
+    from app.services.picking_service import PickingService
+
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-            
-            # 1. Bloquear y Obtener datos de cabecera
+
+            # 1. Bloquear y Obtener TODOS los datos de cabecera necesarios
             cursor.execute("""
-                SELECT p.id, p.state, pt.code, p.project_id, p.location_src_id, p.location_dest_id, p.employee_id
-                FROM pickings p 
-                JOIN picking_types pt ON p.picking_type_id = pt.id 
+                SELECT
+                    p.id, p.state, p.partner_id, p.scheduled_date, p.purchase_order,
+                    p.date_transfer, p.custom_operation_type, p.adjustment_reason,
+                    p.project_id, p.location_src_id, p.location_dest_id, p.employee_id,
+                    pt.code as type_code
+                FROM pickings p
+                JOIN picking_types pt ON p.picking_type_id = pt.id
                 WHERE p.id = %s FOR UPDATE
             """, (picking_id,))
             p = cursor.fetchone()
-            
-            if not p: raise ValueError("El albarán no existe.")
-            if p['state'] != 'draft': raise ValueError(f"Estado inválido: {p['state']}. Debe estar en borrador.")
 
-            # --- [NUEVO] VALIDACIÓN DE REGLA DE NEGOCIO (EMPLEADOS) ---
-            # Verificamos si Origen O Destino son 'CUADRILLA INTERNA'
+            if not p:
+                raise ValueError("El albarán no existe.")
+            if p['state'] != 'draft':
+                raise ValueError(f"Estado inválido: {p['state']}. Debe estar en borrador.")
+
+            # 2. VALIDACIÓN DE INTEGRIDAD DE CABECERA (NUEVA)
+            # Usa el servicio para validar campos obligatorios según tipo de operación
+            PickingService.validate_header_for_ready(dict(p), p['type_code'])
+
+            # 3. VALIDACIÓN DE REGLA DE NEGOCIO (EMPLEADOS/CUADRILLA)
             loc_ids = []
             if p['location_src_id']: loc_ids.append(p['location_src_id'])
             if p['location_dest_id']: loc_ids.append(p['location_dest_id'])
-            
+
             if loc_ids:
                 cursor.execute(f"""
                     SELECT wc.name as category_name
@@ -298,28 +313,26 @@ def mark_picking_as_ready(picking_id):
                     JOIN warehouse_categories wc ON w.category_id = wc.id
                     WHERE l.id IN %s
                 """, (tuple(loc_ids),))
-                
+
                 categories_found = [row['category_name'] for row in cursor.fetchall()]
-                
+
                 if 'CUADRILLA INTERNA' in categories_found:
-                    # Si cualquiera de los dos lados es cuadrilla, exigimos responsable
                     if not p['employee_id']:
                         raise ValueError("🛑 REGLA DE NEGOCIO:\n\nEsta operación involucra a una 'Cuadrilla Interna'.\nEs OBLIGATORIO indicar el Empleado Responsable (Técnico/Chofer).")
-            # ---------------------------------------------------
 
-            # [FIX] SINCRONIZACIÓN ABSOLUTA DE PROYECTO
+            # 4. SINCRONIZACIÓN DE PROYECTO EN LÍNEAS
             cursor.execute("""
-                UPDATE stock_moves 
-                SET project_id = %s 
+                UPDATE stock_moves
+                SET project_id = %s
                 WHERE picking_id = %s
             """, (p['project_id'], picking_id))
 
-            # 2. Validación de Integridad (Líneas vacías)
+            # 5. VALIDACIÓN DE LÍNEAS (No puede estar vacío)
             cursor.execute("SELECT COUNT(*) as count FROM stock_moves WHERE picking_id = %s", (picking_id,))
             if cursor.fetchone()['count'] == 0:
                 raise ValueError("El albarán está vacío. Agregue productos primero.")
 
-            # 3. Bloqueo Inteligente de Productos
+            # 6. BLOQUEO DE PRODUCTOS (para evitar race conditions)
             cursor.execute("""
                 SELECT p.id FROM products p
                 JOIN stock_moves sm ON sm.product_id = p.id
@@ -327,13 +340,13 @@ def mark_picking_as_ready(picking_id):
                 FOR UPDATE
             """, (picking_id,))
 
-            # 4. Validación de Stock (Lógica Universal que corregimos antes)
-            if p['code'] not in ('IN',):
-                ok, msg = _check_stock_with_cursor(cursor, picking_id, p['code'])
+            # 7. VALIDACIÓN DE STOCK (para operaciones que consumen)
+            if p['type_code'] not in ('IN',):
+                ok, msg = _check_stock_with_cursor(cursor, picking_id, p['type_code'])
                 if not ok:
                     raise ValueError(f"Stock insuficiente al intentar reservar:\n{msg}")
 
-            # 5. Actualización de estado
+            # 8. ACTUALIZACIÓN DE ESTADO
             cursor.execute("UPDATE pickings SET state = 'listo' WHERE id = %s", (picking_id,))
             
         conn.commit()

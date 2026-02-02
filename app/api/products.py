@@ -6,6 +6,8 @@ from datetime import date
 from app import database as db
 from app import schemas, security
 from app.security import TokenData
+from app.services.product_service import ProductService
+from app.exceptions import ValidationError, WMSBaseException
 import traceback
 import io
 import csv
@@ -43,8 +45,6 @@ async def get_all_products(
     company_id: int = Query(...),
     skip: int = 0,
     limit: int = 100,
-    
-    # --- ¡PARÁMETROS DE FILTRO Y ORDEN AÑADIDOS! ---
     sort_by: Optional[str] = Query(None),
     ascending: bool = Query(True),
     name: Optional[str] = Query(None),
@@ -54,37 +54,31 @@ async def get_all_products(
     tracking: Optional[str] = Query(None),
     ownership: Optional[str] = Query(None)
 ):
-    """ Obtiene una lista de productos filtrada y paginada. """
+    """Obtiene una lista de productos filtrada y paginada."""
     if "products.can_crud" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tiene permiso para ver productos")
-        
-    # 1. Construir el dict de filtros
-    filters = {
-        "name": name, "sku": sku, "category_name": category_name,
-        "uom_name": uom_name, "tracking": tracking, "ownership": ownership
-    }
-    # 2. Limpiar Nones
-    clean_filters = {k: v for k, v in filters.items() if v is not None and v != ""}
-    
-    # 3. Llamar a la BD
+
+    # Usar servicio para construir filtros (elimina duplicación)
+    clean_filters = ProductService.build_filter_dict(
+        name=name, sku=sku, category_name=category_name,
+        uom_name=uom_name, tracking=tracking, ownership=ownership
+    )
+
     products_raw = db.get_products_filtered_sorted(
-        company_id, 
-        filters=clean_filters, 
-        sort_by=sort_by, 
-        ascending=ascending, 
-        limit=limit, 
+        company_id,
+        filters=clean_filters,
+        sort_by=sort_by,
+        ascending=ascending,
+        limit=limit,
         offset=skip
     )
     return [dict(p) for p in products_raw]
 
 
-# --- ¡NUEVO ENDPOINT DE CONTEO! ---
 @router.get("/count", response_model=int)
 async def get_products_count(
     auth: AuthDependency,
     company_id: int = Query(...),
-    
-    # Mismos filtros que get_all_products
     name: Optional[str] = Query(None),
     sku: Optional[str] = Query(None),
     category_name: Optional[str] = Query(None),
@@ -92,16 +86,16 @@ async def get_products_count(
     tracking: Optional[str] = Query(None),
     ownership: Optional[str] = Query(None)
 ):
-    """ Obtiene el conteo total de productos para la paginación. """
+    """Obtiene el conteo total de productos para la paginación."""
     if "products.can_crud" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
-    filters = {
-        "name": name, "sku": sku, "category_name": category_name,
-        "uom_name": uom_name, "tracking": tracking, "ownership": ownership
-    }
-    clean_filters = {k: v for k, v in filters.items() if v is not None and v != ""}
-    
+    # Usar servicio para construir filtros
+    clean_filters = ProductService.build_filter_dict(
+        name=name, sku=sku, category_name=category_name,
+        uom_name=uom_name, tracking=tracking, ownership=ownership
+    )
+
     count = db.get_products_count(company_id, filters=clean_filters)
     return count
 
@@ -112,19 +106,37 @@ async def create_product(
     auth: AuthDependency,
     company_id: int = Query(...)
 ):
-    """ Crea un nuevo producto. """
+    """Crea un nuevo producto."""
     if "products.can_crud" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tiene permiso para crear productos")
 
     try:
+        # Validar y normalizar datos usando el servicio
+        validated_data = ProductService.prepare_product_data(
+            sku=product.sku,
+            name=product.name,
+            tracking=product.tracking,
+            ownership=product.ownership,
+            standard_price=product.standard_price,
+            category_id=product.category_id,
+            uom_id=product.uom_id
+        )
+
         new_product_id = db.create_product(
-            name=product.name, sku=product.sku,
-            category_id=product.category_id, tracking=product.tracking,
-            uom_id=product.uom_id, company_id=company_id,
-            ownership=product.ownership, standard_price=product.standard_price
+            name=validated_data['name'],
+            sku=validated_data['sku'],
+            category_id=validated_data['category_id'],
+            tracking=validated_data['tracking'],
+            uom_id=validated_data['uom_id'],
+            company_id=company_id,
+            ownership=validated_data['ownership'],
+            standard_price=validated_data['standard_price']
         )
         created_product_raw = db.get_product_details(new_product_id)
         return dict(created_product_raw)
+
+    except WMSBaseException:
+        raise  # El exception handler global lo maneja
     except ValueError as ve:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
     except Exception as e:
@@ -147,7 +159,7 @@ async def update_product(
     product: schemas.ProductUpdate,
     auth: AuthDependency
 ):
-    """ Actualiza un producto existente por su ID. """
+    """Actualiza un producto existente por su ID."""
     if "products.can_crud" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
@@ -155,20 +167,38 @@ async def update_product(
         current_data = db.get_product_details(product_id)
         if not current_data:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado")
-        
+
+        # Merge datos actuales con nuevos
         update_data = dict(current_data)
         update_data.update(product.dict(exclude_unset=True))
-        
-        db.update_product(
-            product_id=product_id, name=update_data['name'], sku=update_data['sku'],
-            category_id=update_data['category_id'], tracking=update_data['tracking'],
-            uom_id=update_data['uom_id'], ownership=update_data['ownership'],
-            standard_price=update_data['standard_price']
+
+        # Validar y normalizar usando el servicio
+        validated_data = ProductService.prepare_product_data(
+            sku=update_data['sku'],
+            name=update_data['name'],
+            tracking=update_data['tracking'],
+            ownership=update_data['ownership'],
+            standard_price=update_data['standard_price'],
+            category_id=update_data['category_id'],
+            uom_id=update_data['uom_id']
         )
-        
+
+        db.update_product(
+            product_id=product_id,
+            name=validated_data['name'],
+            sku=validated_data['sku'],
+            category_id=validated_data['category_id'],
+            tracking=validated_data['tracking'],
+            uom_id=validated_data['uom_id'],
+            ownership=validated_data['ownership'],
+            standard_price=validated_data['standard_price']
+        )
+
         updated_product_raw = db.get_product_details(product_id)
         return dict(updated_product_raw)
 
+    except WMSBaseException:
+        raise  # El exception handler global lo maneja
     except ValueError as ve:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
     except Exception as e:
@@ -190,8 +220,6 @@ async def delete_product(product_id: int, auth: AuthDependency):
 async def export_products_csv(
     auth: AuthDependency,
     company_id: int = Query(...),
-
-    # Reutilizamos los mismos filtros que la vista principal
     sort_by: Optional[str] = Query(None),
     ascending: bool = Query(True),
     name: Optional[str] = Query(None),
@@ -201,57 +229,41 @@ async def export_products_csv(
     tracking: Optional[str] = Query(None),
     ownership: Optional[str] = Query(None)
 ):
-    """
-    Genera y transmite un archivo CSV de los productos filtrados.
-    """
-    if "products.can_crud" not in auth.permissions: # O un permiso de exportación
+    """Genera y transmite un archivo CSV de los productos filtrados."""
+    if "products.can_crud" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
     try:
-        # 1. Construir filtros
-        filters = {
-            "name": name, "sku": sku, "category_name": category_name,
-            "uom_name": uom_name, "tracking": tracking, "ownership": ownership
-        }
-        clean_filters = {k: v for k, v in filters.items() if v is not None and v != ""}
+        # Usar servicio para construir filtros
+        clean_filters = ProductService.build_filter_dict(
+            name=name, sku=sku, category_name=category_name,
+            uom_name=uom_name, tracking=tracking, ownership=ownership
+        )
 
-        # 2. Obtener TODOS los datos (sin paginación, limit=None)
+        # Obtener todos los datos (sin paginación)
         products_raw = db.get_products_filtered_sorted(
-            company_id, 
-            filters=clean_filters, 
-            sort_by=sort_by or 'id', 
-            ascending=ascending, 
-            limit=None, 
+            company_id,
+            filters=clean_filters,
+            sort_by=sort_by or 'id',
+            ascending=ascending,
+            limit=None,
             offset=None
         )
 
         if not products_raw:
             raise HTTPException(status_code=404, detail="No hay datos para exportar con esos filtros.")
 
-        # 3. Crear un archivo CSV en memoria
-        output = io.StringIO(newline='')
-        # Usar ';' como delimitador para compatibilidad con Excel en español
-        writer = csv.writer(output, delimiter=';') 
+        # Usar servicio para generar CSV
+        csv_content = ProductService.generate_csv_content(products_raw)
 
-        # 4. Escribir cabeceras
-        headers = ["sku", "name", "ownership", "standard_price", "category_name", "uom_name", "tracking"]
-        writer.writerow(headers)
-
-        # 5. Escribir datos
-        for prod_row in products_raw:
-            prod_dict = dict(prod_row)
-            writer.writerow([prod_dict.get(h, '') for h in headers])
-
-        # 6. Preparar la respuesta para streaming
-        output.seek(0)
-
-        # 7. Devolver el archivo
         return StreamingResponse(
-            iter([output.getvalue()]),
+            iter([csv_content]),
             media_type="text/csv",
             headers={"Content-Disposition": "attachment; filename=productos.csv"}
         )
 
+    except WMSBaseException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al generar CSV: {e}")
@@ -260,119 +272,88 @@ async def export_products_csv(
 async def import_products_csv(
     auth: AuthDependency,
     file: UploadFile = File(...),
-    company_id: int = Query(...)  # <-- CORRECCIÓN 1: Requerir company_id
+    company_id: int = Query(...)
 ):
-    """ Importa productos desde un archivo CSV. """
+    """Importa productos desde un archivo CSV."""
     if "products.can_crud" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
     try:
+        # 1. Leer archivo
         content = await file.read()
-        content_decoded = content.decode('utf-8-sig')
-        file_io = io.StringIO(content_decoded)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error al leer el archivo: {e}")
 
-    reader = csv.DictReader(file_io, delimiter=';')
-    try:
-        rows = list(reader)
-        if not rows: raise ValueError("El archivo CSV está vacío.")
-        
-        headers = {h.lower().strip() for h in reader.fieldnames or []}
-        required_headers = {"sku", "name", "category_name", "uom_name", "tracking", "ownership", "standard_price"}
-        
-        if not required_headers.issubset(headers):
-            missing = required_headers - headers
-            raise ValueError(f"Faltan columnas: {', '.join(sorted(list(missing)))}")
+        # 2. Parsear CSV (Service Layer)
+        rows, headers = ProductService.parse_csv_file(content)
 
-        # --- CORRECCIÓN 2: Validar categorías y UdM usando el company_id ---
-        all_db_categories = {cat['name']: cat['id'] for cat in db.get_product_categories(company_id)}
-        all_db_uoms = {uom['name']: uom['id'] for uom in db.get_uoms(company_id)}
+        # 3. Validar headers (Service Layer)
+        ProductService.validate_csv_headers(headers)
 
-        invalid_categories = set()
-        invalid_uoms = set()
+        # 4. Cargar datos de referencia (Repository - SQL puro)
+        categories_map = {cat['name']: cat['id'] for cat in db.get_product_categories(company_id)}
+        uoms_map = {uom['name']: uom['id'] for uom in db.get_uoms(company_id)}
 
-        for row in rows:
-            cat_name = row.get('category_name', '').strip()
-            uom_name = row.get('uom_name', '').strip()
-            if cat_name and cat_name not in all_db_categories:
-                invalid_categories.add(cat_name)
-            if uom_name and uom_name not in all_db_uoms:
-                invalid_uoms.add(uom_name)
-        
-        errors_to_report = []
-        if invalid_categories:
-            errors_to_report.append(f"Categorías no existen: {', '.join(sorted(list(invalid_categories)))}")
-        if invalid_uoms:
-            errors_to_report.append(f"UdM no existen: {', '.join(sorted(list(invalid_uoms)))}")
-        
-        if errors_to_report:
-            raise ValueError(". ".join(errors_to_report))
-        # --- FIN DE LA CORRECCIÓN 2 ---
+        # 5. Validar referencias (Service Layer)
+        ProductService.validate_csv_references(rows, categories_map, uoms_map)
 
+        # 6. Procesar filas
         created, updated = 0, 0
         error_list = []
-        
+
         for i, row in enumerate(rows):
             row_num = i + 2
             sku = row.get('sku', '').strip()
-            name = row.get('name', '').strip()
-            
+
             try:
-                if not sku or not name:
-                    raise ValueError("sku y name son obligatorios.")
-                price_str = row.get('standard_price', '0').replace(',', '.')
-                price = float(price_str if price_str else '0')
-                if price < 0:
-                    raise ValueError("standard_price no puede ser negativo.")
-                
-                tracking = row.get('tracking', 'none').strip()
-                if tracking not in ['none', 'lot', 'serial']:
-                    raise ValueError(f"Valor de 'tracking' inválido: {tracking}")
-                
-                ownership = row.get('ownership', 'owned').strip()
-                if ownership not in ['owned', 'consigned']:
-                    raise ValueError(f"Valor de 'ownership' inválido: {ownership}")
-
-                category_id = all_db_categories[row['category_name'].strip()]
-                uom_id = all_db_uoms[row['uom_name'].strip()]
-
-                # Esta función de BD debe manejar la lógica de INSERT/UPDATE
-                result = db.upsert_product_from_import(
-                    company_id=company_id, sku=sku, name=name,
-                    category_id=category_id, uom_id=uom_id,
-                    tracking=tracking, ownership=ownership, price=price
+                # Validar y normalizar fila (Service Layer)
+                validated_data = ProductService.process_csv_row(
+                    row, row_num, categories_map, uoms_map
                 )
-                
-                if result == "created": created += 1
-                elif result == "updated": updated += 1
-            
+
+                # Insertar/Actualizar (Repository - SQL puro)
+                result = db.upsert_product_from_import(
+                    company_id=company_id,
+                    sku=validated_data['sku'],
+                    name=validated_data['name'],
+                    category_id=validated_data['category_id'],
+                    uom_id=validated_data['uom_id'],
+                    tracking=validated_data['tracking'],
+                    ownership=validated_data['ownership'],
+                    price=validated_data['standard_price']
+                )
+
+                if result == "created":
+                    created += 1
+                elif result == "updated":
+                    updated += 1
+
+            except ValidationError as ve:
+                error_list.append(f"{ve.message}")
             except Exception as e:
                 error_list.append(f"Fila {row_num} (SKU: {sku}): {e}")
 
         if error_list:
             raise HTTPException(
-                status_code=400, 
+                status_code=400,
                 detail="Importación fallida. Corrija los errores y reintente:\n- " + "\n- ".join(error_list)
             )
 
         return {"created": created, "updated": updated, "errors": 0}
 
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
+    except WMSBaseException:
+        raise  # El exception handler global lo maneja
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error crítico al procesar CSV: {e}")
     
-# En app/api/products.py (o donde prefieras)
-
 class SKUImportRequest(BaseModel):
     company_id: int
     raw_text: str
 
+
 class SKUImportResponse(BaseModel):
     found: List[dict]
     errors: List[str]
+
 
 @router.post("/validate-skus-import", response_model=SKUImportResponse)
 async def validate_skus_for_import(
@@ -384,15 +365,32 @@ async def validate_skus_for_import(
     Devuelve los productos encontrados y los errores.
     """
     try:
-        # La lógica pesada la ponemos en una función de DB/lógica
-        found_products, errors = await asyncio.to_thread(
-            db.process_sku_import_list,
+        # 1. Parsear texto (Service Layer)
+        parsed_skus, parse_errors = ProductService.parse_sku_text(request.raw_text)
+
+        if not parsed_skus:
+            return {"found": [], "errors": parse_errors}
+
+        # 2. Buscar productos en BD (Repository - SQL puro)
+        skus_to_find = list(parsed_skus.keys())
+        found_products = await asyncio.to_thread(
+            db.find_products_by_skus,
             company_id=request.company_id,
-            raw_text=request.raw_text
+            skus=skus_to_find
         )
-        
-        return {"found": [dict(p) for p in found_products], "errors": errors}
-        
+
+        # 3. Construir respuesta (Service Layer)
+        final_list, not_found_errors = ProductService.build_sku_import_response(
+            parsed_skus, found_products
+        )
+
+        # Combinar errores de parsing y de productos no encontrados
+        all_errors = parse_errors + not_found_errors
+
+        return {"found": final_list, "errors": all_errors}
+
+    except WMSBaseException:
+        raise
     except Exception as e:
-        # ... (manejo de error)
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al procesar SKUs: {e}")

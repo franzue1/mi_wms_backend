@@ -1,9 +1,15 @@
 # app/pdf_generator.py
+"""
+Generador de PDFs para operaciones de inventario.
+Compatible con datos de repositorios SQL puros (DictCursor).
+Todos los accesos a datos usan .get() para manejo seguro de campos opcionales.
+"""
+
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 from datetime import datetime, date
+from typing import Dict, Any, List, Optional
 
-# [CORRECCIÓN] Importamos warehouse_repo en lugar de location_repo
 from app.database.repositories import operation_repo, partner_repo, warehouse_repo
 
 class PDF(FPDF):
@@ -19,16 +25,25 @@ class PDF(FPDF):
         self.set_font('Helvetica', 'I', 8)
         self.cell(0, 10, f'Página {self.page_no()}', 0, align='C')
 
-def generate_picking_bytes(picking_id, company_id):
+def generate_picking_bytes(picking_id: int, company_id: int) -> bytes:
     """
-    Genera el PDF en memoria y devuelve los bytes.
+    Genera el PDF de un picking en memoria y devuelve los bytes.
+    Compatible con datos de repositorios SQL puros.
+
+    Args:
+        picking_id: ID del picking
+        company_id: ID de la compañía
+
+    Returns:
+        bytes: Contenido del PDF
     """
     picking_info, moves = operation_repo.get_picking_details(picking_id, company_id)
     moves_serials = operation_repo.get_serials_for_picking(picking_id)
-    
+
     partner_details = None
-    if picking_info.get('partner_id'):
-        partner_details = partner_repo.get_partner_details(picking_info['partner_id'])
+    partner_id = picking_info.get('partner_id')
+    if partner_id:
+        partner_details = partner_repo.get_partner_details(partner_id)
     
     pdf = PDF()
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -121,28 +136,33 @@ def generate_picking_bytes(picking_id, company_id):
 
     for move in moves:
         line_height = 5
-        desc_text = move['name']
-        move_id = move['id']
+        # Acceso seguro con .get() para todos los campos
+        move_name = move.get('name', '')
+        move_id = move.get('id')
+        move_sku = move.get('sku', '')
+        move_uom = move.get('uom_name', 'Und')
+        move_qty = move.get('quantity_done', 0)
+
+        desc_text = move_name
         serials_data = moves_serials.get(move_id, {})
         if serials_data:
-             series_list = list(serials_data.keys())
-             series_str = ", ".join(series_list)
-             desc_text += f"\n [SN: {series_str}]"
+            series_list = list(serials_data.keys())
+            series_str = ", ".join(series_list)
+            desc_text += f"\n [SN: {series_str}]"
 
         x_start, y_start = pdf.get_x(), pdf.get_y()
-        
+
         pdf.set_xy(x_start + w_sku, y_start)
         pdf.multi_cell(w_desc, line_height, desc_text, border=1, align='L')
         y_end = pdf.get_y()
         row_height = y_end - y_start
-        
+
         pdf.set_xy(x_start, y_start)
-        pdf.cell(w_sku, row_height, str(move['sku']), border=1, align='C')
+        pdf.cell(w_sku, row_height, str(move_sku), border=1, align='C')
         pdf.set_xy(x_start + w_sku + w_desc, y_start)
-        pdf.cell(w_uom, row_height, str(move.get('uom_name', 'Und')), border=1, align='C')
+        pdf.cell(w_uom, row_height, str(move_uom), border=1, align='C')
         pdf.set_xy(x_start + w_sku + w_desc + w_uom, y_start)
-        qty_val = move.get('quantity_done', 0)
-        qty_str = f"{int(qty_val)}" if qty_val % 1 == 0 else f"{qty_val:.2f}"
+        qty_str = f"{int(move_qty)}" if move_qty % 1 == 0 else f"{move_qty:.2f}"
         pdf.cell(w_qty, row_height, qty_str, border=1, align='C')
         pdf.set_y(y_end)
 

@@ -6,9 +6,9 @@ from datetime import date
 from app import database as db
 from app import schemas, security
 from app.security import TokenData
+from app.services.warehouse_service import WarehouseService
+from app.exceptions import ValidationError, NotFoundError, DuplicateError
 import traceback
-import io
-import csv
 from fastapi.responses import StreamingResponse
 import asyncio
 
@@ -35,16 +35,17 @@ async def get_all_warehouses(
     """ Obtiene una lista de almacenes. """
     if "warehouses.can_crud" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
-        
-    # 1. Construir el dict de filtros
-    filters = {
-        "name": name, "code": code, "status": status, 
-        "category_name": category_name, "ruc": ruc, "address": address
-    }
-    # 2. Limpiar Nones
-    clean_filters = {k: v for k, v in filters.items() if v is not None}
-    
-    # 3. Llamar a la DB con todos los parámetros
+
+    # Usar WarehouseService para construir filtros
+    clean_filters = WarehouseService.build_filter_dict(
+        name=name,
+        code=code,
+        status=status,
+        category_name=category_name,
+        ruc=ruc,
+        address=address
+    )
+
     warehouses_raw = db.get_warehouses_filtered_sorted(
         company_id, 
         filters=clean_filters, 
@@ -73,15 +74,16 @@ async def get_warehouses_count(
     if "warehouses.can_crud" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
-    # 1. Construir el dict de filtros
-    filters = {
-        "name": name, "code": code, "status": status, 
-        "category_name": category_name, "ruc": ruc, "address": address
-    }
-    # 2. Limpiar Nones
-    clean_filters = {k: v for k, v in filters.items() if v is not None}
-    
-    # 3. Llamar a la DB
+    # Usar WarehouseService para construir filtros
+    clean_filters = WarehouseService.build_filter_dict(
+        name=name,
+        code=code,
+        status=status,
+        category_name=category_name,
+        ruc=ruc,
+        address=address
+    )
+
     count = db.get_warehouses_count(company_id, filters=clean_filters)
     return count
 
@@ -123,36 +125,35 @@ async def create_warehouse(
     """ Crea un nuevo almacén y sus ubicaciones/operaciones por defecto. """
     if "warehouses.can_crud" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
-    
+
+    # Usar WarehouseService para preparar datos normalizados
+    prepared_data = WarehouseService.prepare_warehouse_data(warehouse.dict())
+
     try:
-        # --- ¡CORRECCIÓN! ---
-        # Llamamos directamente a la función pública de DB en un hilo.
-        # NO abrimos 'with db.connect_db()...' aquí.
-        
         new_wh_id = await asyncio.to_thread(
-            db.create_warehouse, # La función pública que revisamos
+            db.create_warehouse,
             company_id=company_id,
-            name=warehouse.name,
-            code=warehouse.code.upper(),
-            category_id=warehouse.category_id,
-            social_reason=warehouse.social_reason,
-            ruc=warehouse.ruc,
-            email=warehouse.email,
-            phone=warehouse.phone,
-            address=warehouse.address
+            name=prepared_data["name"],
+            code=prepared_data["code"],
+            category_id=prepared_data["category_id"],
+            social_reason=prepared_data["social_reason"],
+            ruc=prepared_data["ruc"],
+            email=prepared_data["email"],
+            phone=prepared_data["phone"],
+            address=prepared_data["address"]
         )
-        # --------------------
-        
-        # Obtener los detalles del almacén creado para devolverlos
+
         created_warehouse_raw = await asyncio.to_thread(db.get_warehouse_details_by_id, new_wh_id)
-        
+
         if not created_warehouse_raw:
-             raise HTTPException(status_code=500, detail="Almacén creado pero no encontrado.")
+            raise HTTPException(status_code=500, detail="Almacén creado pero no encontrado.")
 
         return dict(created_warehouse_raw)
 
     except ValueError as ve:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
+    except ValidationError as ve:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=ve.message)
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error interno: {e}")
@@ -168,32 +169,38 @@ async def update_warehouse(
     if "warehouses.can_crud" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
+    current_data = db.get_warehouse_details_by_id(warehouse_id)
+    if not current_data:
+        raise NotFoundError("Almacén no encontrado", "WH_NOT_FOUND")
+
+    # Merge datos actuales con los nuevos
+    update_data = dict(current_data)
+    update_data.update(warehouse.dict(exclude_unset=True))
+
+    # Usar WarehouseService para normalizar
+    prepared_data = WarehouseService.prepare_warehouse_data(update_data)
+
     try:
-        current_data = db.get_warehouse_details_by_id(warehouse_id)
-        if not current_data:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Almacén no encontrado")
-        
-        update_data = current_data.copy()
-        update_data.update(warehouse.dict(exclude_unset=True))
-        
         db.update_warehouse(
             wh_id=warehouse_id,
-            name=update_data['name'],
-            code=update_data['code'],
-            category_id=update_data['category_id'],
-            social_reason=update_data['social_reason'],
-            ruc=update_data['ruc'],
-            email=update_data['email'],
-            phone=update_data['phone'],
-            address=update_data['address'],
-            status=update_data['status']
+            name=prepared_data["name"],
+            code=prepared_data["code"],
+            category_id=prepared_data["category_id"],
+            social_reason=prepared_data["social_reason"],
+            ruc=prepared_data["ruc"],
+            email=prepared_data["email"],
+            phone=prepared_data["phone"],
+            address=prepared_data["address"],
+            status=WarehouseService.normalize_status(update_data.get("status"))
         )
-        
+
         updated_wh = db.get_warehouse_details_by_id(warehouse_id)
         return dict(updated_wh)
 
     except ValueError as ve:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
+    except ValidationError as ve:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=ve.message)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error interno: {e}")
 
@@ -214,9 +221,6 @@ async def inactivate_warehouse(warehouse_id: int, auth: AuthDependency):
 async def export_warehouses_csv(
     auth: AuthDependency,
     company_id: int = Query(...),
-    
-
-    # Reutilizamos los filtros de la vista principal
     sort_by: Optional[str] = Query(None),
     ascending: bool = Query(True),
     name: Optional[str] = Query(None),
@@ -230,38 +234,35 @@ async def export_warehouses_csv(
     if "warehouses.can_crud" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
-    try:
-        filters = {"name": name, "code": code, "status": status, "category_name": category_name, "ruc": ruc, "address": address}
-        clean_filters = {k: v for k, v in filters.items() if v is not None and v != ""}
+    clean_filters = WarehouseService.build_filter_dict(
+        name=name,
+        code=code,
+        status=status,
+        category_name=category_name,
+        ruc=ruc,
+        address=address
+    )
 
-        warehouses_raw = db.get_warehouses_filtered_sorted(
-            company_id, filters=clean_filters, sort_by=sort_by or 'id', 
-            ascending=ascending, limit=None, offset=None
-        )
+    warehouses_raw = db.get_warehouses_filtered_sorted(
+        company_id,
+        filters=clean_filters,
+        sort_by=sort_by or 'id',
+        ascending=ascending,
+        limit=None,
+        offset=None
+    )
 
-        if not warehouses_raw:
-            raise HTTPException(status_code=404, detail="No hay datos para exportar.")
+    if not warehouses_raw:
+        raise NotFoundError("No hay datos para exportar", "EXPORT_NO_DATA")
 
-        output = io.StringIO(newline='')
-        writer = csv.writer(output, delimiter=';')
+    # Usar WarehouseService para generar CSV
+    csv_content = WarehouseService.generate_csv_content(warehouses_raw)
 
-        headers = ["code", "name", "status", "social_reason", "ruc", "email", "phone", "address", "category_name"]
-        writer.writerow(headers)
-
-        for wh_row in warehouses_raw:
-            wh_dict = dict(wh_row)
-            writer.writerow([wh_dict.get(h, '') for h in headers])
-
-        output.seek(0)
-        return StreamingResponse(
-            iter([output.getvalue()]),
-            media_type="text/csv",
-            headers={"Content-Disposition": "attachment; filename=almacenes.csv"}
-        )
-
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error al generar CSV: {e}")
+    return StreamingResponse(
+        iter([csv_content]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=almacenes.csv"}
+    )
 
 
 @router.post("/import/csv", response_model=dict)
@@ -274,83 +275,59 @@ async def import_warehouses_csv(
     if "warehouses.can_crud" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
-    try:
-        content = await file.read()
-        content_decoded = content.decode('utf-8-sig')
-        file_io = io.StringIO(content_decoded)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error al leer el archivo: {e}")
+    # 1. Leer y parsear CSV usando WarehouseService
+    content = await file.read()
+    rows, headers = WarehouseService.parse_csv_file(content)
 
-    reader = csv.DictReader(file_io, delimiter=';')
-    try:
-        rows = list(reader)
-        if not rows: raise ValueError("El archivo CSV está vacío.")
-        
-        headers = {h.lower().strip() for h in reader.fieldnames or []}
-        required_headers = {"code", "name", "status", "social_reason", "ruc", "email", "phone", "address", "category_name"}
-        if not required_headers.issubset(headers):
-            missing = required_headers - headers
-            raise ValueError(f"Faltan columnas: {', '.join(sorted(list(missing)))}")
+    # 2. Validar headers requeridos
+    WarehouseService.validate_csv_headers(headers)
 
-        # Validar categorías (BD Call)
-        all_db_categories = {cat['name'] for cat in db.get_warehouse_categories(company_id)}
-        invalid_categories = {row.get('category_name', '').strip() for row in rows if row.get('category_name', '').strip() and row.get('category_name', '').strip() not in all_db_categories}
-        if invalid_categories:
-            raise ValueError(f"Categorías no existen: {', '.join(invalid_categories)}")
-        
-        cat_map = {cat['name']: cat['id'] for cat in db.get_warehouse_categories(company_id)}
+    # 3. Cargar categorías de BD y validar referencias
+    db_categories = db.get_warehouse_categories(company_id)
+    valid_category_names = {cat['name'] for cat in db_categories}
+    WarehouseService.validate_csv_categories(rows, valid_category_names)
 
-        created, updated = 0, 0
-        error_list = []
-        
-        for i, row in enumerate(rows):
-            row_num = i + 2
-            code = row.get('code', '').strip().upper()
-            name = row.get('name', '').strip()
-            status = row.get('status', '').lower().strip()
-            
-            try:
-                if not code or not name or not status or not row.get('category_name'):
-                    raise ValueError("code, name, status, y category_name son obligatorios.")
-                if status not in ['activo', 'inactivo']:
-                    raise ValueError(f"Estado '{status}' inválido, debe ser 'activo' o 'inactivo'.")
-                
-                category_id = cat_map.get(row.get('category_name', '').strip())
-                if category_id is None:
-                    raise ValueError(f"Categoría '{row.get('category_name')}' no encontrada (cache).")
+    # 4. Crear mapeo de categorías
+    cat_map = {cat['name']: cat['id'] for cat in db_categories}
 
-                # --- Aquí es donde ocurre la llamada a la BD ---
-                result = db.upsert_warehouse_from_import(
-                    company_id=company_id, code=code, name=name, status=status,
-                    social_reason=row.get('social_reason', '').strip(),
-                    ruc=row.get('ruc', '').strip(),
-                    email=row.get('email', '').strip(),
-                    phone=row.get('phone', '').strip(),
-                    address=row.get('address', '').strip(),
-                    category_id=category_id
-                )
-                
-                if result == "created": created += 1
-                elif result == "updated": updated += 1
-            
-            except Exception as e:
-                # Captura el AttributeError o cualquier error de la BD
-                error_list.append(f"Fila {row_num} (Code: {code}): {e}")
+    # 5. Procesar filas
+    created, updated = 0, 0
+    error_list = []
 
-        # --- ¡ESTA ES LA CORRECCIÓN! ---
-        # Si hubo CUALQUIER error, fallamos toda la operación
-        if error_list:
-            print(f"Importación fallida con {len(error_list)} errores.")
-            raise HTTPException(
-                status_code=400, 
-                detail="Importación fallida. Corrija los errores y reintente:\n- " + "\n- ".join(error_list)
+    for i, row in enumerate(rows):
+        row_num = i + 2
+        try:
+            # Usar WarehouseService para procesar y normalizar la fila
+            prepared = WarehouseService.process_csv_row(row, row_num, cat_map)
+
+            result = db.upsert_warehouse_from_import(
+                company_id=company_id,
+                code=prepared["code"],
+                name=prepared["name"],
+                status=prepared["status"],
+                social_reason=prepared["social_reason"],
+                ruc=prepared["ruc"],
+                email=prepared["email"],
+                phone=prepared["phone"],
+                address=prepared["address"],
+                category_id=prepared["category_id"]
             )
-        # --- FIN DE LA CORRECCIÓN ---
 
-        return {"created": created, "updated": updated, "errors": 0}
+            if result == "created":
+                created += 1
+            elif result == "updated":
+                updated += 1
 
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error crítico al procesar CSV: {e}")
+        except ValidationError as ve:
+            error_list.append(ve.message)
+        except Exception as e:
+            error_list.append(f"Fila {row_num}: {e}")
+
+    if error_list:
+        raise ValidationError(
+            "Importación con errores:\n- " + "\n- ".join(error_list),
+            "CSV_IMPORT_ERRORS",
+            {"errors": error_list}
+        )
+
+    return {"created": created, "updated": updated, "errors": 0}

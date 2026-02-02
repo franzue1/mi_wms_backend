@@ -152,11 +152,9 @@ def create_warehouse(company_id, name, code, category_id, social_reason=None, ru
 def update_warehouse(wh_id, name, code, category_id, social_reason, ruc, email, phone, address, status):
     """
     Actualiza un almacén y sus ubicaciones en cascada.
+    SQL PURO - Los datos deben venir pre-normalizados desde el Service Layer.
     """
     print(f"[DB-UPDATE-WH] Intentando actualizar Warehouse ID: {wh_id} con nuevo código: {code}")
-    new_code_upper = code.strip().upper() if code else None
-    if not new_code_upper:
-        raise ValueError("El código de almacén no puede estar vacío.")
 
     # ELIMINADO: global db_pool...
 
@@ -170,21 +168,21 @@ def update_warehouse(wh_id, name, code, category_id, social_reason, ruc, email, 
             if not old_data:
                 raise ValueError(f"No se encontró el almacén con ID {wh_id} para actualizar.")
             old_code = old_data[0]
-            print(f" -> Código antiguo: '{old_code}', Código nuevo propuesto: '{new_code_upper}'")
+            print(f" -> Código antiguo: '{old_code}', Código nuevo propuesto: '{code}'")
 
             cursor.execute(
                 """UPDATE warehouses SET
                    name = %s, code = %s, category_id = %s, social_reason = %s, ruc = %s,
                    email = %s, phone = %s, address = %s, status = %s
                    WHERE id = %s""",
-                (name, new_code_upper, category_id, social_reason, ruc, email, phone, address, status, wh_id)
+                (name, code, category_id, social_reason, ruc, email, phone, address, status, wh_id)
             )
             print(" -> Tabla 'warehouses' actualizada.")
 
-            if old_code != new_code_upper:
+            if old_code != code:
                 print(f" -> El código cambió. Actualizando paths en 'locations'...")
                 old_prefix = f"{old_code}/"
-                new_prefix = f"{new_code_upper}/"
+                new_prefix = f"{code}/"
                 
                 cursor.execute(
                     """UPDATE locations
@@ -205,7 +203,7 @@ def update_warehouse(wh_id, name, code, category_id, social_reason, ruc, email, 
         if conn: conn.rollback()
         print(f"[DB-ERROR] Error al actualizar almacén: {err}")
         if 'warehouses_code_key' in str(err):
-            raise ValueError(f"El código '{new_code_upper}' ya está en uso por otro almacén.")
+            raise ValueError(f"El código '{code}' ya está en uso por otro almacén.")
         else:
             traceback.print_exc(); raise err
             
@@ -559,43 +557,39 @@ def get_locations_detailed(company_id):
 def create_location(company_id, name, path, type, category, warehouse_id):
     """
     Crea una nueva ubicación.
-    [MEJORA] Fuerza mayúsculas en nombre y path para estandarización.
+    SQL PURO - Los datos deben venir pre-normalizados desde el Service Layer.
     """
     if type != 'internal' and warehouse_id is not None: warehouse_id = None
     elif type == 'internal' and warehouse_id is None:
         raise ValueError("Se requiere un Almacén Asociado para ubicaciones de tipo 'Interna'.")
 
-    # Normalización
-    name_upper = name.strip().upper() if name else name
-    path_upper = path.strip().upper() if path else path
-
     conn = None
     try:
         conn = get_db_connection()
-        
+
         with conn.cursor() as cursor:
             # Validación de Path duplicado
-            cursor.execute("SELECT id FROM locations WHERE path = %s AND company_id = %s", (path_upper, company_id))
+            cursor.execute("SELECT id FROM locations WHERE path = %s AND company_id = %s", (path, company_id))
             if cursor.fetchone():
-                raise ValueError(f"El Path '{path_upper}' ya existe.")
-            
+                raise ValueError(f"El Path '{path}' ya existe.")
+
             # Insertar
             query = """
                 INSERT INTO locations (company_id, name, path, type, category, warehouse_id)
                 VALUES (%s, %s, %s, %s, %s, %s)
                 RETURNING id
             """
-            params = (company_id, name_upper, path_upper, type, category, warehouse_id)
+            params = (company_id, name, path, type, category, warehouse_id)
             cursor.execute(query, params)
             new_id = cursor.fetchone()[0]
-            
+
             conn.commit()
             return new_id
-            
+
     except Exception as e:
         if conn: conn.rollback()
-        if "locations_path_key" in str(e): 
-            raise ValueError(f"El Path '{path_upper}' ya existe.")
+        if "locations_path_key" in str(e):
+            raise ValueError(f"El Path '{path}' ya existe.")
         raise ValueError(f"No se pudo crear la ubicación: {e}") from e
     finally:
         if conn: return_db_connection(conn)
@@ -603,26 +597,22 @@ def create_location(company_id, name, path, type, category, warehouse_id):
 def update_location(location_id, company_id, name, path, type, category, warehouse_id):
     """
     Actualiza una ubicación existente.
-    [MEJORA] Fuerza mayúsculas en nombre y path.
+    SQL PURO - Los datos deben venir pre-normalizados desde el Service Layer.
     """
     print(f"[DB-UPDATE-LOC] Intentando actualizar Location ID: {location_id}")
     if type != 'internal' and warehouse_id is not None: warehouse_id = None
     elif type == 'internal' and warehouse_id is None: raise ValueError("Se requiere un Almacén Asociado.")
 
-    # Normalización
-    name_upper = name.strip().upper() if name else name
-    path_upper = path.strip().upper() if path else path
-
     conn = None
     try:
-        conn = get_db_connection() 
-        
+        conn = get_db_connection()
+
         with conn.cursor() as cursor:
             # Datos Actuales
             cursor.execute("SELECT type, warehouse_id FROM locations WHERE id = %s AND company_id = %s", (location_id, company_id))
             current_loc = cursor.fetchone()
             if not current_loc: raise ValueError(f"No se encontró la ubicación con ID {location_id}.")
-            
+
             current_type = current_loc[0]
             current_warehouse_id = current_loc[1]
 
@@ -640,16 +630,16 @@ def update_location(location_id, company_id, name, path, type, category, warehou
                     raise ValueError(f"No se puede modificar: es la última ubicación interna del almacén original (ID: {current_warehouse_id}).")
 
             # Validación Path único
-            cursor.execute("SELECT id FROM locations WHERE path = %s AND company_id = %s AND id != %s", (path_upper, company_id, location_id))
+            cursor.execute("SELECT id FROM locations WHERE path = %s AND company_id = %s AND id != %s", (path, company_id, location_id))
             existing = cursor.fetchone()
-            if existing: raise ValueError(f"El Path '{path_upper}' ya está en uso por otra ubicación.")
+            if existing: raise ValueError(f"El Path '{path}' ya está en uso por otra ubicación.")
 
             # Ejecutar UPDATE
             cursor.execute(
                 """UPDATE locations SET
                    name = %s, path = %s, type = %s, category = %s, warehouse_id = %s
                    WHERE id = %s AND company_id = %s""",
-                (name_upper, path_upper, type, category, warehouse_id, location_id, company_id)
+                (name, path, type, category, warehouse_id, location_id, company_id)
             )
             conn.commit()
             return True

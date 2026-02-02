@@ -1,10 +1,18 @@
 # mi_wms_backend/app/main.py
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import traceback
 from app import database as db
+from app.exceptions import (
+    WMSBaseException,
+    ValidationError,
+    NotFoundError,
+    DuplicateError,
+    PermissionDeniedError
+)
 import os
 
 # Importar los routers
@@ -74,6 +82,35 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# === Exception Handlers para errores de negocio ===
+
+@app.exception_handler(WMSBaseException)
+async def wms_exception_handler(request: Request, exc: WMSBaseException):
+    """
+    Handler global para excepciones de negocio del WMS.
+    Convierte excepciones tipadas a respuestas JSON estructuradas.
+    """
+    # Determinar status code según tipo de excepción
+    status_code = 400  # Default para errores de validación
+
+    if isinstance(exc, NotFoundError):
+        status_code = 404
+    elif isinstance(exc, DuplicateError):
+        status_code = 409  # Conflict
+    elif isinstance(exc, PermissionDeniedError):
+        status_code = 403
+
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": exc.code,
+            "message": exc.message,
+            "details": exc.details
+        }
+    )
+
 
 # Incluir los routers (endpoints)
 app.include_router(auth.router, prefix="/auth", tags=["Auth"])

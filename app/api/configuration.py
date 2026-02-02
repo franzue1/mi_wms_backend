@@ -1,9 +1,16 @@
 # app/api/configuration.py
+"""
+Endpoints de Configuración.
+Delega lógica de validación al ConfigService.
+"""
+
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from typing import List, Annotated
 from app import database as db
 from app import schemas, security
 from app.security import TokenData
+from app.services.config_service import ConfigService
+from app.exceptions import ValidationError
 import asyncio
 import traceback
 
@@ -25,9 +32,19 @@ async def get_product_categories(company_id: int = Query(...)):
 
 @router.post("/product-categories", response_model=schemas.ConfigResponse, status_code=201, dependencies=[Depends(check_config_permission)])
 async def create_product_category(category: schemas.ConfigCreate, company_id: int = Query(...)):
+    """Crea una nueva categoría de producto. Usa ConfigService para validación."""
     try:
-        new_item = await asyncio.to_thread(db.create_product_category, category.name, company_id)
-        return dict(new_item)
+        # Validar datos usando el servicio
+        validated = ConfigService.validate_product_category(category.name, company_id)
+
+        new_item = await asyncio.to_thread(
+            db.create_product_category,
+            validated["name"],
+            validated["company_id"]
+        )
+        return ConfigService.build_category_response(dict(new_item))
+    except ValidationError as ve:
+        raise HTTPException(status_code=400, detail=ve.message)
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
@@ -36,9 +53,20 @@ async def create_product_category(category: schemas.ConfigCreate, company_id: in
 
 @router.put("/product-categories/{category_id}", response_model=schemas.ConfigResponse, dependencies=[Depends(check_config_permission)])
 async def update_product_category(category_id: int, category: schemas.ConfigCreate, company_id: int = Query(...)):
+    """Actualiza una categoría de producto. Usa ConfigService para validación."""
     try:
-        updated_item = await asyncio.to_thread(db.update_product_category, category_id, category.name, company_id)
-        return dict(updated_item)
+        # Validar datos usando el servicio
+        validated = ConfigService.validate_product_category(category.name, company_id)
+
+        updated_item = await asyncio.to_thread(
+            db.update_product_category,
+            category_id,
+            validated["name"],
+            validated["company_id"]
+        )
+        return ConfigService.build_category_response(dict(updated_item))
+    except ValidationError as ve:
+        raise HTTPException(status_code=400, detail=ve.message)
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
@@ -60,18 +88,39 @@ async def get_uoms(company_id: int = Query(...)): # [CORREGIDO] Agregado company
     return [dict(row) for row in data]
 
 @router.post("/uoms", response_model=schemas.ConfigResponse, status_code=201, dependencies=[Depends(check_config_permission)])
-async def create_uom(uom: schemas.ConfigCreate, company_id: int = Query(...)): # [CORREGIDO] Agregado company_id
+async def create_uom(uom: schemas.ConfigCreate, company_id: int = Query(...)):
+    """Crea una nueva unidad de medida. Usa ConfigService para validación."""
     try:
-        new_id = await asyncio.to_thread(db.create_uom, uom.name, company_id)
-        return {"id": new_id, "name": uom.name}
+        # Validar datos usando el servicio
+        validated = ConfigService.validate_uom(uom.name, company_id)
+
+        new_id = await asyncio.to_thread(
+            db.create_uom,
+            validated["name"],
+            validated["company_id"]
+        )
+        return {"id": new_id, "name": validated["name"]}
+    except ValidationError as ve:
+        raise HTTPException(status_code=400, detail=ve.message)
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
 
 @router.put("/uoms/{uom_id}", response_model=schemas.ConfigResponse, dependencies=[Depends(check_config_permission)])
-async def update_uom(uom_id: int, uom: schemas.ConfigCreate, company_id: int = Query(...)): # [CORREGIDO] Agregado company_id
+async def update_uom(uom_id: int, uom: schemas.ConfigCreate, company_id: int = Query(...)):
+    """Actualiza una unidad de medida. Usa ConfigService para validación."""
     try:
-        await asyncio.to_thread(db.update_uom, uom_id, uom.name, company_id)
-        return {"id": uom_id, "name": uom.name}
+        # Validar datos usando el servicio
+        validated = ConfigService.validate_uom(uom.name, company_id)
+
+        await asyncio.to_thread(
+            db.update_uom,
+            uom_id,
+            validated["name"],
+            validated["company_id"]
+        )
+        return {"id": uom_id, "name": validated["name"]}
+    except ValidationError as ve:
+        raise HTTPException(status_code=400, detail=ve.message)
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
 
@@ -92,17 +141,38 @@ async def get_warehouse_categories(company_id: int = Query(...)):
 
 @router.post("/warehouse-categories", response_model=schemas.ConfigResponse, status_code=201, dependencies=[Depends(check_config_permission)])
 async def create_warehouse_category(category: schemas.ConfigCreate, company_id: int = Query(...)):
+    """Crea una nueva categoría de almacén. Usa ConfigService para validación."""
     try:
-        new_item = await asyncio.to_thread(db.create_warehouse_category, category.name, company_id)
-        return dict(new_item)
+        # Validar datos usando el servicio
+        validated = ConfigService.validate_warehouse_category(category.name, company_id)
+
+        new_item = await asyncio.to_thread(
+            db.create_warehouse_category,
+            validated["name"],
+            validated["company_id"]
+        )
+        return ConfigService.build_category_response(dict(new_item))
+    except ValidationError as ve:
+        raise HTTPException(status_code=400, detail=ve.message)
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
 
 @router.put("/warehouse-categories/{category_id}", response_model=schemas.ConfigResponse, dependencies=[Depends(check_config_permission)])
 async def update_warehouse_category(category_id: int, category: schemas.ConfigCreate, company_id: int = Query(...)):
+    """Actualiza una categoría de almacén. Usa ConfigService para validación."""
     try:
-        updated_item = await asyncio.to_thread(db.update_warehouse_category, category_id, category.name, company_id)
-        return dict(updated_item)
+        # Validar datos usando el servicio
+        validated = ConfigService.validate_warehouse_category(category.name, company_id)
+
+        updated_item = await asyncio.to_thread(
+            db.update_warehouse_category,
+            category_id,
+            validated["name"],
+            validated["company_id"]
+        )
+        return ConfigService.build_category_response(dict(updated_item))
+    except ValidationError as ve:
+        raise HTTPException(status_code=400, detail=ve.message)
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
 

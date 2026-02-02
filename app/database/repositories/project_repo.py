@@ -11,27 +11,21 @@ def get_directions(company_id: int):
     )
 
 def create_direction(company_id: int, name: str, code: str = None):
-    # --- LIMPIEZA ---
-    clean_name = name.strip().upper()
-    clean_code = code.strip().upper() if code else None
-    # ----------------
+    """Crea una Dirección. La validación/normalización se hace en ProjectService."""
     try:
         return execute_commit_query(
             "INSERT INTO directions (company_id, name, code) VALUES (%s, %s, %s) RETURNING id",
-            (company_id, clean_name, clean_code), fetchone=True
+            (company_id, name, code), fetchone=True
         )[0]
     except psycopg2.errors.UniqueViolation:
-        raise ValueError(f"Ya existe una Dirección con el nombre '{clean_name}'.")
+        raise ValueError(f"Ya existe una Dirección con el nombre '{name}'.")
 
 def update_direction(direction_id: int, name: str, code: str):
-    # --- LIMPIEZA ---
-    clean_name = name.strip().upper()
-    clean_code = code.strip().upper() if code else None
-    # ----------------
+    """Actualiza una Dirección. La validación/normalización se hace en ProjectService."""
     try:
-        execute_commit_query("UPDATE directions SET name=%s, code=%s WHERE id=%s", (clean_name, clean_code, direction_id))
+        execute_commit_query("UPDATE directions SET name=%s, code=%s WHERE id=%s", (name, code, direction_id))
     except psycopg2.errors.UniqueViolation:
-        raise ValueError(f"Ya existe una Dirección con el nombre '{clean_name}'.")
+        raise ValueError(f"Ya existe una Dirección con el nombre '{name}'.")
 
 def delete_direction(direction_id: int):
     # 1. Validación: ¿Tiene hijos (Gerencias)?
@@ -58,27 +52,21 @@ def get_managements(company_id: int, direction_id: int = None):
     return execute_query(query, tuple(params), fetchall=True)
 
 def create_management(company_id: int, name: str, direction_id: int, code: str = None):
-    # --- LIMPIEZA ---
-    clean_name = name.strip().upper()
-    clean_code = code.strip().upper() if code else None
-    # ----------------
+    """Crea una Gerencia. La validación/normalización se hace en ProjectService."""
     try:
         return execute_commit_query(
             "INSERT INTO managements (company_id, direction_id, name, code) VALUES (%s, %s, %s, %s) RETURNING id",
-            (company_id, direction_id, clean_name, clean_code), fetchone=True
+            (company_id, direction_id, name, code), fetchone=True
         )[0]
     except psycopg2.errors.UniqueViolation:
-        raise ValueError(f"Ya existe una Gerencia con el nombre '{clean_name}'.")
+        raise ValueError(f"Ya existe una Gerencia con el nombre '{name}'.")
 
 def update_management(mgmt_id: int, name: str, direction_id: int, code: str):
-    # --- LIMPIEZA ---
-    clean_name = name.strip().upper()
-    clean_code = code.strip().upper() if code else None
-    # ----------------
+    """Actualiza una Gerencia. La validación/normalización se hace en ProjectService."""
     try:
-        execute_commit_query("UPDATE managements SET name=%s, direction_id=%s, code=%s WHERE id=%s", (clean_name, direction_id, clean_code, mgmt_id))
+        execute_commit_query("UPDATE managements SET name=%s, direction_id=%s, code=%s WHERE id=%s", (name, direction_id, code, mgmt_id))
     except psycopg2.errors.UniqueViolation:
-        raise ValueError(f"Ya existe una Gerencia con el nombre '{clean_name}'.")
+        raise ValueError(f"Ya existe una Gerencia con el nombre '{name}'.")
 
 def delete_management(mgmt_id: int):
     # 1. Validación: ¿Tiene hijos (Proyectos/Macros)?
@@ -94,34 +82,26 @@ def delete_management(mgmt_id: int):
 # --- 3. MACRO PROYECTOS (Nivel 3) ---
 
 def create_macro_project(company_id: int, name: str, management_id: int, code: str = None, cost_center: str = None):
-    # --- LIMPIEZA ---
-    clean_name = name.strip().upper()
-    clean_code = code.strip().upper() if code else None
-    clean_cc = cost_center.strip().upper() if cost_center else None # <--- Limpieza CC
-    # ----------------
+    """Crea un Macro Proyecto. La validación/normalización se hace en ProjectService."""
     try:
         return execute_commit_query(
-            """INSERT INTO macro_projects (company_id, management_id, name, code, cost_center) 
-               VALUES (%s, %s, %s, %s, %s) 
+            """INSERT INTO macro_projects (company_id, management_id, name, code, cost_center)
+               VALUES (%s, %s, %s, %s, %s)
                RETURNING id""",
-            (company_id, management_id, clean_name, clean_code, clean_cc), fetchone=True
+            (company_id, management_id, name, code, cost_center), fetchone=True
         )[0]
     except psycopg2.errors.UniqueViolation:
-        raise ValueError(f"Ya existe un Proyecto con el nombre '{clean_name}'.")
+        raise ValueError(f"Ya existe un Proyecto con el nombre '{name}'.")
 
 def update_macro_project(macro_id: int, name: str, management_id: int, code: str, cost_center: str = None):
-    # --- LIMPIEZA ---
-    clean_name = name.strip().upper()
-    clean_code = code.strip().upper() if code else None
-    clean_cc = cost_center.strip().upper() if cost_center else None # <--- Limpieza CC
-    # ----------------
+    """Actualiza un Macro Proyecto. La validación/normalización se hace en ProjectService."""
     try:
         execute_commit_query(
-            "UPDATE macro_projects SET name=%s, management_id=%s, code=%s, cost_center=%s WHERE id=%s", 
-            (clean_name, management_id, clean_code, clean_cc, macro_id)
+            "UPDATE macro_projects SET name=%s, management_id=%s, code=%s, cost_center=%s WHERE id=%s",
+            (name, management_id, code, cost_center, macro_id)
         )
     except psycopg2.errors.UniqueViolation:
-        raise ValueError(f"Ya existe un Proyecto con el nombre '{clean_name}'.")
+        raise ValueError(f"Ya existe un Proyecto con el nombre '{name}'.")
 
 def get_macro_projects(company_id: int, management_id: int = None):
     # Agregamos mp.cost_center al SELECT
@@ -301,23 +281,11 @@ def get_projects_count(company_id: int, status: str = None, search: str = None,
     res = execute_query(query, tuple(params), fetchone=True)
     return res['total'] if res else 0
         
-def create_project(company_id: int, name: str, macro_project_id: int, code: str = None, address: str = None, 
-                   department: str = None, province: str = None, district: str = None, 
+def create_project(company_id: int, name: str, macro_project_id: int, code: str = None, address: str = None,
+                   department: str = None, province: str = None, district: str = None,
                    budget: float = 0, start_date=None, end_date=None):
-
-    # --- LIMPIEZA ---
-    clean_name = name.strip().upper()
-    clean_code = code.strip().upper() if code else None
-    clean_address = address.strip().upper() if address else None
-
-    # [VALIDACIÓN LÓGICA] Fechas coherentes
-    if start_date and end_date and start_date > end_date:
-        raise ValueError("La Fecha de Inicio no puede ser posterior a la Fecha de Fin.")
-
-    # [VALIDACIÓN DE SEGURIDAD]
-    if not clean_code: raise ValueError("El Código PEP es obligatorio.")
-
-    # Verificar que el Macro Proyecto pertenezca a la compañía
+    """Crea una Obra. La validación/normalización se hace en ProjectService."""
+    # Verificar que el Macro Proyecto pertenezca a la compañía (integridad referencial)
     check = execute_query(
         "SELECT id FROM macro_projects WHERE id = %s AND company_id = %s",
         (macro_project_id, company_id), fetchone=True
@@ -328,75 +296,63 @@ def create_project(company_id: int, name: str, macro_project_id: int, code: str 
     try:
         return execute_commit_query(
             """INSERT INTO projects (
-                   company_id, macro_project_id, name, code, address, 
-                   department, province, district, 
-                   budget, start_date, end_date, 
+                   company_id, macro_project_id, name, code, address,
+                   department, province, district,
+                   budget, start_date, end_date,
                    status, phase
-               ) 
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'active', 'Sin Iniciar') 
+               )
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'active', 'Sin Iniciar')
                RETURNING id""",
-            (company_id, macro_project_id, clean_name, clean_code, clean_address, 
-             department, province, district, 
-             budget, start_date, end_date), 
+            (company_id, macro_project_id, name, code, address,
+             department, province, district,
+             budget, start_date, end_date),
             fetchone=True
         )[0]
 
     except psycopg2.errors.UniqueViolation:
-        raise ValueError(f"El Código PEP '{clean_code}' ya existe en este Macro Proyecto.")
+        raise ValueError(f"El Código PEP '{code}' ya existe en este Macro Proyecto.")
     except psycopg2.errors.NotNullViolation:
-        # Captura de seguridad por si falla la validación de Python
         raise ValueError("El Código PEP es obligatorio.")
 
 def update_project(project_id: int, data: dict):
-    """Actualiza campos editables con limpieza automática."""
+    """
+    Actualiza campos editables de una Obra.
+    La validación/normalización de datos se debe hacer en ProjectService.
+    """
     allowed = {
-        'name', 'code', 'address', 'status', 'phase', 'macro_project_id', 
+        'name', 'code', 'address', 'status', 'phase', 'macro_project_id',
         'budget', 'start_date', 'end_date',
         'department', 'province', 'district'
     }
 
-    # [CORRECCIÓN DE SEGURIDAD] 
-    # Si intentan cambiar el Macro Proyecto, verificar que pertenezca a la misma compañía.
-    # Nota: Esto requiere hacer un query extra, pero la seguridad lo vale.
+    # Verificación de integridad referencial para macro_project_id
     if 'macro_project_id' in data:
         new_macro_id = data['macro_project_id']
-        # 1. Obtener la compañía dueña del proyecto actual
         current_proj = execute_query("SELECT company_id FROM projects WHERE id=%s", (project_id,), fetchone=True)
-        
+
         if current_proj:
             cid = current_proj['company_id']
-            # 2. Verificar que el nuevo macro pertenezca a esa compañía
             check_macro = execute_query(
-                "SELECT id FROM macro_projects WHERE id=%s AND company_id=%s", 
+                "SELECT id FROM macro_projects WHERE id=%s AND company_id=%s",
                 (new_macro_id, cid), fetchone=True
             )
             if not check_macro:
                 raise ValueError("Operación rechazada: El Proyecto Padre seleccionado no pertenece a la compañía.")
-            
-    # [VALIDACIÓN LÓGICA] Si intentan actualizar ambas fechas, verificar coherencia
-    if 'start_date' in data and 'end_date' in data:
-        s = data['start_date']
-        e = data['end_date']
-        if s and e and s > e:
-             raise ValueError("La Fecha de Inicio no puede ser posterior a la Fecha de Fin.")
 
     updates = {}
     for k, v in data.items():
         if k in allowed:
-            # Si el campo es texto (nombre, codigo, direccion), lo limpiamos
-            if k in ['name', 'code', 'address'] and isinstance(v, str):
-                updates[k] = v.strip().upper()
-            else:
-                updates[k] = v
-                
-    if not updates: return
+            updates[k] = v
+
+    if not updates:
+        return
+
     set_clause = ", ".join([f"{k} = %s" for k in updates.keys()])
     params = list(updates.values()) + [project_id]
-    
+
     try:
         execute_commit_query(f"UPDATE projects SET {set_clause} WHERE id = %s", tuple(params))
     except psycopg2.errors.UniqueViolation:
-        # [MEJORA] Mensaje específico para la nueva restricción compuesta
         raise ValueError("Operación rechazada: El Código PEP ya existe dentro del Proyecto seleccionado.")
 
 def delete_project(project_id: int):
@@ -479,20 +435,10 @@ def check_and_update_project_phase(project_id: int):
 
 def upsert_project_from_import(company_id, name, code, macro_project_id, address, status, phase, start_date, end_date, budget, department, province, district, cost_center=None):
     """
-    [BLINDADO - ATOMIC UPSERT] 
-    Usa INSERT ... ON CONFLICT para manejar la concurrencia de forma nativa en BD.
-    Evita condiciones de carrera entre INSERT y UPDATE.
+    Atomic UPSERT para importación de obras.
+    La validación/normalización se hace en ProjectService.
     """
     conn = None
-    
-    # Limpieza
-    clean_name = name.strip().upper()
-    clean_code = code.strip().upper() if code else None
-    clean_addr = address.strip().upper() if address else None
-    
-    # Validación previa
-    if not clean_code:
-        raise ValueError(f"El proyecto '{clean_name}' no tiene Código PEP. Es obligatorio.")
 
     try:
         conn = get_db_connection()
@@ -522,27 +468,26 @@ def upsert_project_from_import(company_id, name, code, macro_project_id, address
                 RETURNING (xmax = 0) AS inserted
             """
             
-            # Nota: Usamos COALESCE para no sobrescribir datos existentes con NULLs si el Excel viene vacío en esas columnas
-            
+            # Nota: Usamos COALESCE para no sobrescribir datos existentes con NULLs si el Excel viene vacío
+
             params = (
-                company_id, macro_project_id, clean_name, clean_code, clean_addr, 
-                status or 'active', phase or 'Sin Iniciar', 
-                start_date, end_date, budget or 0, 
+                company_id, macro_project_id, name, code, address,
+                status or 'active', phase or 'Sin Iniciar',
+                start_date, end_date, budget or 0,
                 department, province, district
             )
-            
+
             cursor.execute(query, params)
             result = cursor.fetchone()
             was_inserted = result[0] if result else False
-            
+
             conn.commit()
             return "created" if was_inserted else "updated"
 
     except Exception as e:
         if conn: conn.rollback()
-        # Capturamos error si el índice único no existe o falla otra cosa
         if "unique constraint" in str(e):
-             raise ValueError(f"Conflicto de integridad: El código '{clean_code}' ya existe en otro contexto.")
+            raise ValueError(f"Conflicto de integridad: El código '{code}' ya existe en otro contexto.")
         raise e
     finally:
         if conn: return_db_connection(conn)
@@ -579,40 +524,29 @@ def get_hierarchy_flat(company_id: int):
 
 def import_hierarchy_batch(company_id: int, rows: list):
     """
-    Versión FINAL: 
-    1. Flexibilidad Cero en Nombres.
-    2. Captura de Códigos Duplicados.
-    3. [NUEVO] Validación de Integridad: No permite saltar niveles (Hijos sin Padre).
+    Importación masiva de jerarquía.
+    La validación/normalización se hace en ProjectService.
+    Los datos vienen pre-procesados con line_ref para mensajes de error.
     """
     conn = get_db_connection()
     stats = {"dirs_created": 0, "mgmts_created": 0, "macros_created": 0, "macros_updated": 0}
-    
+
     try:
         with conn.cursor() as cursor:
-            for i, row in enumerate(rows):
-                line_ref = f"Fila {i+2}"
-                
-                # Extracción de datos
-                raw_dir = row.get('dir_name', '').strip()
-                dir_code = row.get('dir_code', '').strip().upper() or None
-                
-                raw_mgmt = row.get('mgmt_name', '').strip()
-                mgmt_code = row.get('mgmt_code', '').strip().upper() or None
-                
-                raw_macro = row.get('macro_name', '').strip()
-                macro_code = row.get('macro_code', '').strip().upper() or None
-                cost_center = row.get('cost_center', '').strip().upper() or None
+            for row in rows:
+                # Los datos vienen pre-procesados del servicio
+                line_ref = row.get('line_ref', 'Fila desconocida')
+                raw_dir = row.get('dir_name', '')
+                dir_code = row.get('dir_code')
+                raw_mgmt = row.get('mgmt_name', '')
+                mgmt_code = row.get('mgmt_code')
+                raw_macro = row.get('macro_name', '')
+                macro_code = row.get('macro_code')
+                cost_center = row.get('cost_center')
 
-                # --- VALIDACIÓN DE INTEGRIDAD ESTRUCTURAL ---
-                # Caso 1: Tiene Gerencia o Proyecto, pero no tiene Dirección
+                # Si no hay dirección, saltar (ya validado en servicio)
                 if not raw_dir:
-                    if raw_mgmt or raw_macro:
-                        raise ValueError(f"{line_ref}: Estructura rota. Ha definido Gerencia/Proyecto pero falta la 'Dirección' (Padre Supremo).")
-                    continue # Si toda la fila está vacía, saltamos
-
-                # Caso 2: Tiene Proyecto, pero no tiene Gerencia
-                if raw_macro and not raw_mgmt:
-                    raise ValueError(f"{line_ref}: Estructura rota. Quiere crear el Proyecto '{raw_macro}' pero falta la 'Gerencia' (Padre).")
+                    continue
 
                 # -----------------------------------------------
 

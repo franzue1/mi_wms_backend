@@ -13,6 +13,8 @@ from fastapi.responses import StreamingResponse, Response
 import asyncio
 from collections import defaultdict
 from app.security import TokenData, verify_company_access
+from app.services.picking_service import PickingService
+from app.exceptions import ValidationError, BusinessRuleError, NotFoundError
 
 # Matriz de Validación de Importación: { "Nombre Operación": (Categorías Origen, Categorías Destino) }
 IMPORT_LOGIC_RULES = {
@@ -101,20 +103,26 @@ class MoveQuantityUpdate(BaseModel):
 # --- Helper de Filtros ---
 
 def _build_picking_filters(type_code: str, filters_in: dict):
-    filter_map = {
-        'name': 'p.name', 'purchase_order': 'p.purchase_order', 'project_name': 'project_name',
-        'src_path': 'src_path_display', 'dest_path': 'dest_path_display',
-        'warehouse_src_name': 'w_src.name', 'warehouse_dest_name': 'w_dest.name',
-        'state': 'p.state', 'custom_operation_type': 'p.custom_operation_type',
-        'partner_ref': 'p.partner_ref', 'responsible_user': 'p.responsible_user',
-        'date_transfer_from': 'date_transfer_from', 'date_transfer_to': 'date_transfer_to',
-        'employee_name': 'employee_name'
-    }
-    clean_filters = {}
-    for api_key, db_key in filter_map.items():
-        if filters_in.get(api_key):
-            clean_filters[db_key] = filters_in[api_key]
-    return clean_filters
+    """
+    Construye filtros para la consulta de pickings.
+    Usa PickingService.build_picking_filter_dict para normalización.
+    """
+    return PickingService.build_picking_filter_dict(
+        state=filters_in.get('state'),
+        name=filters_in.get('name'),
+        partner_ref=filters_in.get('partner_ref'),
+        custom_operation_type=filters_in.get('custom_operation_type'),
+        purchase_order=filters_in.get('purchase_order'),
+        responsible_user=filters_in.get('responsible_user'),
+        project_name=filters_in.get('project_name'),
+        employee_name=filters_in.get('employee_name'),
+        date_transfer_from=filters_in.get('date_transfer_from'),
+        date_transfer_to=filters_in.get('date_transfer_to'),
+        src_path_display=filters_in.get('src_path'),
+        dest_path_display=filters_in.get('dest_path'),
+        warehouse_src_name=filters_in.get('warehouse_src_name'),
+        warehouse_dest_name=filters_in.get('warehouse_dest_name'),
+    )
 
 # --- 1. Endpoints Fijos / Listas (Primero) ---
 
@@ -1009,51 +1017,76 @@ async def get_picking_serials(picking_id: int, auth: AuthDependency):
 
 @router.post("/{picking_id}/mark-ready", status_code=200)
 async def mark_picking_ready(picking_id: int, auth: AuthDependency):
-    # --- [CAMBIO DE PERMISO] ---
-    # Ahora requiere un permiso específico, separado de editar y validar.
+    """ Marca el picking como 'listo' y reserva el stock. """
     if "operations.can_mark_ready" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tienes permiso para reservar stock (Marcar como Listo).")
-    # ---------------------------
-    
+
     try:
-        # ... (el resto de la lógica sigue igual: db.mark_picking_as_ready...)
         db.mark_picking_as_ready(picking_id)
         return {"message": "Albarán marcado como 'listo'. Stock reservado correctamente."}
 
+    except ValidationError as ve:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=ve.message)
+    except BusinessRuleError as bre:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=bre.message)
     except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error interno: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error interno: {e}")
 
 @router.post("/{picking_id}/validate", status_code=200)
 async def validate_picking(picking_id: int, tracking_data: schemas.ValidateRequest, auth: AuthDependency):
+    """ Valida el picking y ejecuta el movimiento de stock. """
     if "operations.can_validate" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
-    success, message = db.process_picking_validation(picking_id, tracking_data.moves_with_tracking)
-    if not success:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
-    return {"message": message}
+
+    try:
+        success, message = db.process_picking_validation(picking_id, tracking_data.moves_with_tracking)
+        if not success:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
+        return {"message": message}
+    except ValidationError as ve:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=ve.message)
+    except BusinessRuleError as bre:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=bre.message)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al validar: {e}")
 
 @router.post("/{picking_id}/return-to-draft", status_code=200)
 async def return_picking_to_draft(picking_id: int, auth: AuthDependency):
-    # Antes verificaba 'can_edit', ahora requiere el permiso específico.
+    """ Regresa el picking a estado borrador (draft). """
     if "operations.can_reset_to_draft" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tienes permiso para revertir operaciones.")
-    success, message = db.return_picking_to_draft(picking_id)
-    if not success:
-        raise HTTPException(status_code=400, detail=message)
-    return {"message": message}
+
+    try:
+        success, message = db.return_picking_to_draft(picking_id)
+        if not success:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
+        return {"message": message}
+    except BusinessRuleError as bre:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=bre.message)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al revertir: {e}")
 
 @router.delete("/{picking_id}", status_code=200)
 async def cancel_picking(picking_id: int, auth: AuthDependency):
     """ Cancela un albarán (pasa a estado 'cancelled'). """
-    if "operations.can_edit" not in auth.permissions: # Asumimos que editar permite cancelar
+    if "operations.can_edit" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
-    success, message = db.cancel_picking(picking_id)
-    if not success:
-        raise HTTPException(status_code=400, detail=message)
-    return {"message": message}
+
+    try:
+        success, message = db.cancel_picking(picking_id)
+        if not success:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
+        return {"message": message}
+    except BusinessRuleError as bre:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=bre.message)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al cancelar: {e}")
 
 @router.put("/{picking_id}/header", status_code=200)
 async def update_picking_header(picking_id: int, data: PickingHeaderUpdate, auth: AuthDependency):

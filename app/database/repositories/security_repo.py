@@ -1,4 +1,8 @@
 #backend/app/database/repositories/security_repo.py
+"""
+Repositorio de Seguridad.
+Contiene solo operaciones SQL puras. La lógica de negocio está en AuthService.
+"""
 
 import hashlib
 import traceback
@@ -6,57 +10,96 @@ import psycopg2.extras
 from ..core import get_db_connection, return_db_connection, execute_query, execute_commit_query
 from ..utils import _create_warehouse_with_cursor
 
+
+# =============================================================================
+# FUNCIONES LEGACY - Mantener por compatibilidad, usar AuthService preferentemente
+# =============================================================================
+
 def hash_password(password):
-    """Genera un hash SHA-256 para la contraseña."""
+    """
+    LEGACY: Genera un hash SHA-256 para la contraseña.
+    Preferir AuthService.hash_password_sha256() para nuevo código.
+    """
     return hashlib.sha256(password.encode('utf-8')).hexdigest()
 
+
 def check_password(hashed_password, plain_password):
-    """Verifica si la contraseña coincide con el hash."""
+    """
+    LEGACY: Verifica si la contraseña coincide con el hash.
+    Preferir AuthService.verify_password() para nuevo código.
+    """
     return hashed_password == hash_password(plain_password)
+
+
+# =============================================================================
+# FUNCIONES SQL PURAS PARA AUTENTICACIÓN
+# =============================================================================
+
+def get_user_for_auth(username: str):
+    """
+    Obtiene datos del usuario para autenticación (SQL puro).
+    NO verifica contraseña - eso es responsabilidad del servicio.
+
+    Returns:
+        dict o None: Datos del usuario con rol, o None si no existe
+    """
+    query = """
+        SELECT u.*, r.name as role_name
+        FROM users u
+        LEFT JOIN roles r ON u.role_id = r.id
+        WHERE u.username = %s
+    """
+    return execute_query(query, (username,), fetchone=True)
+
+
+def get_permissions_by_role_id(role_id: int):
+    """
+    Obtiene los permisos de un rol (SQL puro).
+
+    Returns:
+        set: Conjunto de claves de permisos
+    """
+    permissions = execute_query(
+        """SELECT p.key
+           FROM role_permissions rp
+           JOIN permissions p ON rp.permission_id = p.id
+           WHERE rp.role_id = %s""",
+        (role_id,),
+        fetchall=True
+    )
+    return {perm['key'] for perm in permissions}
+
 
 def validate_user_and_get_permissions(username, plain_password):
     """
-    Valida al usuario y devuelve sus detalles (INCLUYENDO EL NOMBRE DEL ROL).
+    Valida al usuario y devuelve sus detalles.
+    NOTA: Esta función se mantiene por compatibilidad.
+    Para nuevo código, usar get_user_for_auth + AuthService.verify_password.
     """
+    from app.services.auth_service import AuthService
+
     try:
-        query = """
-            SELECT u.*, r.name as role_name 
-            FROM users u
-            LEFT JOIN roles r ON u.role_id = r.id
-            WHERE u.username = %s
-        """
-        user = execute_query(query, (username,), fetchone=True)
-        # --------------------------------------------------------------------
-        
+        user = get_user_for_auth(username)
+
         if not user:
             print(f"[AUTH] Fallo: Usuario '{username}' no encontrado.")
-            return None, None 
-        
+            return None, None
+
         if not user['is_active']:
             print(f"[AUTH] Fallo: Usuario '{username}' está inactivo.")
-            return None, None 
+            return None, None
 
-        # Verificar contraseña
-        if not check_password(user['hashed_password'], plain_password):
+        # Usar AuthService para verificar contraseña (soporta SHA-256 y BCrypt)
+        if not AuthService.verify_password(plain_password, user['hashed_password']):
             print(f"[AUTH] Fallo: Contraseña incorrecta para '{username}'.")
-            return None, None 
-        
+            return None, None
+
         # ¡Éxito!
         print(f"[AUTH] Éxito: Usuario '{username}' (Rol: {user['role_name']}) validado.")
-        user_data = dict(user) # Ahora user_data tiene 'role_name'
-        role_id = user_data['role_id']
-        
-        permissions = execute_query(
-            """SELECT p.key
-               FROM role_permissions rp
-               JOIN permissions p ON rp.permission_id = p.id
-               WHERE rp.role_id = %s""",
-            (role_id,),
-            fetchall=True
-        )
-        
-        permissions_set = {perm['key'] for perm in permissions}
-        
+        user_data = dict(user)
+
+        permissions_set = get_permissions_by_role_id(user_data['role_id'])
+
         return user_data, permissions_set
 
     except Exception as e:
@@ -67,57 +110,59 @@ def validate_user_and_get_permissions(username, plain_password):
 def create_user(username, plain_password, full_name, role_id, company_ids=None, warehouse_ids=None):
     """
     Crea un usuario y asigna sus compañías permitidas.
-    """
-    if not username or not plain_password or not full_name or not role_id:
-        raise ValueError("Todos los campos son obligatorios.")
+    La validación de datos debe hacerse en AdminService antes de llamar aquí.
 
+    Args:
+        username: Nombre de usuario (ya validado)
+        plain_password: Contraseña en texto plano (será hasheada aquí por compatibilidad)
+        full_name: Nombre completo
+        role_id: ID del rol
+        company_ids: Lista de IDs de compañías
+        warehouse_ids: Lista de IDs de almacenes
+    """
     conn = None
     try:
         conn = get_db_connection()
         conn.cursor_factory = psycopg2.extras.DictCursor
 
         with conn.cursor() as cursor:
-            # 1. Hashear contraseña
+            # Hashear contraseña usando SHA-256 (compatibilidad)
             hashed_pass = hash_password(plain_password)
 
-            # 2. Insertar Usuario
-            # [CAMBIO] Insertamos must_change_password = TRUE implícitamente o explícitamente
+            # Insertar Usuario
             query_user = """
                 INSERT INTO users (username, hashed_password, full_name, role_id, is_active, must_change_password)
-                VALUES (%s, %s, %s, %s, 1, TRUE) 
+                VALUES (%s, %s, %s, %s, 1, TRUE)
                 RETURNING id
             """
             cursor.execute(query_user, (username, hashed_pass, full_name, role_id))
             new_id_row = cursor.fetchone()
-            
+
             if not new_id_row:
                 raise Exception("No se pudo obtener el ID del nuevo usuario.")
-            
+
             new_user_id = new_id_row['id']
 
-            # 3. Insertar Relación con Compañías (Si hay)
+            # Insertar Relación con Compañías
             if company_ids and isinstance(company_ids, list) and len(company_ids) > 0:
-                # Preparamos los datos: [(user_id, 1), (user_id, 2), ...]
                 values = [(new_user_id, int(c_id)) for c_id in company_ids]
-                
                 query_rel = "INSERT INTO user_companies (user_id, company_id) VALUES (%s, %s)"
                 cursor.executemany(query_rel, values)
                 print(f" -> Asignadas {len(values)} compañías al usuario {username}.")
 
-            # 4. [NUEVO] Insertar Relación con Almacenes
+            # Insertar Relación con Almacenes
             if warehouse_ids and isinstance(warehouse_ids, list) and len(warehouse_ids) > 0:
                 values = [(new_user_id, int(w_id)) for w_id in warehouse_ids]
                 query_wh = "INSERT INTO user_warehouses (user_id, warehouse_id) VALUES (%s, %s)"
                 cursor.executemany(query_wh, values)
                 print(f" -> Asignados {len(values)} almacenes al usuario {username}.")
 
-            # 5. Confirmar todo
             conn.commit()
             return new_user_id
 
     except Exception as e:
-        if conn: conn.rollback() # Revertir si falla algo
-        if "users_username_key" in str(e): 
+        if conn: conn.rollback()
+        if "users_username_key" in str(e):
             raise ValueError(f"El nombre de usuario '{username}' ya existe.")
         raise e
     finally:
@@ -125,11 +170,18 @@ def create_user(username, plain_password, full_name, role_id, company_ids=None, 
 
 def update_user(user_id, full_name, role_id, is_active, new_password=None, company_ids=None, warehouse_ids=None):
     """
-    Actualiza datos del usuario y sus compañías.
-    Si 'company_ids' es None, no se tocan las compañías.
-    Si 'company_ids' es [], se le quitan todas las compañías.
-    """
+    Actualiza datos del usuario y sus compañías (SQL puro).
+    La validación debe hacerse en AdminService antes de llamar aquí.
 
+    Args:
+        user_id: ID del usuario a actualizar
+        full_name: Nuevo nombre completo
+        role_id: Nuevo ID de rol
+        is_active: Estado activo
+        new_password: Nueva contraseña en texto plano (opcional)
+        company_ids: Lista de IDs de compañías (None = no cambiar, [] = quitar todas)
+        warehouse_ids: Lista de IDs de almacenes (None = no cambiar)
+    """
     conn = None
 
     try:
@@ -137,33 +189,29 @@ def update_user(user_id, full_name, role_id, is_active, new_password=None, compa
         conn.cursor_factory = psycopg2.extras.DictCursor
 
         with conn.cursor() as cursor:
-            # 1. Actualizar datos básicos
+            # Actualizar datos básicos
             if new_password:
                 hashed_pass = hash_password(new_password)
-                # [CAMBIO] Si se cambia la password aquí (reset administrativo), activamos must_change_password = TRUE
                 query = """
-                    UPDATE users 
-                    SET full_name = %s, role_id = %s, is_active = %s, hashed_password = %s, must_change_password = TRUE 
+                    UPDATE users
+                    SET full_name = %s, role_id = %s, is_active = %s,
+                        hashed_password = %s, must_change_password = TRUE
                     WHERE id = %s
                 """
                 params = (full_name, role_id, int(is_active), hashed_pass, user_id)
-
                 cursor.execute(query, params)
                 print(f"[DB-RBAC] Usuario {user_id} actualizado (CON nueva contraseña).")
-        
             else:
                 query = """
-                    UPDATE users 
-                    SET full_name = %s, role_id = %s, is_active = %s 
+                    UPDATE users
+                    SET full_name = %s, role_id = %s, is_active = %s
                     WHERE id = %s
                 """
-                # --- ¡CORRECCIÓN AQUÍ TAMBIÉN! ---
                 params = (full_name, role_id, int(is_active), user_id)
-                
                 cursor.execute(query, params)
                 print(f"[DB-RBAC] Usuario {user_id} actualizado (SIN nueva contraseña).")
 
-            # 2. Actualizar Compañías
+            # Actualizar Compañías
             if company_ids is not None:
                 cursor.execute("DELETE FROM user_companies WHERE user_id = %s", (user_id,))
                 if company_ids:
@@ -171,7 +219,7 @@ def update_user(user_id, full_name, role_id, is_active, new_password=None, compa
                     query_rel = "INSERT INTO user_companies (user_id, company_id) VALUES (%s, %s)"
                     cursor.executemany(query_rel, values)
 
-            # 3. [NUEVO] Actualizar Almacenes
+            # Actualizar Almacenes
             if warehouse_ids is not None:
                 cursor.execute("DELETE FROM user_warehouses WHERE user_id = %s", (user_id,))
                 if warehouse_ids:
@@ -546,7 +594,12 @@ def get_companies():
 
 def change_own_password(user_id: int, new_password: str):
     """
-    Permite al usuario cambiar su propia contraseña y DESACTIVA el flag de cambio obligatorio.
+    Permite al usuario cambiar su propia contraseña (SQL puro).
+    La validación de la contraseña debe hacerse en AuthService.
+
+    Args:
+        user_id: ID del usuario
+        new_password: Nueva contraseña en texto plano (será hasheada aquí)
     """
     conn = None
     try:
@@ -554,8 +607,8 @@ def change_own_password(user_id: int, new_password: str):
         hashed_pass = hash_password(new_password)
         with conn.cursor() as cursor:
             cursor.execute("""
-                UPDATE users 
-                SET hashed_password = %s, must_change_password = FALSE 
+                UPDATE users
+                SET hashed_password = %s, must_change_password = FALSE
                 WHERE id = %s
             """, (hashed_pass, user_id))
             conn.commit()

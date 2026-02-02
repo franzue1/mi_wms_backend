@@ -4,8 +4,9 @@ from typing import List, Optional, Annotated
 from app import database as db
 from app import schemas, security
 from app.security import TokenData
-import csv
-import io
+from app.services.project_service import ProjectService
+from app.exceptions import ValidationError, NotFoundError, BusinessRuleError, DuplicateError
+import traceback
 from fastapi.responses import StreamingResponse
 
 router = APIRouter()
@@ -38,19 +39,29 @@ def get_directions(auth: AuthDependency, company_id: int = Query(...)):
 
 @router.post("/directions", status_code=201)
 def create_direction(auth: AuthDependency, data: schemas.DirectionCreate, company_id: int = Query(...)):
-    verify_access(auth, company_id) # <--- BLINDAJE
+    verify_access(auth, company_id)
     try:
-        new_id = db.create_direction(company_id, data.name, data.code)
+        # Validar y normalizar usando el servicio
+        clean_name, clean_code = ProjectService.validate_direction_data(data.name, data.code)
+        new_id = db.create_direction(company_id, clean_name, clean_code)
         return {"id": new_id}
-    except ValueError as e: raise HTTPException(400, detail=str(e))
+    except ValidationError as ve:
+        raise HTTPException(400, detail=ve.message)
+    except ValueError as e:
+        raise HTTPException(400, detail=str(e))
 
 @router.put("/directions/{item_id}")
 def update_direction(item_id: int, data: schemas.DirectionCreate, auth: AuthDependency, company_id: int = Query(...)):
     verify_access(auth, company_id)
     try:
-        db.update_direction(item_id, data.name, data.code)
+        # Validar y normalizar usando el servicio
+        clean_name, clean_code = ProjectService.validate_direction_data(data.name, data.code)
+        db.update_direction(item_id, clean_name, clean_code)
         return {"message": "Actualizado"}
-    except ValueError as e: raise HTTPException(400, detail=str(e))
+    except ValidationError as ve:
+        raise HTTPException(400, detail=ve.message)
+    except ValueError as e:
+        raise HTTPException(400, detail=str(e))
 
 @router.delete("/directions/{item_id}")
 def delete_direction(item_id: int, auth: AuthDependency, company_id: int = Query(...)):
@@ -68,19 +79,33 @@ def get_managements(auth: AuthDependency, company_id: int = Query(...), directio
 
 @router.post("/managements", status_code=201)
 def create_management(auth: AuthDependency, data: schemas.ManagementCreate, company_id: int = Query(...)):
-    verify_access(auth, company_id) # <--- BLINDAJE
+    verify_access(auth, company_id)
     try:
-        new_id = db.create_management(company_id, data.name, data.direction_id, data.code)
+        # Validar y normalizar usando el servicio
+        clean_name, clean_code = ProjectService.validate_management_data(
+            data.name, data.direction_id, data.code
+        )
+        new_id = db.create_management(company_id, clean_name, data.direction_id, clean_code)
         return {"id": new_id}
-    except ValueError as e: raise HTTPException(400, detail=str(e))
+    except ValidationError as ve:
+        raise HTTPException(400, detail=ve.message)
+    except ValueError as e:
+        raise HTTPException(400, detail=str(e))
 
 @router.put("/managements/{item_id}")
 def update_management(item_id: int, data: schemas.ManagementCreate, auth: AuthDependency, company_id: int = Query(...)):
     verify_access(auth, company_id)
     try:
-        db.update_management(item_id, data.name, data.direction_id, data.code)
+        # Validar y normalizar usando el servicio
+        clean_name, clean_code = ProjectService.validate_management_data(
+            data.name, data.direction_id, data.code
+        )
+        db.update_management(item_id, clean_name, data.direction_id, clean_code)
         return {"message": "Actualizado"}
-    except ValueError as e: raise HTTPException(400, detail=str(e))
+    except ValidationError as ve:
+        raise HTTPException(400, detail=ve.message)
+    except ValueError as e:
+        raise HTTPException(400, detail=str(e))
 
 @router.delete("/managements/{item_id}")
 def delete_management(item_id: int, auth: AuthDependency, company_id: int = Query(...)):
@@ -98,33 +123,35 @@ def get_macro_projects(auth: AuthDependency, company_id: int = Query(...), manag
 
 @router.post("/macros", status_code=201)
 def create_macro_project(auth: AuthDependency, data: schemas.MacroProjectCreate, company_id: int = Query(...)):
-    verify_access(auth, company_id) 
+    verify_access(auth, company_id)
     try:
-        # [MODIFICADO] Pasamos data.cost_center al final
+        # Validar y normalizar usando el servicio
+        clean_name, clean_code, clean_cc = ProjectService.validate_macro_data(
+            data.name, data.management_id, data.code, data.cost_center
+        )
         new_id = db.create_macro_project(
-            company_id, 
-            data.name, 
-            data.management_id, 
-            data.code, 
-            data.cost_center
+            company_id, clean_name, data.management_id, clean_code, clean_cc
         )
         return {"id": new_id}
-    except ValueError as e: raise HTTPException(400, detail=str(e))
+    except ValidationError as ve:
+        raise HTTPException(400, detail=ve.message)
+    except ValueError as e:
+        raise HTTPException(400, detail=str(e))
 
 @router.put("/macros/{item_id}")
 def update_macro(item_id: int, data: schemas.MacroProjectCreate, auth: AuthDependency, company_id: int = Query(...)):
     verify_access(auth, company_id)
     try:
-        # [MODIFICADO] Pasamos data.cost_center al final
-        db.update_macro_project(
-            item_id, 
-            data.name, 
-            data.management_id, 
-            data.code, 
-            data.cost_center
+        # Validar y normalizar usando el servicio
+        clean_name, clean_code, clean_cc = ProjectService.validate_macro_data(
+            data.name, data.management_id, data.code, data.cost_center
         )
+        db.update_macro_project(item_id, clean_name, data.management_id, clean_code, clean_cc)
         return {"message": "Actualizado"}
-    except ValueError as e: raise HTTPException(400, detail=str(e))
+    except ValidationError as ve:
+        raise HTTPException(400, detail=ve.message)
+    except ValueError as e:
+        raise HTTPException(400, detail=str(e))
 
 @router.delete("/macros/{item_id}")
 def delete_macro(item_id: int, auth: AuthDependency, company_id: int = Query(...)):
@@ -217,13 +244,22 @@ def get_projects_count(
 def create_project(auth: AuthDependency, project: schemas.ProjectCreate, company_id: int = Query(...)):
     verify_access(auth, company_id)
     try:
-        # Pasamos todos los nuevos campos al repositorio
+        # Validar y normalizar usando el servicio
+        validated = ProjectService.validate_project_data(
+            name=project.name,
+            code=project.code,
+            macro_project_id=project.macro_project_id,
+            start_date=project.start_date,
+            end_date=project.end_date,
+            address=project.address
+        )
+
         new_id = db.create_project(
             company_id=company_id,
-            name=project.name,
+            name=validated['name'],
             macro_project_id=project.macro_project_id,
-            code=project.code,
-            address=project.address,
+            code=validated['code'],
+            address=validated['address'],
             department=project.department,
             province=project.province,
             district=project.district,
@@ -232,6 +268,8 @@ def create_project(auth: AuthDependency, project: schemas.ProjectCreate, company
             end_date=project.end_date
         )
         return {"id": new_id, "message": "Obra creada"}
+    except ValidationError as ve:
+        raise HTTPException(status_code=400, detail=ve.message)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -259,59 +297,32 @@ def delete_project(auth: AuthDependency, project_id: int):
 
 @router.get("/export/csv", response_class=StreamingResponse)
 async def export_projects_csv(auth: AuthDependency, company_id: int = Query(...)):
+    """
+    Genera y transmite un archivo CSV de las Obras/Proyectos.
+    Usa ProjectService para generación de CSV.
+    """
     verify_access(auth, company_id)
-    
+
     try:
-        # 1. Obtener datos (reusamos la función existente corregida)
-        projects = db.get_projects(company_id, limit=999999) 
-        
-        # 2. Generar CSV
-        output = io.StringIO(newline='')
-        # Usamos lineterminator='\n' para compatibilidad total Excel/Windows
-        writer = csv.writer(output, delimiter=';', lineterminator='\n')
-        
-        # Headers [MEJORADOS]
-        headers = [
-            "Código PEP", "Nombre de Obra", 
-            "Dirección", "Gerencia", "Proyecto (Macro)", # <--- JERARQUÍA COMPLETA
-            "Estado", "Fase", 
-            "Dirección Física", "Departamento", "Provincia", "Distrito",
-            "Presupuesto (S/)", "Inicio", "Fin", 
-            "En Custodia (S/)", "Liquidado (S/)"
-        ]
-        writer.writerow(headers)
-        
-        # Rows
-        for p in projects:
-            row = [
-                p.get('code') or "",
-                p.get('name'),
-                p.get('direction_name') or "",   # <--- Nuevo
-                p.get('management_name') or "",  # <--- Nuevo
-                p.get('macro_name') or "",
-                p.get('status'),
-                p.get('phase'),
-                p.get('address') or "",
-                p.get('department') or "",
-                p.get('province') or "",
-                p.get('district') or "",
-                f"{float(p.get('budget', 0)):.2f}".replace('.', ','), # Formato decimal Excel (coma)
-                p.get('start_date') or "",
-                p.get('end_date') or "",
-                f"{float(p.get('stock_value', 0)):.2f}".replace('.', ','),      # Formato decimal Excel
-                f"{float(p.get('liquidated_value', 0)):.2f}".replace('.', ',')  # Formato decimal Excel
-            ]
-            writer.writerow(row)
-            
-        output.seek(0)
-        
+        # 1. Obtener datos del repositorio
+        projects = db.get_projects(company_id, limit=999999)
+
+        if not projects:
+            raise NotFoundError("No hay datos para exportar", "EXPORT_NO_DATA")
+
+        # 2. Usar el servicio para generar el CSV
+        csv_content = ProjectService.generate_projects_csv_content(projects)
+
         return StreamingResponse(
-            iter([output.getvalue()]),
+            iter([csv_content]),
             media_type="text/csv",
             headers={"Content-Disposition": "attachment; filename=Reporte_Obras_Completo.csv"}
         )
-        
+
+    except NotFoundError as nfe:
+        raise HTTPException(status_code=404, detail=nfe.message)
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(500, detail=f"Error exportando: {e}")
 
 @router.get("/hierarchy/export-flat", response_class=StreamingResponse)
@@ -321,57 +332,25 @@ async def export_hierarchy_flat(
 ):
     """
     Genera un CSV plano con la estructura completa.
-    [CORRECCIÓN DEFINITIVA] Usamos lineterminator='\n' para evitar el doble salto de línea
-    que genera filas en blanco en Excel/Windows.
+    Usa ProjectService para generación de CSV.
     """
     verify_access(auth, company_id)
-    
-    try:
-        # 1. Obtener datos
-        hierarchy_data = db.get_hierarchy_flat(company_id)
-        
-        # 2. Generar CSV
-        output = io.StringIO(newline='') 
-        
-        # [TRUCO] Forzamos '\n'. 
-        # Si usáramos el default, en algunos entornos se convierte en \r\r\n (doble salto).
-        # Al usar '\n', Excel lo lee bien y evitamos el salto extra.
-        writer = csv.writer(output, delimiter=';', lineterminator='\n') 
-        
-        # Headers
-        headers = [
-            "Dirección", "Cód. Dir", 
-            "Gerencia", "Cód. Ger", 
-            "Proyecto (Macro)", "Cód. Proy", "Centro de Costo"
-        ]
-        writer.writerow(headers)
-        
-        # Rows (con limpieza de datos para evitar saltos ocultos dentro del texto)
-        for row in hierarchy_data:
-            def clean(val):
-                # .strip() elimina espacios y saltos de línea (\n) al inicio/final del dato
-                return str(val).strip() if val else ""
 
-            writer.writerow([
-                clean(row.get('dir_name')),
-                clean(row.get('dir_code')),
-                clean(row.get('mgmt_name')),
-                clean(row.get('mgmt_code')),
-                clean(row.get('macro_name')),
-                clean(row.get('macro_code')),
-                clean(row.get('cost_center'))
-            ])
-            
-        output.seek(0)
-        
+    try:
+        # 1. Obtener datos del repositorio
+        hierarchy_data = db.get_hierarchy_flat(company_id)
+
+        # 2. Usar el servicio para generar el CSV
+        csv_content = ProjectService.generate_hierarchy_csv_content(hierarchy_data)
+
         return StreamingResponse(
-            iter([output.getvalue()]),
+            iter([csv_content]),
             media_type="text/csv",
             headers={"Content-Disposition": "attachment; filename=jerarquia_proyectos.csv"}
         )
-        
+
     except Exception as e:
-        print(f"Error exportando jerarquía: {e}")
+        traceback.print_exc()
         raise HTTPException(500, detail=f"Error exportando: {str(e)}")
 
 @router.post("/hierarchy/import-flat", response_model=dict)
@@ -382,73 +361,53 @@ async def import_hierarchy_flat(
 ):
     """
     Importa una estructura jerárquica desde un CSV plano.
-    Columnas esperadas: 
-    'Dirección', 'Cód. Dir', 'Gerencia', 'Cód. Ger', 'Proyecto (Macro)', 'Cód. Proy', 'Centro de Costo'
+    Usa ProjectService para parsing y validación.
     """
     verify_access(auth, company_id)
-    
+
     try:
         content = await file.read()
-        decoded = content.decode('utf-8-sig')
-        
-        # Detectar delimitador
-        first_line = decoded.split('\n')[0]
-        delimiter = ';' if ';' in first_line else ','
-        
-        reader = csv.DictReader(io.StringIO(decoded), delimiter=delimiter)
-        
-        # Normalizar headers (quitar tildes, espacios, lower)
-        # Mapeo flexible para que el usuario no sufra con nombres exactos
-        def normalize_header(h):
-            return h.lower().replace('ó', 'o').replace('é', 'e').replace('.', '').strip()
-            
-        header_map = {normalize_header(h): h for h in reader.fieldnames or []}
-        
-        # Mapeo de nuestras claves internas a las columnas del CSV
-        # Clave Interna : Posibles nombres en el CSV
-        key_mapping = {
-            'dir_name': ['direccion', 'direction', 'area'],
-            'dir_code': ['cod dir', 'cod direccion', 'codigo direccion'],
-            'mgmt_name': ['gerencia', 'management', 'departamento'],
-            'mgmt_code': ['cod ger', 'cod gerencia', 'codigo gerencia'],
-            'macro_name': ['proyecto (macro)', 'proyecto', 'macro', 'project'],
-            'macro_code': ['cod proy', 'cod proyecto', 'codigo proyecto'],
-            'cost_center': ['centro de costo', 'centro costo', 'ceco', 'cc']
-        }
-        
-        rows_to_process = []
-        
-        for row in reader:
-            clean_row = {}
-            for internal_key, possible_names in key_mapping.items():
-                # Buscar cuál columna del CSV coincide con esta clave
-                csv_col = next((header_map.get(poss) for poss in possible_names if poss in header_map), None)
-                if csv_col:
-                    clean_row[internal_key] = row.get(csv_col, "").strip()
-                else:
-                    clean_row[internal_key] = "" # Si no existe columna, vacío
-            
-            # Solo agregar si al menos tiene Dirección (es la raíz obligatoria)
-            if clean_row.get('dir_name'):
-                rows_to_process.append(clean_row)
-                
-        if not rows_to_process:
-            raise ValueError("No se encontraron filas válidas con al menos una 'Dirección'.")
 
-        # Llamar al repo
+        # Usar el servicio para parsear el CSV
+        rows, headers = ProjectService.parse_csv_file(content)
+
+        # Resolver columnas del CSV
+        resolved_cols = ProjectService.resolve_csv_columns(
+            headers,
+            ProjectService.HIERARCHY_HEADER_MAPPING
+        )
+
+        rows_to_process = []
+        for i, row in enumerate(rows):
+            line_num = i + 2
+            try:
+                processed = ProjectService.process_hierarchy_row(row, resolved_cols, line_num)
+                # Solo agregar si al menos tiene Dirección
+                if processed and processed.get('dir_name'):
+                    rows_to_process.append(processed)
+            except ValidationError as ve:
+                raise HTTPException(status_code=400, detail=ve.message)
+
+        if not rows_to_process:
+            raise ValidationError(
+                "No se encontraron filas válidas con al menos una 'Dirección'.",
+                "CSV_EMPTY_FILE"
+            )
+
+        # Llamar al repositorio
         stats = db.import_hierarchy_batch(company_id, rows_to_process)
-        
+
         return {
             "message": "Importación completada con éxito",
             "stats": stats
         }
 
+    except ValidationError as ve:
+        raise HTTPException(status_code=400, detail=ve.message)
     except ValueError as ve:
-        # [CORRECCIÓN] Capturamos los errores de validación del repo y devolvemos 400
         raise HTTPException(status_code=400, detail=str(ve))
-        
     except Exception as e:
-        import traceback; traceback.print_exc()
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error crítico en importación: {str(e)}")
 
 @router.post("/import/csv", response_model=dict)
@@ -457,158 +416,71 @@ async def import_projects_csv(
     company_id: int = Query(...),
     file: UploadFile = File(...)
 ):
+    """
+    Importa Obras desde CSV.
+    Usa ProjectService para parsing y validación.
+    """
     verify_access(auth, company_id)
-    
+
     try:
         content = await file.read()
-        decoded = content.decode('utf-8-sig')
-        
-        # 1. Detectar delimitador
-        first_line = decoded.split('\n')[0]
-        delimiter = ';' if ';' in first_line else ','
-        
-        reader = csv.DictReader(io.StringIO(decoded), delimiter=delimiter)
-        rows = list(reader)
-        
-        if not rows: raise ValueError("El archivo CSV está vacío.")
-        
-        # Mapa de headers del CSV: { "nombre de obra": "Nombre de Obra", ... }
-        headers_map = {h.strip().lower(): h for h in reader.fieldnames or []}
-        
-        # --- [MEJORA] DICCIONARIO DE SINÓNIMOS ---
-        # Mapea nuestra clave interna -> Posibles nombres en el CSV
-        KEY_MAPPING = {
-            'name': ['name', 'nombre', 'nombre de obra', 'obra', 'proyecto'],
-            'code': ['code', 'codigo', 'código', 'codigo pep', 'pep', 'id pep', 'código pep'],
-            'macro_name': ['macro_name', 'macro', 'proyecto (macro)', 'macro proyecto', 'contrato marco'],
-            'status': ['status', 'estado'],
-            'phase': ['phase', 'fase', 'etapa'],
-            'address': ['address', 'direccion', 'dirección', 'direccion fisica', 'ubicacion'],
-            'department': ['department', 'departamento', 'dpto', 'dpto.'],
-            'province': ['province', 'provincia', 'prov', 'prov.'],
-            'district': ['district', 'distrito', 'dist'],
-            'budget': ['budget', 'presupuesto', 'presupuesto (s/)', 'monto'],
-            'start_date': ['start_date', 'inicio', 'f. inicio', 'fecha inicio'],
-            'end_date': ['end_date', 'fin', 'f. fin', 'fecha fin', 'termino']
-        }
 
-        # Resolver qué columna del CSV corresponde a cada clave interna
-        resolved_cols = {}
-        for internal_key, synonyms in KEY_MAPPING.items():
-            # Buscamos si algún sinónimo existe en los headers del CSV
-            match = next((h for h in synonyms if h in headers_map), None)
-            if match:
-                resolved_cols[internal_key] = headers_map[match]
+        # Usar el servicio para parsear el CSV
+        rows, headers = ProjectService.parse_csv_file(content)
 
-        # ----------------------------------------
-        
+        # Resolver columnas del CSV
+        resolved_cols = ProjectService.resolve_csv_columns(
+            headers,
+            ProjectService.PROJECT_HEADER_MAPPING
+        )
+
+        # Obtener mapa de Macro Proyectos para validación
         macros_db = db.get_macro_projects(company_id)
         macros_map = {m['name'].strip().upper(): m['id'] for m in macros_db}
-        
+
         validation_errors = []
         valid_rows_to_process = []
-        
-        # --- HELPER DE FECHAS (ESTRICTO) ---
-        def parse_date_strict(date_str, field_name):
-            if not date_str or not date_str.strip(): return None 
-            d = date_str.strip()
-            if "-" in d: # 2025-12-31
-                parts = d.split("-")
-                if len(parts) == 3 and len(parts[0]) == 4: return d
-            if "/" in d: # 31/12/2025
-                parts = d.split("/")
-                if len(parts) == 3: return f"{parts[2]}-{parts[1]}-{parts[0]}"
-            raise ValueError(f"Fecha inválida en '{field_name}': '{d}'. Use YYYY-MM-DD o DD/MM/YYYY")
 
-        # --- FASE 1: VALIDACIÓN ---
+        # FASE 1: VALIDACIÓN
         for i, row in enumerate(rows):
             line_num = i + 2
-            
-            # Helper para sacar valor usando el mapa resuelto
-            def get_val(internal_key):
-                csv_header = resolved_cols.get(internal_key)
-                return row.get(csv_header, '').strip() if csv_header else ''
-
             try:
-                # 1. Validar Nombre
-                name = get_val('name')
-                if not name:
-                    if not any(row.values()): continue # Saltar filas vacías
-                    raise ValueError("El campo 'Nombre de Obra' es obligatorio.")
-
-                # 2. Código PEP
-                code_val = get_val('code')
-                if not code_val:
-                    raise ValueError(f"El 'Código PEP' es obligatorio para la obra '{name}'.")
-                
-                import re
-                if not re.match(r"^[a-zA-Z0-9_./-]*$", code_val):
-                     raise ValueError(f"El Código PEP '{code_val}' contiene caracteres inválidos.")
-
-                # 3. Validar Proyecto (Macro)
-                macro_name_raw = get_val('macro_name')
-                macro_id = None
-                
-                if not macro_name_raw:
-                    # Intento fallback: A veces el usuario pone el nombre del proyecto en otra columna
-                    raise ValueError(f"El campo 'Proyecto (Macro)' es obligatorio para la obra '{name}'.")
-                
-                macro_clean = macro_name_raw.strip().upper()
-                if macro_clean not in macros_map:
-                    raise ValueError(f"El Proyecto '{macro_name_raw}' NO EXISTE en el sistema. Créelo primero en Jerarquía.")
-                
-                macro_id = macros_map[macro_clean]
-
-                # 4. Validar Fechas
-                final_start = parse_date_strict(get_val('start_date'), 'Inicio')
-                final_end = parse_date_strict(get_val('end_date'), 'Fin')
-
-                # 5. Validar Presupuesto
-                budget_str = get_val('budget').replace("S/", "").replace(",", "")
-                try:
-                    budget = float(budget_str) if budget_str else 0.0
-                except:
-                    raise ValueError(f"Presupuesto inválido: '{get_val('budget')}'")
-
-                valid_rows_to_process.append({
-                    "name": name,
-                    "code": code_val,
-                    "macro_project_id": macro_id,
-                    "address": get_val('address'),
-                    "status": get_val('status') or 'active',
-                    "phase": get_val('phase') or 'Sin Iniciar',
-                    "start_date": final_start,
-                    "end_date": final_end,
-                    "budget": budget,
-                    "department": get_val('department'),
-                    "province": get_val('province'),
-                    "district": get_val('district')
-                })
-
+                processed = ProjectService.process_project_row(
+                    row, resolved_cols, macros_map, line_num
+                )
+                if processed:
+                    valid_rows_to_process.append(processed)
+            except ValidationError as ve:
+                validation_errors.append(ve.message)
             except Exception as e:
                 validation_errors.append(f"Línea {line_num}: {str(e)}")
 
         if validation_errors:
             error_msg = "IMPORTACIÓN RECHAZADA (Errores encontrados):\n" + "\n".join(validation_errors[:10])
-            if len(validation_errors) > 10: error_msg += "\n... y más errores."
-            raise ValueError(error_msg)
+            if len(validation_errors) > 10:
+                error_msg += f"\n... y {len(validation_errors) - 10} errores más."
+            raise ValidationError(error_msg, "CSV_IMPORT_ERRORS")
 
-        # --- FASE 2: EJECUCIÓN ---
+        # FASE 2: EJECUCIÓN
         stats = {"created": 0, "updated": 0}
-        
+
         for data in valid_rows_to_process:
             res = db.upsert_project_from_import(
                 company_id=company_id,
                 **data
             )
-            if res == "created": stats['created'] += 1
-            else: stats['updated'] += 1
-            
+            if res == "created":
+                stats['created'] += 1
+            else:
+                stats['updated'] += 1
+
         return stats
 
+    except ValidationError as ve:
+        raise HTTPException(status_code=400, detail=ve.message)
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
-        import traceback; traceback.print_exc()
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error crítico: {str(e)}")
 

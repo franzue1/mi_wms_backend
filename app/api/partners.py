@@ -1,15 +1,13 @@
 # app/api/partners.py
 from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File
-from typing import List, Annotated, Optional, Dict
-from pydantic import BaseModel
-from datetime import date
+from typing import List, Annotated, Optional
 from app import database as db
 from app import schemas, security
 from app.security import TokenData
+from app.services.partner_service import PartnerService
+from app.exceptions import ValidationError, DuplicateError, NotFoundError
 import traceback
-import io # <-- AÑADIR
-import csv # <-- AÑADIR
-from fastapi.responses import StreamingResponse # <-- AÑADIR
+from fastapi.responses import StreamingResponse
 
 router = APIRouter()
 AuthDependency = Annotated[TokenData, Depends(security.get_current_user_data)]
@@ -20,8 +18,6 @@ async def get_all_partners(
     company_id: int = Query(...),
     skip: int = 0,
     limit: int = 100,
-    
-    # --- ¡PARÁMETROS DE FILTRO Y ORDEN AÑADIDOS! ---
     sort_by: Optional[str] = Query(None),
     ascending: bool = Query(True),
     name: Optional[str] = Query(None),
@@ -30,53 +26,52 @@ async def get_all_partners(
     address: Optional[str] = Query(None),
     category_name: Optional[str] = Query(None)
 ):
-    """ Obtiene una lista de socios (proveedores/clientes). """
+    """Obtiene una lista de socios (proveedores/clientes)."""
     if "partners.can_crud" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
-        
-    # 1. Construir dict de filtros
-    filters = {
-        "name": name, "ruc": ruc, "social_reason": social_reason,
-        "address": address, "category_name": category_name
-    }
-    # 2. Limpiar Nones
-    clean_filters = {k: v for k, v in filters.items() if v is not None and v != ""}
 
-    # 3. Llamar a la BD
+    # Usar PartnerService para construir filtros
+    clean_filters = PartnerService.build_filter_dict(
+        name=name,
+        ruc=ruc,
+        social_reason=social_reason,
+        address=address,
+        category_name=category_name
+    )
+
     partners_raw = db.get_partners_filtered_sorted(
-        company_id, 
+        company_id,
         filters=clean_filters,
-        sort_by=sort_by, 
-        ascending=ascending, 
-        limit=limit, 
+        sort_by=sort_by,
+        ascending=ascending,
+        limit=limit,
         offset=skip
     )
     return [dict(p) for p in partners_raw]
 
 
-# --- ¡NUEVO ENDPOINT DE CONTEO! ---
 @router.get("/count", response_model=int)
 async def get_partners_count(
     auth: AuthDependency,
     company_id: int = Query(...),
-    
-    # Mismos filtros que get_all_partners
     name: Optional[str] = Query(None),
     ruc: Optional[str] = Query(None),
     social_reason: Optional[str] = Query(None),
     address: Optional[str] = Query(None),
     category_name: Optional[str] = Query(None)
 ):
-    """ Obtiene el conteo total de socios para la paginación. """
+    """Obtiene el conteo total de socios para la paginación."""
     if "partners.can_crud" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
-    filters = {
-        "name": name, "ruc": ruc, "social_reason": social_reason,
-        "address": address, "category_name": category_name
-    }
-    clean_filters = {k: v for k, v in filters.items() if v is not None and v != ""}
-    
+    clean_filters = PartnerService.build_filter_dict(
+        name=name,
+        ruc=ruc,
+        social_reason=social_reason,
+        address=address,
+        category_name=category_name
+    )
+
     count = db.get_partners_count(company_id, filters=clean_filters)
     return count
 
@@ -97,23 +92,33 @@ async def create_partner(
     auth: AuthDependency,
     company_id: int = Query(...),
 ):
-    """ Crea un nuevo socio. """
+    """Crea un nuevo socio."""
     if "partners.can_crud" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
-    
+
+    # Usar PartnerService para preparar datos normalizados
+    prepared_data = PartnerService.prepare_partner_data(partner.dict())
+
     try:
         new_partner_id = db.create_partner(
-            name=partner.name, category_id=partner.category_id,
-            company_id=company_id, social_reason=partner.social_reason,
-            ruc=partner.ruc, email=partner.email,
-            phone=partner.phone, address=partner.address
+            name=prepared_data["name"],
+            category_id=prepared_data["category_id"],
+            company_id=company_id,
+            social_reason=prepared_data["social_reason"],
+            ruc=prepared_data["ruc"],
+            email=prepared_data["email"],
+            phone=prepared_data["phone"],
+            address=prepared_data["address"]
         )
         created_partner = db.get_partner_details_by_id(new_partner_id)
         return dict(created_partner)
-    except ValueError as ve:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
     except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error interno: {e}")
+        if "partners_company_id_name_key" in str(e):
+            raise DuplicateError(
+                f"Ya existe un proveedor/cliente con el nombre '{prepared_data['name']}'",
+                "PARTNER_DUPLICATE_NAME"
+            )
+        raise
 
 @router.put("/{partner_id}", response_model=schemas.PartnerResponse)
 async def update_partner(
@@ -121,31 +126,42 @@ async def update_partner(
     partner: schemas.PartnerUpdate,
     auth: AuthDependency
 ):
-    """ Actualiza un socio existente. """
+    """Actualiza un socio existente."""
     if "partners.can_crud" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
+    current_data = db.get_partner_details_by_id(partner_id)
+    if not current_data:
+        raise NotFoundError("Socio no encontrado", "PARTNER_NOT_FOUND")
+
+    # Merge datos actuales con los nuevos
+    update_data = dict(current_data)
+    update_data.update(partner.dict(exclude_unset=True))
+
+    # Usar PartnerService para normalizar
+    prepared_data = PartnerService.prepare_partner_data(update_data)
+
     try:
-        current_data = db.get_partner_details_by_id(partner_id)
-        if not current_data:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Socio no encontrado")
-        
-        update_data = current_data.copy()
-        update_data.update(partner.dict(exclude_unset=True))
-        
         db.update_partner(
-            partner_id=partner_id, name=update_data['name'],
-            category_id=update_data['category_id'], social_reason=update_data['social_reason'],
-            ruc=update_data['ruc'], email=update_data['email'],
-            phone=update_data['phone'], address=update_data['address']
+            partner_id=partner_id,
+            name=prepared_data["name"],
+            category_id=prepared_data["category_id"],
+            social_reason=prepared_data["social_reason"],
+            ruc=prepared_data["ruc"],
+            email=prepared_data["email"],
+            phone=prepared_data["phone"],
+            address=prepared_data["address"]
         )
-        
+
         updated_partner = db.get_partner_details_by_id(partner_id)
         return dict(updated_partner)
-    except ValueError as ve:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
     except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error interno: {e}")
+        if "partners_company_id_name_key" in str(e):
+            raise DuplicateError(
+                f"Ya existe otro proveedor/cliente con el nombre '{prepared_data['name']}'",
+                "PARTNER_DUPLICATE_NAME"
+            )
+        raise
 
 @router.delete("/{partner_id}", status_code=status.HTTP_200_OK)
 async def delete_partner(partner_id: int, auth: AuthDependency):
@@ -162,8 +178,6 @@ async def delete_partner(partner_id: int, auth: AuthDependency):
 async def export_partners_csv(
     auth: AuthDependency,
     company_id: int = Query(...),
-
-    # Reutilizamos los filtros de la vista principal
     sort_by: Optional[str] = Query(None),
     ascending: bool = Query(True),
     name: Optional[str] = Query(None),
@@ -172,120 +186,100 @@ async def export_partners_csv(
     address: Optional[str] = Query(None),
     category_name: Optional[str] = Query(None)
 ):
-    """ Genera y transmite un archivo CSV de los socios filtrados. """
+    """Genera y transmite un archivo CSV de los socios filtrados."""
     if "partners.can_crud" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
-    try:
-        filters = {"name": name, "ruc": ruc, "social_reason": social_reason, "address": address, "category_name": category_name}
-        clean_filters = {k: v for k, v in filters.items() if v is not None and v != ""}
+    clean_filters = PartnerService.build_filter_dict(
+        name=name,
+        ruc=ruc,
+        social_reason=social_reason,
+        address=address,
+        category_name=category_name
+    )
 
-        partners_raw = db.get_partners_filtered_sorted(
-            company_id, filters=clean_filters, sort_by=sort_by or 'id', 
-            ascending=ascending, limit=None, offset=None
-        )
+    partners_raw = db.get_partners_filtered_sorted(
+        company_id,
+        filters=clean_filters,
+        sort_by=sort_by or 'id',
+        ascending=ascending,
+        limit=None,
+        offset=None
+    )
 
-        if not partners_raw:
-            raise HTTPException(status_code=404, detail="No hay datos para exportar.")
+    if not partners_raw:
+        raise NotFoundError("No hay datos para exportar", "EXPORT_NO_DATA")
 
-        output = io.StringIO(newline='')
-        writer = csv.writer(output, delimiter=';')
+    # Usar PartnerService para generar CSV
+    csv_content = PartnerService.generate_csv_content(partners_raw)
 
-        headers = ["name", "category_name", "ruc", "social_reason", "address", "email", "phone"]
-        writer.writerow(headers)
-
-        for partner_row in partners_raw:
-            partner_dict = dict(partner_row)
-            writer.writerow([partner_dict.get(h, '') for h in headers])
-
-        output.seek(0)
-        return StreamingResponse(
-            iter([output.getvalue()]),
-            media_type="text/csv",
-            headers={"Content-Disposition": "attachment; filename=socios.csv"}
-        )
-
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error al generar CSV: {e}")
+    return StreamingResponse(
+        iter([csv_content]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=socios.csv"}
+    )
 
 @router.post("/import/csv", response_model=dict)
 async def import_partners_csv(
     auth: AuthDependency,
-    company_id: int = Query(...), # <-- 1. Haz que el company_id sea REQUERIDO
+    company_id: int = Query(...),
     file: UploadFile = File(...)
 ):
-    """ Importa socios (partners) desde un archivo CSV. """
+    """Importa socios (partners) desde un archivo CSV."""
     if "partners.can_crud" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
-    try:
-        content = await file.read()
-        content_decoded = content.decode('utf-8-sig')
-        file_io = io.StringIO(content_decoded)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error al leer el archivo: {e}")
+    # 1. Leer y parsear CSV usando PartnerService
+    content = await file.read()
+    rows, headers = PartnerService.parse_csv_file(content)
 
-    reader = csv.DictReader(file_io, delimiter=';')
-    try:
-        rows = list(reader)
-        if not rows: raise ValueError("El archivo CSV está vacío.")
+    # 2. Validar headers requeridos
+    PartnerService.validate_csv_headers(headers)
 
-        headers = {h.lower().strip() for h in reader.fieldnames or []}
-        required_headers = {"name", "category_name"} # Mínimos requeridos
+    # 3. Cargar categorías de BD y validar referencias
+    db_categories = db.get_partner_categories(company_id)
+    valid_category_names = {cat['name'] for cat in db_categories}
+    PartnerService.validate_csv_categories(rows, valid_category_names)
 
-        if not required_headers.issubset(headers):
-            missing = required_headers - headers
-            raise ValueError(f"Faltan columnas obligatorias: {', '.join(sorted(list(missing)))}")
+    # 4. Crear mapeo de categorías
+    cat_map = {cat['name']: cat['id'] for cat in db_categories}
 
-        # Validar categorías
-        all_db_categories = {cat['name'] for cat in db.get_partner_categories(company_id)}
-        invalid_categories = {row.get('category_name','').strip() for row in rows if row.get('category_name','').strip() and row.get('category_name','').strip() not in all_db_categories}
-        if invalid_categories:
-            raise ValueError(f"Las siguientes categorías no existen: {', '.join(sorted(list(invalid_categories)))}")        
-        cat_map = {cat['name']: cat['id'] for cat in db.get_partner_categories(company_id)}
+    # 5. Procesar filas
+    created, updated = 0, 0
+    error_list = []
 
-        created, updated = 0, 0
-        error_list = []
+    for i, row in enumerate(rows):
+        row_num = i + 2
+        try:
+            # Usar PartnerService para procesar y normalizar la fila
+            prepared = PartnerService.process_csv_row(row, row_num, cat_map)
 
-        for i, row in enumerate(rows):
-            row_num = i + 2
-            name = row.get('name', '').strip()
-            category_name = row.get('category_name', '').strip()
-
-            try:
-                if not name or not category_name:
-                    raise ValueError("name y category_name son obligatorios.")
-
-                category_id = cat_map.get(category_name)
-                if category_id is None:
-                    raise ValueError(f"Categoría '{category_name}' no encontrada (cache).")
-
-                result = db.upsert_partner_from_import(
-                    company_id=company_id, name=name, category_id=category_id,
-                    ruc=row.get('ruc', '').strip() or None,
-                    social_reason=row.get('social_reason', '').strip() or None,
-                    address=row.get('address', '').strip() or None,
-                    email=row.get('email', '').strip() or None,
-                    phone=row.get('phone', '').strip() or None
-                )
-
-                if result == "created": created += 1
-                elif result == "updated": updated += 1
-
-            except Exception as e:
-                error_list.append(f"Fila {row_num} (Nombre: {name}): {e}")
-
-        if error_list:
-            raise HTTPException(
-                status_code=400, 
-                detail="Importación fallida. Corrija los errores y reintente:\n- " + "\n- ".join(error_list)
+            result = db.upsert_partner_from_import(
+                company_id=company_id,
+                name=prepared["name"],
+                category_id=prepared["category_id"],
+                ruc=prepared["ruc"],
+                social_reason=prepared["social_reason"],
+                address=prepared["address"],
+                email=prepared["email"],
+                phone=prepared["phone"]
             )
 
-        return {"created": created, "updated": updated, "errors": 0}
+            if result == "created":
+                created += 1
+            elif result == "updated":
+                updated += 1
 
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error crítico al procesar CSV: {e}")
+        except ValidationError as ve:
+            error_list.append(ve.message)
+        except Exception as e:
+            error_list.append(f"Fila {row_num}: {e}")
+
+    if error_list:
+        raise ValidationError(
+            "Importación con errores:\n- " + "\n- ".join(error_list),
+            "CSV_IMPORT_ERRORS",
+            {"errors": error_list}
+        )
+
+    return {"created": created, "updated": updated, "errors": 0}

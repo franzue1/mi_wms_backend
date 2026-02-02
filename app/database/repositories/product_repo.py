@@ -58,27 +58,26 @@ def get_product_details_by_sku(sku, company_id):
 
 def create_product(name, sku, category_id, tracking, uom_id, company_id, ownership, standard_price):
     """
-    Crea un nuevo producto. [ESTRICTO] Fuerza mayúsculas en SKU y Nombre.
+    Crea un nuevo producto.
+    NOTA: Los datos deben venir ya normalizados desde el Service Layer.
     """
-    # Normalización Estricta
-    sku_upper = sku.strip().upper() if sku else None
-    name_upper = name.strip().upper() if name else None
-
     query = """
-        INSERT INTO products (name, sku, category_id, tracking, uom_id, company_id, ownership, standard_price) 
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s) 
+        INSERT INTO products (name, sku, category_id, tracking, uom_id, company_id, ownership, standard_price)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
     """
-    params = (name_upper, sku_upper, category_id, tracking, uom_id, company_id, ownership, standard_price)
+    params = (name, sku, category_id, tracking, uom_id, company_id, ownership, standard_price)
 
     try:
         result = execute_commit_query(query, params, fetchone=True)
-        if result: return result[0]
-        else: raise Exception("No se devolvió ID al crear producto.")
-            
+        if result:
+            return result[0]
+        else:
+            raise Exception("No se devolvió ID al crear producto.")
+
     except Exception as e:
         if "products_sku_key" in str(e):
-            raise ValueError(f"El SKU '{sku_upper}' ya existe.")
+            raise ValueError(f"El SKU '{sku}' ya existe.")
         else:
             print(f"Error DB [create_product]: {e}")
             traceback.print_exc()
@@ -86,25 +85,23 @@ def create_product(name, sku, category_id, tracking, uom_id, company_id, ownersh
 
 def update_product(product_id, name, sku, category_id, tracking, uom_id, ownership, standard_price):
     """
-    Actualiza un producto. [ESTRICTO] Fuerza mayúsculas en SKU y Nombre.
+    Actualiza un producto.
+    NOTA: Los datos deben venir ya normalizados desde el Service Layer.
     """
-    sku_upper = sku.strip().upper() if sku else None
-    name_upper = name.strip().upper() if name else None
-
     query = """
-        UPDATE products 
-        SET name = %s, sku = %s, category_id = %s, tracking = %s, 
-            uom_id = %s, ownership = %s, standard_price = %s 
+        UPDATE products
+        SET name = %s, sku = %s, category_id = %s, tracking = %s,
+            uom_id = %s, ownership = %s, standard_price = %s
         WHERE id = %s
     """
-    params = (name_upper, sku_upper, category_id, tracking, uom_id, ownership, standard_price, product_id)
+    params = (name, sku, category_id, tracking, uom_id, ownership, standard_price, product_id)
 
     try:
         execute_commit_query(query, params)
-        
+
     except Exception as e:
-        if "products_sku_key" in str(e): 
-            raise ValueError(f"El SKU '{sku_upper}' ya existe para otro producto.")
+        if "products_sku_key" in str(e):
+            raise ValueError(f"El SKU '{sku}' ya existe para otro producto.")
         else:
             raise e
 
@@ -262,20 +259,16 @@ def get_products_count(company_id, filters={}):
 def upsert_product_from_import(company_id, sku, name, category_id, uom_id, tracking, ownership, price):
     """
     Inserta o actualiza un producto (UPSERT).
-    [ESTRICTO] Normaliza a mayúsculas antes de guardar.
+    NOTA: Los datos deben venir ya normalizados desde el Service Layer.
     """
     conn = None
-    
-    # Normalización
-    sku_upper = sku.strip().upper() if sku else None
-    name_upper = name.strip().upper() if name else None
-    
+
     query = """
         INSERT INTO products (
             company_id, sku, name, category_id, uom_id, tracking, ownership, standard_price
-        ) 
+        )
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (company_id, sku) 
+        ON CONFLICT (company_id, sku)
         DO UPDATE SET
             name = EXCLUDED.name,
             category_id = EXCLUDED.category_id,
@@ -285,7 +278,7 @@ def upsert_product_from_import(company_id, sku, name, category_id, uom_id, track
             standard_price = EXCLUDED.standard_price
         RETURNING (xmax = 0) AS inserted
     """
-    params = (company_id, sku_upper, name_upper, category_id, uom_id, tracking, ownership, price)
+    params = (company_id, sku, name, category_id, uom_id, tracking, ownership, price)
 
     try:
         conn = get_db_connection()
@@ -293,17 +286,19 @@ def upsert_product_from_import(company_id, sku, name, category_id, uom_id, track
             cursor.execute(query, params)
             result = cursor.fetchone()
             was_inserted = result[0] if result else False
-            
+
             conn.commit()
             return "created" if was_inserted else "updated"
 
     except Exception as e:
-        if conn: conn.rollback()
-        print(f"Error procesando fila para SKU {sku_upper}: {e}")
+        if conn:
+            conn.rollback()
+        print(f"Error procesando fila para SKU {sku}: {e}")
         raise e
-        
+
     finally:
-        if conn: return_db_connection(conn)
+        if conn:
+            return_db_connection(conn)
 
 def search_storable_products_by_term(company_id: int, search_term: str):
     """
@@ -333,97 +328,39 @@ def search_storable_products_by_term(company_id: int, search_term: str):
         return []
     return [dict(row) for row in results_rows]  
 
-def process_sku_import_list(company_id: int, raw_text: str):
+def find_products_by_skus(company_id: int, skus: list):
     """
-    Parsea una lista de SKUs y cantidades, y los valida contra la BD.
-    Usa UNA sola consulta SQL para máxima eficiencia.
+    Busca productos almacenables por lista de SKUs (lowercase).
+    SQL PURO - La lógica de parsing está en el Service Layer.
+
+    Args:
+        company_id: ID de la compañía
+        skus: Lista de SKUs en lowercase
+
+    Returns:
+        Lista de productos encontrados
     """
-    parsed_lines = {} # Usamos un dict para agrupar SKUs duplicados
-    errors = []
-    
-    lines = raw_text.strip().split('\n')
-    
-    for i, line in enumerate(lines):
-        if not line.strip(): continue
-        
-        sku = ""
-        qty_str = "1"
-        
-        if '*' in line:
-            parts = line.split('*')
-            if len(parts) == 2:
-                sku = parts[0].strip().lower() # Normalizar a minúsculas
-                qty_str = parts[1].strip().replace(',', '.')
-            else:
-                errors.append(f"Línea {i+1}: Formato inválido (demasiados '*').")
-                continue
-        else:
-            sku = line.strip().lower() # Normalizar a minúsculas
-        
-        if not sku:
-            errors.append(f"Línea {i+1}: SKU vacío.")
-            continue
-            
-        try:
-            quantity = float(qty_str)
-            if quantity <= 0:
-                errors.append(f"Línea {i+1}: Cantidad debe ser positiva.")
-                continue
-        except (ValueError, TypeError):
-            errors.append(f"Línea {i+1}: Cantidad '{qty_str}' no es un número.")
-            continue
-            
-        # Agrupar cantidades por SKU
-        parsed_lines[sku] = parsed_lines.get(sku, 0) + quantity
+    if not skus:
+        return []
 
-    # --- Validación contra la Base de Datos ---
-    
-    if not parsed_lines:
-        return [], errors # No hay nada que buscar
-
-    # Obtenemos la lista de SKUs únicos a buscar
-    skus_to_find = list(parsed_lines.keys())
-    
-    # ¡Consulta SQL eficiente!
-    # Usamos "LOWER(pr.sku) = ANY(%(skus)s)" para usar un array de PostgreSQL
     sql_query = """
-        SELECT 
-            pr.id, pr.name, pr.sku, pr.tracking, pr.ownership, 
+        SELECT
+            pr.id, pr.name, pr.sku, pr.tracking, pr.ownership,
             pr.uom_id, pr.standard_price, u.name as uom_name
         FROM products pr
         LEFT JOIN uom u ON pr.uom_id = u.id
-        WHERE 
+        WHERE
             pr.company_id = %(company_id)s
             AND pr.type = 'storable'
-            AND LOWER(pr.sku) = ANY(%(skus)s); -- ¡Busca en un array!
+            AND LOWER(pr.sku) = ANY(%(skus)s)
     """
-    params = {"company_id": company_id, "skus": skus_to_find}
-    db_results = execute_query(sql_query, params, fetchall=True)
-    
-# Asegúrate de que db_results sea una lista vacía si es None
-    if db_results is None:
-        db_results = []
+    params = {"company_id": company_id, "skus": skus}
+    results = execute_query(sql_query, params, fetchall=True)
 
-    found_products_map = {row['sku'].lower(): row for row in db_results}
-    
-    # --- Construir la respuesta ---
-    final_found_list = []
-    
-    for sku_lower, total_qty in parsed_lines.items():
-        product_data = found_products_map.get(sku_lower)
-        
-        if product_data:
-            # Producto encontrado. Añadir la cantidad
-            # Esto es lo que Flet recibirá en 'found'
-            final_found_list.append({
-                "product": dict(product_data),  # <--- Esta es la corrección
-                "quantity": total_qty
-            })
-        else:
-            # Producto no encontrado
-            errors.append(f"SKU '{sku_lower}' no encontrado, inactivo o no almacenable.")
+    if results is None:
+        return []
 
-    return final_found_list, errors
+    return [dict(row) for row in results]
 
 # --- UNIDADES DE MEDIDA (UOM) - REFACTORIZADO PARA MULTI-COMPAÑÍA ---
 
