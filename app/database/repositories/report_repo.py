@@ -7,17 +7,22 @@ from ..core import get_db_connection, return_db_connection, execute_query
 # --- DASHBOARD & KPIs ---
 
 def get_dashboard_kpis(company_id):
+    """
+    Obtiene contadores de operaciones pendientes por tipo.
+    [CORREGIDO] Solo cuenta estado 'listo' - operaciones que requieren
+    atención inmediata para ser validadas (excluye borradores).
+    """
     query = """
         SELECT
             pt.code,
             COUNT(p.id) as pending_count
         FROM pickings p
         JOIN picking_types pt ON p.picking_type_id = pt.id
-        WHERE p.company_id =  %s AND p.state IN ('draft', 'listo')
+        WHERE p.company_id = %s AND p.state = 'listo'
         GROUP BY pt.code
     """
     results = execute_query(query, (company_id,), fetchall=True)
-    
+
     kpis = {'IN': 0, 'OUT': 0, 'INT': 0}
     for row in results:
         if row['code'] in kpis:
