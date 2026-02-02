@@ -96,16 +96,27 @@ def verify_company_access(auth: TokenData, company_id: int):
     Verifica estrictamente si el usuario tiene permiso para acceder a la compañía solicitada.
     Lanza HTTP 403 Forbidden si no tiene permiso.
     """
+    # [DEBUG] Log para diagnóstico de problemas multi-compañía
+    print(f"[SECURITY] verify_company_access: User='{auth.username}', Rol='{auth.role_name}', "
+          f"Requested Company={company_id}, Token Companies={auth.company_ids}")
+
     # 1. El Super Admin (Rol 'Administrador') tiene pase maestro.
-    # Asegúrate que el nombre del rol coincida con tu BD (ej. 'Administrador', 'admin', etc.)
     if auth.role_name == "Administrador":
+        print(f"[SECURITY] ADMIN PASS: Usuario '{auth.username}' es Administrador - acceso permitido")
         return
 
     # 2. Verificar si el ID de la empresa está en la lista permitida del token.
-    # auth.company_ids viene del token JWT, que se firmó al hacer login.
+    if not auth.company_ids:
+        print(f"[SECURITY WARNING] Usuario '{auth.username}' tiene lista de compañías VACÍA en el token!")
+
     if company_id not in auth.company_ids:
-        print(f"[SECURITY BLOCK] Usuario '{auth.username}' (Rol: {auth.role_name}) intentó acceder a Company ID {company_id} sin permiso.")
+        print(f"[SECURITY BLOCK] Usuario '{auth.username}' (Rol: {auth.role_name}) "
+              f"intentó acceder a Company ID {company_id}. "
+              f"Compañías permitidas en token: {auth.company_ids}")
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, 
-            detail="ACCESO DENEGADO: No tienes autorización para acceder a los datos de esta compañía."
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"ACCESO DENEGADO: No tienes autorización para la compañía {company_id}. "
+                   f"Compañías permitidas: {auth.company_ids}"
         )
+
+    print(f"[SECURITY OK] Usuario '{auth.username}' tiene acceso a Company ID {company_id}")
