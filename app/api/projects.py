@@ -165,13 +165,13 @@ def delete_macro(item_id: int, auth: AuthDependency, company_id: int = Query(...
 
 @router.get("/", response_model=List[dict])
 def get_projects(
-    auth: AuthDependency, 
-    company_id: int = Query(...), 
+    auth: AuthDependency,
+    company_id: int = Query(...),
     status: Optional[str] = None,
     search: Optional[str] = None,
     direction_id: Optional[int] = None,
     management_id: Optional[int] = None,
-    
+
     # [NUEVOS PARÁMETROS PARA FILTROS]
     f_code: Optional[str] = None,
     f_macro: Optional[str] = None,
@@ -188,12 +188,12 @@ def get_projects(
 ):
     verify_access(auth, company_id)
     return [dict(r) for r in db.get_projects(
-        company_id=company_id, 
-        status=status, 
-        search=search, 
-        direction_id=direction_id, 
+        company_id=company_id,
+        status=status,
+        search=search,
+        direction_id=direction_id,
         management_id=management_id,
-        
+
         # Pasamos los filtros al repo
         filter_code=f_code,
         filter_macro=f_macro,
@@ -203,11 +203,12 @@ def get_projects(
         filter_direction=f_dir,
         filter_management=f_mgmt,
 
-        limit=limit, 
+        limit=limit,
         offset=skip,
         sort_by=sort_by,
         ascending=ascending
     )]
+
 
 @router.get("/count", response_model=int)
 def get_projects_count(
