@@ -856,36 +856,50 @@ def _update_product_weighted_cost(cursor, product_id, incoming_qty, incoming_pri
         cursor.execute("UPDATE products SET standard_price = %s WHERE id = %s", (new_avg_price, product_id))
         print(f"[WAC-SAFE] Prod {product_id}: {current_price:.2f} -> {new_avg_price:.2f} (Base: {current_qty} uds, Entran: {incoming_qty} @ {incoming_price})")
 
-def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_tracking):
+def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_tracking, validation_fields=None):
     """
-    [BLINDADO v2 - PREVENCIÓN DOBLE CLIC] 
+    [BLINDADO v2 - PREVENCIÓN DOBLE CLIC]
     Valida y ejecuta el movimiento de stock.
     Usa 'FOR UPDATE' para bloquear la fila y evitar condiciones de carrera.
+
+    [NUEVO] validation_fields: dict opcional con campos que se actualizan ANTES de
+            cambiar el estado a 'done'. Permite que el Almacén escriba partner_ref
+            y warehouse_observations sin necesitar permiso 'can_edit'.
     """
     # 1. BLOQUEO ATÓMICO (Critical Section)
-    # Al usar FOR UPDATE, si llega un segundo clic, se quedará esperando aquí 
+    # Al usar FOR UPDATE, si llega un segundo clic, se quedará esperando aquí
     # hasta que el primero termine.
     cursor.execute("""
-        SELECT p.*, pt.code 
-        FROM pickings p 
-        JOIN picking_types pt ON p.picking_type_id = pt.id 
-        WHERE p.id = %s 
+        SELECT p.*, pt.code
+        FROM pickings p
+        JOIN picking_types pt ON p.picking_type_id = pt.id
+        WHERE p.id = %s
         FOR UPDATE
     """, (picking_id,))
-    
+
     picking = cursor.fetchone()
-    
+
     # 2. VERIFICACIÓN DE ESTADO POST-BLOQUEO
     # Cuando el segundo clic logre entrar (después de que el primero termine),
     # se encontrará con que el estado ya es 'done' y será rechazado.
-    if not picking: 
+    if not picking:
         return False, "El albarán no existe."
-    
+
     if picking['state'] == 'done':
         return False, "TRANQUILO: Este ajuste ya fue validado procesado exitosamente por una petición anterior."
-        
+
     if picking['state'] == 'cancelled':
         return False, "El albarán está cancelado."
+
+    # Actualizar campos de validación ANTES de procesar (Guía de Remisión, Observaciones)
+    if validation_fields:
+        allowed_fields = {'partner_ref', 'warehouse_observations'}
+        fields_to_update = {k: v for k, v in validation_fields.items() if k in allowed_fields}
+
+        if fields_to_update:
+            set_clauses = ", ".join([f"{k} = %s" for k in fields_to_update.keys()])
+            values = list(fields_to_update.values()) + [picking_id]
+            cursor.execute(f"UPDATE pickings SET {set_clauses} WHERE id = %s", values)
 
     p_code = picking['code']
     project_id = picking['project_id'] 
@@ -1020,12 +1034,20 @@ def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_track
 
     return True, "Validado correctamente."
 
-def process_picking_validation(picking_id, moves_with_tracking):
+def process_picking_validation(picking_id, moves_with_tracking, validation_fields=None):
+    """
+    Valida un picking y ejecuta los movimientos de stock.
+    [NUEVO] validation_fields: dict opcional con campos a actualizar antes de validar
+            (partner_ref, warehouse_observations). Permite que el Almacén escriba
+            estos campos sin necesitar permiso 'can_edit'.
+    """
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-            ok, msg = _process_picking_validation_with_cursor(cursor, picking_id, moves_with_tracking)
+            ok, msg = _process_picking_validation_with_cursor(
+                cursor, picking_id, moves_with_tracking, validation_fields
+            )
             if ok: conn.commit()
             else: conn.rollback()
             return ok, msg

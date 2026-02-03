@@ -248,6 +248,9 @@ class ValidateRequest(BaseModel):
     """ Schema para el body de la petición de validación """
     # { "move_id": { "serial_name": qty, "serial_2": qty }, ... }
     moves_with_tracking: dict[int, dict[str, float]]
+    # [NUEVO] Campos que el Almacén puede escribir al validar (sin necesitar can_edit)
+    partner_ref: Optional[str] = None
+    warehouse_observations: Optional[str] = None
 
 # --- Schemas para Liquidaciones (Work Orders) ---
 class WorkOrderBase(BaseModel):

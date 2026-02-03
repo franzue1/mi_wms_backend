@@ -1037,12 +1037,28 @@ async def mark_picking_ready(picking_id: int, auth: AuthDependency):
 
 @router.post("/{picking_id}/validate", status_code=200)
 async def validate_picking(picking_id: int, tracking_data: schemas.ValidateRequest, auth: AuthDependency):
-    """ Valida el picking y ejecuta el movimiento de stock. """
+    """
+    Valida el picking y ejecuta el movimiento de stock.
+    [NUEVO] Acepta campos opcionales (partner_ref, warehouse_observations) que se
+    actualizan ANTES de validar. Esto permite que el Almacén ingrese la Guía de
+    Remisión al validar sin necesitar el permiso 'can_edit'.
+    """
     if "operations.can_validate" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
     try:
-        success, message = db.process_picking_validation(picking_id, tracking_data.moves_with_tracking)
+        # Construir diccionario de campos a actualizar (solo si vienen en el payload)
+        validation_fields = {}
+        if tracking_data.partner_ref is not None:
+            validation_fields['partner_ref'] = tracking_data.partner_ref
+        if tracking_data.warehouse_observations is not None:
+            validation_fields['warehouse_observations'] = tracking_data.warehouse_observations
+
+        success, message = db.process_picking_validation(
+            picking_id,
+            tracking_data.moves_with_tracking,
+            validation_fields  # [NUEVO] Pasar campos al repo
+        )
         if not success:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
         return {"message": message}
