@@ -726,6 +726,8 @@ class PickingService:
         employee_name: Optional[str] = None,
         date_transfer_from: Optional[str] = None,
         date_transfer_to: Optional[str] = None,
+        date: Optional[str] = None,
+        transfer_date: Optional[str] = None,
         src_path_display: Optional[str] = None,
         dest_path_display: Optional[str] = None,
         warehouse_src_name: Optional[str] = None,
@@ -733,25 +735,28 @@ class PickingService:
     ) -> Dict[str, str]:
         """
         Construye un diccionario de filtros limpio para la consulta de pickings.
+        Keys alineadas con COLUMN_DEFINITIONS del frontend y operation_repo.py.
 
         Returns:
             Dict[str, str]: Diccionario de filtros sin valores vacíos
         """
         filters = {
-            'p.state': state,
-            'p.name': name,
-            'p.partner_ref': partner_ref,
-            'p.custom_operation_type': custom_operation_type,
-            'p.purchase_order': purchase_order,
-            'p.responsible_user': responsible_user,
+            'state': state,
+            'name': name,
+            'partner_ref': partner_ref,
+            'custom_operation_type': custom_operation_type,
+            'purchase_order': purchase_order,
+            'responsible_user': responsible_user,
             'project_name': project_name,
             'employee_name': employee_name,
             'date_transfer_from': date_transfer_from,
             'date_transfer_to': date_transfer_to,
+            'date': date,
+            'transfer_date': transfer_date,
             'src_path_display': src_path_display,
             'dest_path_display': dest_path_display,
-            'w_src.name': warehouse_src_name,
-            'w_dest.name': warehouse_dest_name,
+            'warehouse_src_name': warehouse_src_name,
+            'warehouse_dest_name': warehouse_dest_name,
         }
         return {k: v for k, v in filters.items() if v is not None and v != ""}
 

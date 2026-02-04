@@ -595,6 +595,200 @@ def save_move_lines_for_move(move_id, tracking_data: dict):
     finally:
         if conn: return_db_connection(conn)
 
+# =============================================================================
+# IMPORTACIÓN ATÓMICA (TRANSACCIÓN COMPLETA)
+# =============================================================================
+
+# Reglas de ownership por tipo de operación
+OWNERSHIP_RULES = {
+    "Compra Nacional": "owned",
+    "Consignación Recibida": "consigned",
+    "Devolución a Proveedor": "owned",
+    "Devolución a Cliente": "consigned",
+}
+
+def import_picking_atomic(header_data: dict, lines_data: list, company_id: int, responsible_user: str):
+    """
+    [TRANSACCIÓN ATÓMICA] Importa un picking completo (cabecera + líneas) de forma segura.
+
+    Si CUALQUIER validación o inserción falla, se hace ROLLBACK total.
+    Nada queda guardado en la BD hasta que TODO sea exitoso.
+
+    Args:
+        header_data: dict con keys:
+            - picking_type_id, src_loc_id, dest_loc_id, op_type_name,
+            - partner_id, date_transfer_db, partner_ref, purchase_order, project_id
+        lines_data: list de dicts con keys:
+            - product_id, final_qty, final_price, serials (list)
+        company_id: ID de la empresa
+        responsible_user: Usuario que importa
+
+    Returns:
+        (success: bool, message: str, picking_id: int or None)
+    """
+    conn = None
+    new_picking_id = None
+
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+
+            # ═══════════════════════════════════════════════════════════════════
+            # FASE 1: VALIDACIÓN PREVIA DE TODAS LAS LÍNEAS (Antes de crear nada)
+            # ═══════════════════════════════════════════════════════════════════
+            op_type_name = header_data.get('op_type_name')
+            required_ownership = OWNERSHIP_RULES.get(op_type_name)
+
+            if required_ownership:
+                # Validar ownership de TODOS los productos ANTES de insertar
+                for i, line in enumerate(lines_data):
+                    product_id = line['product_id']
+                    cursor.execute(
+                        "SELECT name, ownership FROM products WHERE id = %s AND company_id = %s",
+                        (product_id, company_id)
+                    )
+                    prod = cursor.fetchone()
+                    if not prod:
+                        raise ValueError(f"Línea {i+1}: Producto ID {product_id} no encontrado.")
+
+                    actual_ownership = prod['ownership'] or 'owned'
+                    if actual_ownership != required_ownership:
+                        # Mensaje de error específico por operación
+                        if op_type_name == "Compra Nacional":
+                            msg = f"No puedes comprar '{prod['name']}' porque es material Consignado."
+                        elif op_type_name == "Consignación Recibida":
+                            msg = f"'{prod['name']}' es material Propio, no puedes recibirlo como Consignación."
+                        elif op_type_name == "Devolución a Proveedor":
+                            msg = f"No puedes devolver '{prod['name']}' a proveedor porque es Consignado."
+                        elif op_type_name == "Devolución a Cliente":
+                            msg = f"No puedes devolver '{prod['name']}' a cliente porque es Propio."
+                        else:
+                            msg = f"Producto '{prod['name']}' no compatible con operación '{op_type_name}'."
+
+                        raise ValueError(f"Regla de Negocio: {msg}")
+
+            # ═══════════════════════════════════════════════════════════════════
+            # FASE 2: CREAR CABECERA (Picking)
+            # ═══════════════════════════════════════════════════════════════════
+
+            # Obtener código del tipo de picking (usa la misma lógica que get_next_picking_name)
+            cursor.execute(
+                "SELECT code FROM picking_types WHERE id = %s",
+                (header_data['picking_type_id'],)
+            )
+            pt_row = cursor.fetchone()
+            if not pt_row:
+                raise ValueError("Tipo de albarán no encontrado.")
+
+            pt_code = pt_row['code']
+            prefix = f"C{company_id}/{pt_code}/"
+
+            # Buscar último picking con este prefijo (misma lógica que get_next_picking_name)
+            cursor.execute(
+                "SELECT name FROM pickings WHERE name LIKE %s AND company_id = %s ORDER BY id DESC LIMIT 1",
+                (f"{prefix}%", company_id)
+            )
+            last_res = cursor.fetchone()
+
+            current_sequence = 0
+            if last_res:
+                try:
+                    current_sequence = int(last_res['name'].split('/')[-1])
+                except:
+                    pass
+
+            new_name = f"{prefix}{str(current_sequence + 1).zfill(5)}"
+
+            # Insertar picking
+            cursor.execute("""
+                INSERT INTO pickings (
+                    company_id, name, picking_type_id,
+                    location_src_id, location_dest_id,
+                    scheduled_date, state, responsible_user, project_id,
+                    partner_id, partner_ref, purchase_order, date_transfer, custom_operation_type
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, 'draft', %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (
+                company_id, new_name, header_data['picking_type_id'],
+                header_data.get('src_loc_id'), header_data.get('dest_loc_id'),
+                datetime.now(), responsible_user, header_data.get('project_id'),
+                header_data.get('partner_id'), header_data.get('partner_ref'),
+                header_data.get('purchase_order'), header_data.get('date_transfer_db'),
+                header_data.get('op_type_name')
+            ))
+
+            new_picking_id = cursor.fetchone()[0]
+
+            # ═══════════════════════════════════════════════════════════════════
+            # FASE 3: CREAR LÍNEAS (Stock Moves)
+            # ═══════════════════════════════════════════════════════════════════
+            for line in lines_data:
+                cursor.execute("""
+                    INSERT INTO stock_moves (
+                        picking_id, product_id, product_uom_qty, quantity_done,
+                        location_src_id, location_dest_id, price_unit, partner_id, project_id
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                """, (
+                    new_picking_id, line['product_id'], line['final_qty'], line['final_qty'],
+                    header_data.get('src_loc_id'), header_data.get('dest_loc_id'),
+                    line.get('final_price', 0), header_data.get('partner_id'),
+                    header_data.get('project_id')
+                ))
+
+                move_id = cursor.fetchone()[0]
+
+                # Insertar series si las hay
+                serials = line.get('serials', [])
+                if serials:
+                    for serial_name in serials:
+                        if not serial_name:
+                            continue
+                        # Crear o encontrar lote
+                        cursor.execute(
+                            "SELECT id FROM stock_lots WHERE product_id = %s AND name = %s",
+                            (line['product_id'], serial_name.strip().upper())
+                        )
+                        lot_row = cursor.fetchone()
+                        if lot_row:
+                            lot_id = lot_row['id']
+                        else:
+                            cursor.execute(
+                                "INSERT INTO stock_lots (product_id, name) VALUES (%s, %s) RETURNING id",
+                                (line['product_id'], serial_name.strip().upper())
+                            )
+                            lot_id = cursor.fetchone()[0]
+
+                        cursor.execute(
+                            "INSERT INTO stock_move_lines (move_id, lot_id, qty_done) VALUES (%s, %s, %s)",
+                            (move_id, lot_id, 1)
+                        )
+
+            # ═══════════════════════════════════════════════════════════════════
+            # FASE 4: COMMIT - Todo exitoso
+            # ═══════════════════════════════════════════════════════════════════
+            conn.commit()
+            return True, f"Picking {new_name} creado exitosamente.", new_picking_id
+
+    except ValueError as ve:
+        # Error de validación de negocio
+        if conn:
+            conn.rollback()
+        return False, str(ve), None
+
+    except Exception as e:
+        # Error inesperado
+        if conn:
+            conn.rollback()
+        traceback.print_exc()
+        return False, f"Error interno: {str(e)}", None
+
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+
 # --- LOTES Y SERIES ---
 
 def get_lot_by_name(cursor, product_id, lot_name):
@@ -945,9 +1139,13 @@ def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_track
         
         qty_total = m['quantity_done']
         m_proj = m['project_id']
-        
+
+        # --- LIMPIEZA DE LÍNEAS ANTERIORES (Evita duplicados Draft → Done) ---
+        # [FIX] Eliminar stock_move_lines existentes del borrador antes de recrearlas
+        cursor.execute("DELETE FROM stock_move_lines WHERE move_id = %s", (m['id'],))
+
         # --- VALIDACIÓN DE LOTE/SERIE ---
-        lot_ids_to_process = [] 
+        lot_ids_to_process = []
 
         if m['tracking'] == 'none':
             lot_ids_to_process.append((None, qty_total))
@@ -1060,13 +1258,82 @@ def process_picking_validation(picking_id, moves_with_tracking, validation_field
 
 # --- OTROS HELPERS (Listados) ---
 def get_pickings_count(picking_type_code, company_id, filters={}):
-    base_query = """
-    SELECT COUNT(p.id) as total_count FROM pickings p 
-    JOIN picking_types pt ON p.picking_type_id = pt.id
-    WHERE pt.code = %s AND p.company_id = %s AND pt.code != 'ADJ'
     """
-    # (Lógica simplificada de filtros para brevedad, reutilizar la de la versión anterior si es compleja)
-    return execute_query(base_query, (picking_type_code, company_id), fetchone=True)['total_count']
+    Cuenta pickings aplicando los mismos filtros que get_pickings_by_type.
+    """
+    query_params = [picking_type_code, company_id]
+    where_clauses = []
+
+    # --- Lógica de Filtros (misma que get_pickings_by_type) ---
+    for key, value in filters.items():
+        if value:
+            if key in ["date_transfer_from", "date_transfer_to"]:
+                try:
+                    db_date = datetime.strptime(value, "%d/%m/%Y").strftime("%Y-%m-%d")
+                    operator = ">=" if key == "date_transfer_from" else "<="
+                    where_clauses.append(f"p.date_transfer {operator} %s")
+                    query_params.append(db_date)
+                except ValueError: pass
+            elif key == 'date':
+                try:
+                    db_date = datetime.strptime(value, "%d/%m/%Y").strftime("%Y-%m-%d")
+                    where_clauses.append("DATE(p.scheduled_date) = %s")
+                    query_params.append(db_date)
+                except ValueError: pass
+            elif key == 'transfer_date':
+                try:
+                    db_date = datetime.strptime(value, "%d/%m/%Y").strftime("%Y-%m-%d")
+                    where_clauses.append("DATE(p.date_transfer) = %s")
+                    query_params.append(db_date)
+                except ValueError: pass
+            elif key == 'state':
+                where_clauses.append("p.state = %s"); query_params.append(value)
+            elif key == 'employee_name':
+                where_clauses.append("(emp.first_name ILIKE %s OR emp.last_name ILIKE %s)")
+                query_params.extend([f"%{value}%", f"%{value}%"])
+            elif key == 'project_name':
+                where_clauses.append("(proj.code ILIKE %s OR mp.name ILIKE %s)")
+                query_params.extend([f"%{value}%", f"%{value}%"])
+            elif key == 'name':
+                where_clauses.append("p.name ILIKE %s"); query_params.append(f"%{value}%")
+            elif key == 'custom_operation_type':
+                where_clauses.append("p.custom_operation_type = %s"); query_params.append(value)
+            elif key == 'partner_ref':
+                where_clauses.append("p.partner_ref ILIKE %s"); query_params.append(f"%{value}%")
+            elif key == 'purchase_order':
+                where_clauses.append("p.purchase_order ILIKE %s"); query_params.append(f"%{value}%")
+            elif key == 'responsible_user':
+                where_clauses.append("p.responsible_user ILIKE %s"); query_params.append(f"%{value}%")
+            elif key == 'src_path_display':
+                where_clauses.append("CASE WHEN pt.code = 'IN' THEN partner.name ELSE l_src.path END ILIKE %s")
+                query_params.append(f"%{value}%")
+            elif key == 'dest_path_display':
+                where_clauses.append("CASE WHEN pt.code = 'OUT' THEN partner.name ELSE l_dest.path END ILIKE %s")
+                query_params.append(f"%{value}%")
+            elif key == 'warehouse_src_name':
+                where_clauses.append("w_src.name ILIKE %s"); query_params.append(f"%{value}%")
+            elif key == 'warehouse_dest_name':
+                where_clauses.append("w_dest.name ILIKE %s"); query_params.append(f"%{value}%")
+
+    where_string = " AND " + " AND ".join(where_clauses) if where_clauses else ""
+
+    query = f"""
+    SELECT COUNT(p.id) as total_count
+    FROM pickings p
+    JOIN picking_types pt ON p.picking_type_id = pt.id
+    LEFT JOIN locations l_src ON p.location_src_id = l_src.id
+    LEFT JOIN locations l_dest ON p.location_dest_id = l_dest.id
+    LEFT JOIN partners partner ON p.partner_id = partner.id
+    LEFT JOIN warehouses w_src ON l_src.warehouse_id = w_src.id
+    LEFT JOIN warehouses w_dest ON l_dest.warehouse_id = w_dest.id
+    LEFT JOIN employees emp ON p.employee_id = emp.id
+    LEFT JOIN projects proj ON p.project_id = proj.id
+    LEFT JOIN macro_projects mp ON proj.macro_project_id = mp.id
+    WHERE pt.code = %s AND p.company_id = %s AND pt.code != 'ADJ'
+    {where_string}
+    """
+    result = execute_query(query, tuple(query_params), fetchone=True)
+    return result['total_count'] if result else 0
 
 def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id', ascending=False, limit=None, offset=None):
     """
@@ -1089,11 +1356,10 @@ def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id'
     query_params = [picking_type_code, company_id]
     where_clauses = []
 
-    # --- Lógica de Filtros ---
-    # --- Lógica de Filtros ---
+    # --- Lógica de Filtros (keys alineadas con COLUMN_DEFINITIONS del frontend) ---
     for key, value in filters.items():
          if value:
-            # 1. Filtros de Fecha
+            # 1. Filtros de Fecha (rango desde/hasta)
             if key in ["date_transfer_from", "date_transfer_to"]:
                 try:
                     db_date = datetime.strptime(value, "%d/%m/%Y").strftime("%Y-%m-%d")
@@ -1101,36 +1367,78 @@ def get_pickings_by_type(picking_type_code, company_id, filters={}, sort_by='id'
                     where_clauses.append(f"p.date_transfer {operator} %s")
                     query_params.append(db_date)
                 except ValueError: pass
-            
-            # 2. Filtro de Estado
-            elif key == 'p.state':
-                where_clauses.append("p.state = %s"); query_params.append(value)
-            
+
+            # 1b. Filtro de Fecha Registro (columna 'date' del frontend)
+            elif key == 'date':
+                try:
+                    db_date = datetime.strptime(value, "%d/%m/%Y").strftime("%Y-%m-%d")
+                    where_clauses.append("DATE(p.scheduled_date) = %s")
+                    query_params.append(db_date)
+                except ValueError: pass
+
+            # 1c. Filtro de Fecha Traslado (columna 'transfer_date' del frontend)
+            elif key == 'transfer_date':
+                try:
+                    db_date = datetime.strptime(value, "%d/%m/%Y").strftime("%Y-%m-%d")
+                    where_clauses.append("DATE(p.date_transfer) = %s")
+                    query_params.append(db_date)
+                except ValueError: pass
+
+            # 2. Filtro de Estado (exacto, no ILIKE)
+            elif key == 'state':
+                where_clauses.append("p.state = %s")
+                query_params.append(value)
+
+            # 3. Filtro de Técnico (busca en nombre y apellido)
             elif key == 'employee_name':
-                 # Buscamos coincidencias en nombre O apellido
-                 where_clauses.append("(emp.first_name ILIKE %s OR emp.last_name ILIKE %s)")
-                 query_params.extend([f"%{value}%", f"%{value}%"])
+                where_clauses.append("(emp.first_name ILIKE %s OR emp.last_name ILIKE %s)")
+                query_params.extend([f"%{value}%", f"%{value}%"])
 
-            # 4. Filtro de Proyecto (Código o Nombre Macro)
+            # 4. Filtro de Proyecto (Código PEP o Nombre Macro)
             elif key == 'project_name':
-                 where_clauses.append("(proj.code ILIKE %s OR mp.name ILIKE %s)")
-                 query_params.extend([f"%{value}%", f"%{value}%"])
+                where_clauses.append("(proj.code ILIKE %s OR mp.name ILIKE %s)")
+                query_params.extend([f"%{value}%", f"%{value}%"])
 
-            # 5. Filtros Genéricos de Texto (Referencia, Tipo, Nombre, OC, Usuario Creador)
-            elif key in ["p.partner_ref", "p.custom_operation_type", "p.name", "p.purchase_order", "p.responsible_user"]:
-                where_clauses.append(f"{key} ILIKE %s"); query_params.append(f"%{value}%")
-            
-            # 6. Filtros de Ubicación/Almacén
+            # 5. Filtro de Referencia (nombre del picking)
+            elif key == 'name':
+                where_clauses.append("p.name ILIKE %s")
+                query_params.append(f"%{value}%")
+
+            # 6. Filtro de Tipo de Movimiento (exacto para dropdown)
+            elif key == 'custom_operation_type':
+                where_clauses.append("p.custom_operation_type = %s")
+                query_params.append(value)
+
+            # 7. Filtro de Guía de Remisión
+            elif key == 'partner_ref':
+                where_clauses.append("p.partner_ref ILIKE %s")
+                query_params.append(f"%{value}%")
+
+            # 8. Filtro de Orden de Compra
+            elif key == 'purchase_order':
+                where_clauses.append("p.purchase_order ILIKE %s")
+                query_params.append(f"%{value}%")
+
+            # 9. Filtro de Responsable
+            elif key == 'responsible_user':
+                where_clauses.append("p.responsible_user ILIKE %s")
+                query_params.append(f"%{value}%")
+
+            # 10. Filtros de Ubicación (usan CASE por lógica de IN/OUT)
             elif key == 'src_path_display':
                 where_clauses.append("CASE WHEN pt.code = 'IN' THEN partner.name ELSE l_src.path END ILIKE %s")
                 query_params.append(f"%{value}%")
             elif key == 'dest_path_display':
-                 where_clauses.append("CASE WHEN pt.code = 'OUT' THEN partner.name ELSE l_dest.path END ILIKE %s")
-                 query_params.append(f"%{value}%")
-            elif key == 'w_src.name':
-                 where_clauses.append("w_src.name ILIKE %s"); query_params.append(f"%{value}%")
-            elif key == 'w_dest.name':
-                 where_clauses.append("w_dest.name ILIKE %s"); query_params.append(f"%{value}%")
+                where_clauses.append("CASE WHEN pt.code = 'OUT' THEN partner.name ELSE l_dest.path END ILIKE %s")
+                query_params.append(f"%{value}%")
+
+            # 11. Filtros de Almacén
+            elif key == 'warehouse_src_name':
+                where_clauses.append("w_src.name ILIKE %s")
+                query_params.append(f"%{value}%")
+            elif key == 'warehouse_dest_name':
+                where_clauses.append("w_dest.name ILIKE %s")
+                query_params.append(f"%{value}%")
 
     where_string = " AND " + " AND ".join(where_clauses) if where_clauses else ""
 
@@ -2157,12 +2465,13 @@ def import_smart_adjustments_transaction(company_id, user_name, rows):
 def get_data_for_export(company_id, export_type, selected_ids=None):
     """
     Obtiene los datos para el CSV.
+    [MEJORA v4] 1 Fila por Serie: Productos con series generan múltiples filas.
     [MEJORA v3] Agregado Técnico (Empleado), Instrucciones y Observaciones.
     [MEJORA v2] Lógica Inteligente para Nombres de Proveedores/Clientes.
     """
     params = [company_id]
     filter_clause = ""
-    
+
     if selected_ids:
         filter_clause = "AND p.id = ANY(%s)"
         params.append(selected_ids)
@@ -2172,27 +2481,27 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
     # Definimos la lógica de visualización de ubicaciones
     smart_locations_sql = """
         -- LOGICA INTELIGENTE ORIGEN
-        CASE 
-            WHEN pt.code = 'IN' THEN part.name 
-            WHEN l_src.type = 'internal' THEN w_src.name 
-            ELSE l_src.path 
+        CASE
+            WHEN pt.code = 'IN' THEN part.name
+            WHEN l_src.type = 'internal' THEN w_src.name
+            ELSE l_src.path
         END as almacen_origen,
-        
-        CASE 
-            WHEN pt.code = 'IN' THEN part.name 
-            ELSE l_src.path 
+
+        CASE
+            WHEN pt.code = 'IN' THEN part.name
+            ELSE l_src.path
         END as ubicacion_origen,
-        
+
         -- LOGICA INTELIGENTE DESTINO
-        CASE 
-            WHEN pt.code = 'OUT' THEN part.name 
-            WHEN l_dest.type = 'internal' THEN w_dest.name 
-            ELSE l_dest.path 
+        CASE
+            WHEN pt.code = 'OUT' THEN part.name
+            WHEN l_dest.type = 'internal' THEN w_dest.name
+            ELSE l_dest.path
         END as almacen_destino,
-        
-        CASE 
-            WHEN pt.code = 'OUT' THEN part.name 
-            ELSE l_dest.path 
+
+        CASE
+            WHEN pt.code = 'OUT' THEN part.name
+            ELSE l_dest.path
         END as ubicacion_destino
     """
 
@@ -2205,18 +2514,18 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
 
     if export_type == 'headers':
         query = f"""
-            SELECT 
-                p.name as picking_name, 
-                pt.code as picking_type_code, 
-                p.state, 
+            SELECT
+                p.name as picking_name,
+                pt.code as picking_type_code,
+                p.state,
                 p.custom_operation_type,
                 proj.name as project_name,
-                
+
                 {smart_locations_sql},
-                
-                p.partner_ref, 
+
+                p.partner_ref,
                 p.purchase_order,
-                TO_CHAR(p.date_transfer, 'DD/MM/YYYY') as date_transfer, 
+                TO_CHAR(p.date_transfer, 'DD/MM/YYYY') as date_transfer,
                 p.responsible_user,
 
                 -- [NUEVO] Columnas de RRHH y Operaciones
@@ -2229,54 +2538,103 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
 
             FROM pickings p
             JOIN picking_types pt ON p.picking_type_id = pt.id
-            LEFT JOIN partners part ON p.partner_id = part.id 
+            LEFT JOIN partners part ON p.partner_id = part.id
             LEFT JOIN projects proj ON p.project_id = proj.id
             LEFT JOIN locations l_src ON p.location_src_id = l_src.id
             LEFT JOIN locations l_dest ON p.location_dest_id = l_dest.id
             LEFT JOIN warehouses w_src ON l_src.warehouse_id = w_src.id
             LEFT JOIN warehouses w_dest ON l_dest.warehouse_id = w_dest.id
-            
+
             -- [NUEVO] Join con Empleados
             LEFT JOIN employees emp ON p.employee_id = emp.id
-            
-            WHERE p.company_id = %s 
+
+            WHERE p.company_id = %s
               AND pt.code != 'ADJ'
               {filter_clause}
             ORDER BY p.id DESC
         """
-        
+        return execute_query(query, tuple(params), fetchall=True)
+
     elif export_type == 'full':
+        # [v4] NUEVA LÓGICA: 1 FILA POR SERIE
+        # Usamos UNION de dos consultas:
+        # 1. Productos CON series: JOIN directo con stock_move_lines (1 fila por serie)
+        # 2. Productos SIN series: 1 fila por movimiento
+
         query = f"""
-            SELECT 
-                p.name as picking_name, 
-                pt.code as picking_type_code, 
-                p.state, 
+            -- PARTE 1: Productos CON series (1 fila por cada serie)
+            SELECT
+                p.name as picking_name,
+                pt.code as picking_type_code,
+                p.state,
                 p.custom_operation_type,
                 proj.name as project_name,
-                
+
                 {smart_locations_sql},
-                
-                p.partner_ref, 
+
+                p.partner_ref,
                 p.purchase_order,
-                TO_CHAR(p.date_transfer, 'DD/MM/YYYY') as date_transfer, 
+                TO_CHAR(p.date_transfer, 'DD/MM/YYYY') as date_transfer,
                 p.responsible_user,
-                
-                -- [NUEVO] Columnas de RRHH y Operaciones
+
                 {new_cols_sql}
-                
+
+                prod.sku as product_sku,
+                prod.name as product_name,
+                COALESCE(sml.qty_done, 1) as quantity,
+                sm.price_unit,
+
+                {notes_col}
+
+                sl.name as serial
+
+            FROM pickings p
+            JOIN stock_moves sm ON sm.picking_id = p.id
+            JOIN products prod ON sm.product_id = prod.id
+            JOIN picking_types pt ON p.picking_type_id = pt.id
+            -- JOIN con stock_move_lines y stock_lots para obtener 1 fila por serie
+            JOIN stock_move_lines sml ON sml.move_id = sm.id
+            JOIN stock_lots sl ON sml.lot_id = sl.id
+            LEFT JOIN partners part ON p.partner_id = part.id
+            LEFT JOIN projects proj ON p.project_id = proj.id
+            LEFT JOIN locations l_src ON p.location_src_id = l_src.id
+            LEFT JOIN locations l_dest ON p.location_dest_id = l_dest.id
+            LEFT JOIN warehouses w_src ON l_src.warehouse_id = w_src.id
+            LEFT JOIN warehouses w_dest ON l_dest.warehouse_id = w_dest.id
+            LEFT JOIN employees emp ON p.employee_id = emp.id
+
+            WHERE p.company_id = %s
+              AND pt.code != 'ADJ'
+              AND prod.tracking != 'none'
+              {filter_clause}
+
+            UNION ALL
+
+            -- PARTE 2: Productos SIN series (1 fila por movimiento)
+            SELECT
+                p.name as picking_name,
+                pt.code as picking_type_code,
+                p.state,
+                p.custom_operation_type,
+                proj.name as project_name,
+
+                {smart_locations_sql},
+
+                p.partner_ref,
+                p.purchase_order,
+                TO_CHAR(p.date_transfer, 'DD/MM/YYYY') as date_transfer,
+                p.responsible_user,
+
+                {new_cols_sql}
+
                 prod.sku as product_sku,
                 prod.name as product_name,
                 sm.product_uom_qty as quantity,
                 sm.price_unit,
-                
+
                 {notes_col}
 
-                (
-                    SELECT string_agg(sl.name, ', ')
-                    FROM stock_move_lines sml
-                    JOIN stock_lots sl ON sml.lot_id = sl.id
-                    WHERE sml.move_id = sm.id
-                ) as serial
+                '' as serial
 
             FROM pickings p
             JOIN stock_moves sm ON sm.picking_id = p.id
@@ -2288,17 +2646,20 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
             LEFT JOIN locations l_dest ON p.location_dest_id = l_dest.id
             LEFT JOIN warehouses w_src ON l_src.warehouse_id = w_src.id
             LEFT JOIN warehouses w_dest ON l_dest.warehouse_id = w_dest.id
-
-            -- [NUEVO] Join con Empleados
             LEFT JOIN employees emp ON p.employee_id = emp.id
-            
-            WHERE p.company_id = %s 
+
+            WHERE p.company_id = %s
               AND pt.code != 'ADJ'
+              AND prod.tracking = 'none'
               {filter_clause}
-            ORDER BY p.id DESC, prod.sku ASC
+
+            ORDER BY picking_name DESC, product_sku ASC, serial ASC
         """
-    
-    return execute_query(query, tuple(params), fetchall=True)
+        # Para UNION necesitamos company_id dos veces
+        union_params = list(params) + list(params)
+        return execute_query(query, tuple(union_params), fetchall=True)
+
+    return []
 
 def get_project_id_by_composite_key(macro_name, project_code, company_id):
     """

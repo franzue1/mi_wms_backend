@@ -106,6 +106,7 @@ def _build_picking_filters(type_code: str, filters_in: dict):
     """
     Construye filtros para la consulta de pickings.
     Usa PickingService.build_picking_filter_dict para normalización.
+    Keys alineadas con COLUMN_DEFINITIONS del frontend.
     """
     return PickingService.build_picking_filter_dict(
         state=filters_in.get('state'),
@@ -118,8 +119,10 @@ def _build_picking_filters(type_code: str, filters_in: dict):
         employee_name=filters_in.get('employee_name'),
         date_transfer_from=filters_in.get('date_transfer_from'),
         date_transfer_to=filters_in.get('date_transfer_to'),
-        src_path_display=filters_in.get('src_path'),
-        dest_path_display=filters_in.get('dest_path'),
+        date=filters_in.get('date'),
+        transfer_date=filters_in.get('transfer_date'),
+        src_path_display=filters_in.get('src_path_display'),
+        dest_path_display=filters_in.get('dest_path_display'),
         warehouse_src_name=filters_in.get('warehouse_src_name'),
         warehouse_dest_name=filters_in.get('warehouse_dest_name'),
     )
@@ -130,12 +133,14 @@ def _build_picking_filters(type_code: str, filters_in: dict):
 async def get_all_pickings(
     auth: AuthDependency, type_code: str, company_id: int = Query(...), skip: int = 0, limit: int = 25,
     sort_by: Optional[str] = Query(None), ascending: bool = Query(False),
+    # Filtros alineados con COLUMN_DEFINITIONS del frontend
     name: Optional[str] = Query(None), project_name: Optional[str] = Query(None), purchase_order: Optional[str] = Query(None),
-    src_path: Optional[str] = Query(None), dest_path: Optional[str] = Query(None),
+    src_path_display: Optional[str] = Query(None), dest_path_display: Optional[str] = Query(None),
     warehouse_src_name: Optional[str] = Query(None), warehouse_dest_name: Optional[str] = Query(None),
     state: Optional[str] = Query(None), custom_operation_type: Optional[str] = Query(None),
     partner_ref: Optional[str] = Query(None), responsible_user: Optional[str] = Query(None),
     date_transfer_from: Optional[str] = Query(None), date_transfer_to: Optional[str] = Query(None),
+    date: Optional[str] = Query(None), transfer_date: Optional[str] = Query(None),
     employee_name: Optional[str] = Query(None)
 ):
     verify_company_access(auth, company_id) # <--- BLINDAJE
@@ -156,12 +161,15 @@ async def get_all_pickings(
 @router.get("/count", response_model=int)
 async def get_pickings_count(
     auth: AuthDependency, type_code: str, company_id: int = Query(...),
+    # Filtros alineados con COLUMN_DEFINITIONS del frontend
     name: Optional[str] = Query(None), project_name: Optional[str] = Query(None), purchase_order: Optional[str] = Query(None),
-    src_path: Optional[str] = Query(None), dest_path: Optional[str] = Query(None),
+    src_path_display: Optional[str] = Query(None), dest_path_display: Optional[str] = Query(None),
     warehouse_src_name: Optional[str] = Query(None), warehouse_dest_name: Optional[str] = Query(None),
     state: Optional[str] = Query(None), custom_operation_type: Optional[str] = Query(None),
     partner_ref: Optional[str] = Query(None), responsible_user: Optional[str] = Query(None),
-    date_transfer_from: Optional[str] = Query(None), date_transfer_to: Optional[str] = Query(None)
+    date_transfer_from: Optional[str] = Query(None), date_transfer_to: Optional[str] = Query(None),
+    date: Optional[str] = Query(None), transfer_date: Optional[str] = Query(None),
+    employee_name: Optional[str] = Query(None)
 ):
     verify_company_access(auth, company_id) # <--- BLINDAJE
     if "operations.can_view" not in auth.permissions:
@@ -470,6 +478,11 @@ async def import_pickings_csv(
                                 partner_info = db.get_partner_id_by_name(ubicacion_origen_csv, company_id)
                                 if not partner_info or partner_info['category_name'] != 'Proveedor Externo': current_errors.append(f"Proveedor Origen '{ubicacion_origen_csv}' inválido.")
                                 else: partner_id = partner_info['id']
+                            elif expected_source_type == 'customer':
+                                # Origen es Cliente (ej: Consignación Recibida)
+                                partner_info = db.get_partner_id_by_name(ubicacion_origen_csv, company_id)
+                                if not partner_info or partner_info['category_name'] != 'Proveedor Cliente': current_errors.append(f"Cliente Origen '{ubicacion_origen_csv}' inválido.")
+                                else: partner_id = partner_info['id']
                             elif expected_source_type == 'internal':
                                 if not almacen_origen_csv: current_errors.append("Falta Almacén Origen.")
                                 else:
@@ -561,14 +574,27 @@ async def import_pickings_csv(
                             actual_dest_cat = warehouse_cat_map.get(str(almacen_destino_csv).upper())
                             if actual_dest_cat not in allowed_dest_cats: group_errors.append(f"Lógica: Destino '{almacen_destino_csv}' ({actual_dest_cat}) inválido.")
 
-                    # VALIDACIÓN DE EXISTENCIA
+                    # VALIDACIÓN DE EXISTENCIA - ORIGEN
                     if expected_source_type == 'vendor':
+                        # Origen es Proveedor Externo (ej: Compra Nacional)
                         partner_info = db.get_partner_id_by_name(ubicacion_origen_csv, company_id)
                         if not partner_info:
                             group_errors.append(f"Proveedor '{ubicacion_origen_csv}' no existe.")
                         elif partner_info.get('category_name') != 'Proveedor Externo':
                             group_errors.append(
                                 f"Partner '{ubicacion_origen_csv}' no es Proveedor Externo (es '{partner_info.get('category_name')}')."
+                            )
+                        else:
+                            partner_id = partner_info['id']
+
+                    elif expected_source_type == 'customer':
+                        # Origen es Cliente (ej: Consignación Recibida - material del cliente entra a nuestro almacén)
+                        partner_info = db.get_partner_id_by_name(ubicacion_origen_csv, company_id)
+                        if not partner_info:
+                            group_errors.append(f"Cliente '{ubicacion_origen_csv}' no existe.")
+                        elif partner_info.get('category_name') != 'Proveedor Cliente':
+                            group_errors.append(
+                                f"Partner '{ubicacion_origen_csv}' no es Cliente (es '{partner_info.get('category_name')}')."
                             )
                         else:
                             partner_id = partner_info['id']
@@ -661,39 +687,28 @@ async def import_pickings_csv(
                     all_errors.append(f"Error guardando fila {valid_row['row_num']}: {e}")
 
         elif import_type == 'full':
+            # ═══════════════════════════════════════════════════════════════════════
+            # [TRANSACCIÓN ATÓMICA] Cada documento se procesa de forma atómica.
+            # Si falla la validación de reglas de negocio (ownership, etc.),
+            # NO se crea ningún registro huérfano en la BD.
+            # ═══════════════════════════════════════════════════════════════════════
             for group_data in validated_data:
-                header = group_data['header']; lines = group_data['lines']; doc_origen = group_data['doc_origen']
-                try:
-                    new_name = db.get_next_picking_name(header['picking_type_id'], company_id)
-                    new_picking_id = db.create_picking(
-                        new_name, header['picking_type_id'], header['src_loc_id'], header['dest_loc_id'], 
-                        company_id, responsible_user, project_id=header.get('project_id')
-                    )
-                    
-                    updates = {
-                        "partner_ref": header.get('partner_ref'),
-                        "purchase_order": header.get('purchase_order'),
-                        "date_transfer": header.get('date_transfer_db'),
-                        "partner_id": header.get('partner_id'),
-                        "location_src_id": header['src_loc_id'],
-                        "location_dest_id": header['dest_loc_id'],
-                        "custom_operation_type": header['op_type_name']
-                    }
-                    db.update_picking_header(new_picking_id, updates)
+                header = group_data['header']
+                lines = group_data['lines']
+                doc_origen = group_data['doc_origen']
 
-                    for line in lines:
-                        move_id = db.add_stock_move_to_picking(
-                            new_picking_id, line['product_id'], line['final_qty'],
-                            header['src_loc_id'], header['dest_loc_id'],
-                            company_id, line['final_price'], header.get('partner_id'),
-                            project_id=header.get('project_id')
-                        )
-                        if line['serials']:
-                            tracking_data = {s: 1 for s in line['serials']}
-                            db.save_move_lines_for_move(move_id, tracking_data)
+                # Usar función atómica que hace COMMIT solo si todo es exitoso
+                success, message, new_id = db.import_picking_atomic(
+                    header_data=header,
+                    lines_data=lines,
+                    company_id=company_id,
+                    responsible_user=responsible_user
+                )
+
+                if success:
                     created_pickings += 1
-                except Exception as e:
-                    all_errors.append(f"Error guardando Doc '{doc_origen}': {e}")
+                else:
+                    all_errors.append(f"Doc '{doc_origen}': {message}")
 
         if all_errors: raise HTTPException(status_code=500, detail="\n".join(all_errors[:10]))
         return {"created": created_headers or created_pickings, "updated": 0, "errors": 0}

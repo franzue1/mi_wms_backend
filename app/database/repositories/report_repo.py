@@ -152,9 +152,13 @@ def get_inventory_aging(company_id, tracked_only=True):
     final_buckets = {k: v for k, v in buckets.items() if v > 0}
     return final_buckets
 
-def get_inventory_aging_details(company_id, filters={}):
-    # (La consulta CTE es similar, la resta de fechas es la clave)
-    base_query = """
+def _build_aging_base_query_and_params(company_id, filters={}):
+    """
+    [REFACTORIZADO] Construye la consulta base y parámetros para el reporte de antigüedad.
+    Usado tanto para datos como para conteo.
+    """
+    # CTE para obtener fecha de ingreso y costo
+    cte = """
         WITH LotCreationInfo AS (
             SELECT
                 sml.lot_id,
@@ -166,49 +170,134 @@ def get_inventory_aging_details(company_id, filters={}):
             JOIN picking_types pt ON p.picking_type_id = pt.id
             WHERE p.state = 'done' AND pt.code = 'IN' AND p.company_id = %s
             GROUP BY sml.lot_id
-        )
-        SELECT
-            p.sku, p.name as product_name, sl.name as lot_name,
-            w.id as warehouse_id, w.name as warehouse_name,
-            lci.effective_date as entry_date,
-            (CURRENT_DATE - lci.effective_date) as aging_days,
-            sq.quantity,
-            COALESCE(lci.unit_cost, p.standard_price, 0) as unit_cost,
-            (sq.quantity * COALESCE(lci.unit_cost, p.standard_price, 0)) as total_value
-        FROM stock_quants sq
-        JOIN products p ON sq.product_id = p.id
-        JOIN stock_lots sl ON sq.lot_id = sl.id
-        JOIN locations l ON sq.location_id = l.id
-        JOIN warehouses w ON l.warehouse_id = w.id
-        LEFT JOIN LotCreationInfo lci ON sq.lot_id = lci.lot_id
-        WHERE l.type = 'internal' AND l.company_id = %s AND sq.lot_id IS NOT NULL
+        ),
+        AgingData AS (
+            SELECT
+                p.sku, p.name as product_name, sl.name as lot_name,
+                w.id as warehouse_id, w.name as warehouse_name,
+                l.id as location_id, l.name as location_name,
+                lci.effective_date as entry_date,
+                (CURRENT_DATE - lci.effective_date) as aging_days,
+                sq.quantity,
+                COALESCE(lci.unit_cost, p.standard_price, 0) as unit_cost,
+                (sq.quantity * COALESCE(lci.unit_cost, p.standard_price, 0)) as total_value
+            FROM stock_quants sq
+            JOIN products p ON sq.product_id = p.id
+            JOIN stock_lots sl ON sq.lot_id = sl.id
+            JOIN locations l ON sq.location_id = l.id
+            JOIN warehouses w ON l.warehouse_id = w.id
+            LEFT JOIN LotCreationInfo lci ON sq.lot_id = lci.lot_id
+            WHERE l.type = 'internal' AND l.company_id = %s AND sq.lot_id IS NOT NULL
     """
-    # (La lógica de filtros dinámicos se mantiene, pero usa %s)
-    where_clauses = []
-    params = [company_id, company_id] 
 
+    where_clauses = []
+    params = [company_id, company_id]
+
+    # Filtro por producto (SKU o nombre)
     if filters.get("product"):
         product_query = f"%{filters['product']}%"
-        where_clauses.append("(p.sku ILIKE %s OR p.name ILIKE %s)") # Usamos ILIKE para case-insensitive
+        where_clauses.append("(p.sku ILIKE %s OR p.name ILIKE %s)")
         params.extend([product_query, product_query])
-        
+
+    # Filtro por SKU específico
+    if filters.get("sku"):
+        where_clauses.append("p.sku ILIKE %s")
+        params.append(f"%{filters['sku']}%")
+
+    # Filtro por nombre de producto
+    if filters.get("product_name"):
+        where_clauses.append("p.name ILIKE %s")
+        params.append(f"%{filters['product_name']}%")
+
+    # Filtro por almacén
     if filters.get("warehouse_id"):
         where_clauses.append("w.id = %s")
         params.append(filters["warehouse_id"])
 
-    if filters.get("bucket"):
-        bucket = filters["bucket"]
-        # (La lógica de buckets usa 'aging_days' que ya está calculado)
-        if bucket == '0-30': where_clauses.append("aging_days BETWEEN 0 AND 30")
-        elif bucket == '31-60': where_clauses.append("aging_days BETWEEN 31 AND 60")
-        elif bucket == '61-90': where_clauses.append("aging_days BETWEEN 61 AND 90")
-        elif bucket == '+90': where_clauses.append("aging_days > 90")
-    
-    if where_clauses:
-        base_query += " AND " + " AND ".join(where_clauses)
+    # Filtro por nombre de almacén
+    if filters.get("warehouse_name"):
+        where_clauses.append("w.name ILIKE %s")
+        params.append(f"%{filters['warehouse_name']}%")
 
-    base_query += " ORDER BY aging_days DESC"
-    return execute_query(base_query, tuple(params), fetchall=True)
+    # Filtro por lote
+    if filters.get("lot_name"):
+        where_clauses.append("sl.name ILIKE %s")
+        params.append(f"%{filters['lot_name']}%")
+
+    # Filtro por ubicación
+    if filters.get("location_name"):
+        where_clauses.append("l.name ILIKE %s")
+        params.append(f"%{filters['location_name']}%")
+
+    if where_clauses:
+        cte += " AND " + " AND ".join(where_clauses)
+
+    cte += ")"  # Cierra el CTE AgingData
+
+    return cte, params, filters.get("bucket")
+
+
+def get_inventory_aging_details(company_id, filters={}, sort_by='aging_days', ascending=False, limit=None, offset=None):
+    """
+    [OPTIMIZADO] Obtiene el reporte detallado de antigüedad con paginación.
+    """
+    cte, params, bucket = _build_aging_base_query_and_params(company_id, filters)
+
+    # Consulta principal sobre el CTE
+    query = cte + " SELECT * FROM AgingData"
+
+    # Filtro por bucket (se aplica sobre aging_days calculado)
+    bucket_clause = ""
+    if bucket:
+        if bucket == '0-30': bucket_clause = " WHERE aging_days BETWEEN 0 AND 30"
+        elif bucket == '31-60': bucket_clause = " WHERE aging_days BETWEEN 31 AND 60"
+        elif bucket == '61-90': bucket_clause = " WHERE aging_days BETWEEN 61 AND 90"
+        elif bucket == '91-120': bucket_clause = " WHERE aging_days BETWEEN 91 AND 120"
+        elif bucket == '+120': bucket_clause = " WHERE aging_days > 120"
+        elif bucket == '+90': bucket_clause = " WHERE aging_days > 90"  # Compatibilidad
+
+    query += bucket_clause
+
+    # Ordenamiento
+    sort_column_map = {
+        'sku': 'sku', 'product_name': 'product_name', 'lot_name': 'lot_name',
+        'warehouse_name': 'warehouse_name', 'location_name': 'location_name',
+        'entry_date': 'entry_date', 'aging_days': 'aging_days', 'quantity': 'quantity',
+        'unit_cost': 'unit_cost', 'total_value': 'total_value'
+    }
+    sort_col = sort_column_map.get(sort_by, 'aging_days')
+    sort_dir = 'ASC' if ascending else 'DESC'
+    query += f" ORDER BY {sort_col} {sort_dir} NULLS LAST"
+
+    # Paginación
+    if limit is not None:
+        query += f" LIMIT {int(limit)}"
+    if offset is not None:
+        query += f" OFFSET {int(offset)}"
+
+    return execute_query(query, tuple(params), fetchall=True)
+
+
+def get_inventory_aging_count(company_id, filters={}):
+    """
+    [NUEVO] Obtiene el conteo total de registros para el reporte de antigüedad.
+    """
+    cte, params, bucket = _build_aging_base_query_and_params(company_id, filters)
+
+    # Consulta de conteo sobre el CTE
+    query = cte + " SELECT COUNT(*) as total FROM AgingData"
+
+    # Filtro por bucket
+    if bucket:
+        if bucket == '0-30': query += " WHERE aging_days BETWEEN 0 AND 30"
+        elif bucket == '31-60': query += " WHERE aging_days BETWEEN 31 AND 60"
+        elif bucket == '61-90': query += " WHERE aging_days BETWEEN 61 AND 90"
+        elif bucket == '91-120': query += " WHERE aging_days BETWEEN 91 AND 120"
+        elif bucket == '+120': query += " WHERE aging_days > 120"
+        elif bucket == '+90': query += " WHERE aging_days > 90"  # Compatibilidad
+
+    result = execute_query(query, tuple(params), fetchone=True)
+    return result['total'] if result else 0
 
 def get_stock_coverage_report(company_id, history_days=90, product_filter=None):
     safe_history_days = max(1, history_days)

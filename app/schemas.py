@@ -432,6 +432,8 @@ class AgingDetailResponse(BaseModel):
     lot_name: str
     warehouse_id: int
     warehouse_name: str
+    location_id: Optional[int] = None
+    location_name: Optional[str] = None
     entry_date: Optional[date] = None
     aging_days: Optional[int] = 0
     quantity: float

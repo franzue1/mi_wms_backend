@@ -209,20 +209,119 @@ async def get_aging_report(
     company_id: int = Query(...),
     product_filter: Optional[str] = Query(None, alias="product"),
     warehouse_id: Optional[int] = Query(None),
-    bucket: Optional[str] = Query(None)
+    bucket: Optional[str] = Query(None),
+    # [NUEVO] Filtros adicionales
+    sku: Optional[str] = Query(None),
+    product_name: Optional[str] = Query(None),
+    warehouse_name: Optional[str] = Query(None),
+    lot_name: Optional[str] = Query(None),
+    location_name: Optional[str] = Query(None),
+    # [NUEVO] Paginación
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=500),
+    sort_by: str = Query('aging_days'),
+    ascending: bool = Query(False)
 ):
-    """ Obtiene el reporte detallado de antigüedad de inventario. """
+    """
+    [OPTIMIZADO] Obtiene el reporte detallado de antigüedad de inventario con paginación.
+    """
     if "reports.aging.view" not in auth.permissions:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
-    
-    filters = { "product": product_filter, "warehouse_id": warehouse_id, "bucket": bucket }
-    filters = {k: v for k, v in filters.items() if v is not None}
+
+    filters = {
+        "product": product_filter, "warehouse_id": warehouse_id, "bucket": bucket,
+        "sku": sku, "product_name": product_name, "warehouse_name": warehouse_name,
+        "lot_name": lot_name, "location_name": location_name
+    }
+    filters = {k: v for k, v in filters.items() if v is not None and v != ""}
 
     try:
-        aging_data = db.get_inventory_aging_details(company_id, filters)
+        aging_data = db.get_inventory_aging_details(
+            company_id, filters,
+            sort_by=sort_by, ascending=ascending,
+            limit=limit, offset=skip
+        )
         return [dict(row) for row in aging_data]
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al generar reporte de antigüedad: {e}")
+
+
+@router.get("/aging/count", response_model=int)
+async def get_aging_report_count(
+    auth: AuthDependency,
+    company_id: int = Query(...),
+    product_filter: Optional[str] = Query(None, alias="product"),
+    warehouse_id: Optional[int] = Query(None),
+    bucket: Optional[str] = Query(None),
+    # Filtros adicionales
+    sku: Optional[str] = Query(None),
+    product_name: Optional[str] = Query(None),
+    warehouse_name: Optional[str] = Query(None),
+    lot_name: Optional[str] = Query(None),
+    location_name: Optional[str] = Query(None)
+):
+    """
+    [NUEVO] Obtiene el conteo total de registros para paginación del reporte de antigüedad.
+    """
+    if "reports.aging.view" not in auth.permissions:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
+
+    filters = {
+        "product": product_filter, "warehouse_id": warehouse_id, "bucket": bucket,
+        "sku": sku, "product_name": product_name, "warehouse_name": warehouse_name,
+        "lot_name": lot_name, "location_name": location_name
+    }
+    filters = {k: v for k, v in filters.items() if v is not None and v != ""}
+
+    try:
+        count = db.get_inventory_aging_count(company_id, filters)
+        return count
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error al contar registros: {e}")
+
+
+@router.get("/aging/export", response_model=List[dict])
+async def export_aging_report(
+    auth: AuthDependency,
+    company_id: int = Query(...),
+    product_filter: Optional[str] = Query(None, alias="product"),
+    warehouse_id: Optional[int] = Query(None),
+    bucket: Optional[str] = Query(None),
+    sku: Optional[str] = Query(None),
+    product_name: Optional[str] = Query(None),
+    warehouse_name: Optional[str] = Query(None),
+    lot_name: Optional[str] = Query(None),
+    location_name: Optional[str] = Query(None),
+    sort_by: str = Query('aging_days'),
+    ascending: bool = Query(False)
+):
+    """
+    [NUEVO] Obtiene TODOS los datos del reporte de antigüedad (sin paginación) para exportación.
+    """
+    if "reports.aging.view" not in auth.permissions:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
+
+    filters = {
+        "product": product_filter, "warehouse_id": warehouse_id, "bucket": bucket,
+        "sku": sku, "product_name": product_name, "warehouse_name": warehouse_name,
+        "lot_name": lot_name, "location_name": location_name
+    }
+    filters = {k: v for k, v in filters.items() if v is not None and v != ""}
+
+    try:
+        # Sin limit ni offset para obtener TODOS los datos
+        aging_data = db.get_inventory_aging_details(
+            company_id, filters,
+            sort_by=sort_by, ascending=ascending,
+            limit=None, offset=None
+        )
+        return [dict(row) for row in aging_data]
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error al exportar reporte de antigüedad: {e}")
+
 
 @router.get("/coverage", response_model=List[schemas.CoverageReportResponse])
 async def get_coverage_report(
