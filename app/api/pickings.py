@@ -100,6 +100,10 @@ class StockMoveCreate(BaseModel):
 class MoveQuantityUpdate(BaseModel):
     quantity: float
 
+class BulkActionRequest(BaseModel):
+    ids: List[int]
+    action: str  # 'mark_ready', 'return_draft', 'cancel'
+
 # --- Helper de Filtros ---
 
 def _build_picking_filters(type_code: str, filters_in: dict):
@@ -1138,6 +1142,40 @@ async def cancel_picking(picking_id: int, auth: AuthDependency):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al cancelar: {e}")
+
+@router.post("/bulk-action", status_code=200)
+async def bulk_action(data: BulkActionRequest, auth: AuthDependency):
+    """
+    [ACCIÓN MASIVA] Ejecuta una acción sobre múltiples pickings.
+    Actions: 'mark_ready', 'return_draft', 'cancel'
+    Retorna reporte de éxitos y fallos.
+    """
+    # Validar permisos según acción
+    action = data.action
+    required_perms = {
+        'mark_ready': 'operations.can_validate',
+        'return_draft': 'operations.can_reset_to_draft',
+        'cancel': 'operations.can_edit'
+    }
+
+    if action not in required_perms:
+        raise HTTPException(status_code=400, detail=f"Acción '{action}' no válida.")
+
+    if required_perms[action] not in auth.permissions:
+        raise HTTPException(status_code=403, detail="No tienes permiso para esta acción.")
+
+    if not data.ids:
+        raise HTTPException(status_code=400, detail="No se proporcionaron IDs.")
+
+    # Ejecutar acción masiva en repositorio
+    try:
+        result = await asyncio.to_thread(db.bulk_picking_action, data.ids, action)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error en acción masiva: {e}")
 
 @router.put("/{picking_id}/header", status_code=200)
 async def update_picking_header(picking_id: int, data: PickingHeaderUpdate, auth: AuthDependency):

@@ -393,7 +393,7 @@ def return_picking_to_draft(picking_id):
             
             conn.commit()
             return True, "Regresado a borrador exitosamente."
-            
+
     except Exception as e:
         if conn: conn.rollback()
         # Imprimimos el error en consola para que lo veas en los logs de Render si vuelve a pasar
@@ -401,6 +401,52 @@ def return_picking_to_draft(picking_id):
         return False, str(e)
     finally:
         if conn: return_db_connection(conn)
+
+def bulk_picking_action(ids: list, action: str):
+    """
+    [ACCIÓN MASIVA] Ejecuta una acción sobre múltiples pickings.
+    Retorna resumen de éxitos y fallos con nombres para mejor UX.
+    """
+    results = {"success": [], "failed": [], "action": action}
+
+    # [OPTIMIZADO] Obtener nombres de todos los pickings en una sola query
+    names_map = {}
+    if ids:
+        rows = execute_query(
+            "SELECT id, name FROM pickings WHERE id = ANY(%s)",
+            (ids,), fetchall=True
+        )
+        names_map = {row['id']: row['name'] for row in rows} if rows else {}
+
+    for picking_id in ids:
+        name = names_map.get(picking_id, f"ID-{picking_id}")
+        try:
+            if action == 'mark_ready':
+                mark_picking_as_ready(picking_id)
+                results["success"].append({"id": picking_id, "name": name})
+
+            elif action == 'return_draft':
+                ok, msg = return_picking_to_draft(picking_id)
+                if ok:
+                    results["success"].append({"id": picking_id, "name": name})
+                else:
+                    results["failed"].append({"id": picking_id, "name": name, "error": msg})
+
+            elif action == 'cancel':
+                ok, msg = cancel_picking(picking_id)
+                if ok:
+                    results["success"].append({"id": picking_id, "name": name})
+                else:
+                    results["failed"].append({"id": picking_id, "name": name, "error": msg})
+
+        except Exception as e:
+            results["failed"].append({"id": picking_id, "name": name, "error": str(e)})
+
+    results["total"] = len(ids)
+    results["success_count"] = len(results["success"])
+    results["failed_count"] = len(results["failed"])
+
+    return results
 
 def get_next_picking_name(picking_type_id, company_id):
     """
