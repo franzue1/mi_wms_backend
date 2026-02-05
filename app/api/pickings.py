@@ -223,6 +223,8 @@ async def create_draft_picking(data: PickingCreateRequest, auth: AuthDependency)
         response_data["moves"] = [dict(move) for move in picking_moves_raw]
         return response_data
 
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al crear albarán: {e}")
@@ -252,6 +254,8 @@ async def create_full_picking(
         # Para ser rápidos, solo devolvemos el ID y que el frontend recargue.
         return {"id": new_id, "message": "Albarán creado exitosamente"}
 
+    except HTTPException:
+        raise
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
@@ -440,6 +444,11 @@ async def import_pickings_csv(
                     almacen_destino_csv = row.get('almacen_destino'); ubicacion_destino_csv = row.get('ubicacion_destino')
                     date_str = row.get('date_transfer')
                     partner_ref = row.get('partner_ref', ''); purchase_order = row.get('purchase_order', '')
+                    # [NUEVO] Leer instrucciones y observaciones del CSV
+                    operations_instructions = row.get('operations_instructions', '')
+                    warehouse_observations = row.get('warehouse_observations', '')
+                    validated_row_data['operations_instructions'] = operations_instructions
+                    validated_row_data['warehouse_observations'] = warehouse_observations
 
                     if not all([op_type_name, ubicacion_origen_csv, ubicacion_destino_csv, date_str]):
                         current_errors.append("Faltan datos obligatorios.")
@@ -545,6 +554,7 @@ async def import_pickings_csv(
                     op_type_name = first_line.get('custom_operation_type'); almacen_origen_csv = first_line.get('almacen_origen'); ubicacion_origen_csv = first_line.get('ubicacion_origen')
                     almacen_destino_csv = first_line.get('almacen_destino'); ubicacion_destino_csv = first_line.get('ubicacion_destino'); date_str = first_line.get('date_transfer')
                     partner_ref = first_line.get('partner_ref', ''); purchase_order = first_line.get('purchase_order', '')
+                    operations_instructions = first_line.get('operations_instructions', ''); warehouse_observations = first_line.get('warehouse_observations', '')
                     
                     if not all([op_type_name, ubicacion_origen_csv, ubicacion_destino_csv, date_str]): raise ValueError("Faltan datos cabecera.")
                     
@@ -634,7 +644,7 @@ async def import_pickings_csv(
                     
                     if group_errors: raise ValueError("; ".join(group_errors))
 
-                    validated_group_data['header'] = {'picking_type_id': picking_type_id, 'src_loc_id': src_loc_id, 'dest_loc_id': dest_loc_id, 'op_type_name': op_type_name, 'partner_id': partner_id, 'date_transfer_db': date_transfer_db, 'partner_ref': partner_ref, 'purchase_order': purchase_order, 'project_id': pid }
+                    validated_group_data['header'] = {'picking_type_id': picking_type_id, 'src_loc_id': src_loc_id, 'dest_loc_id': dest_loc_id, 'op_type_name': op_type_name, 'partner_id': partner_id, 'date_transfer_db': date_transfer_db, 'partner_ref': partner_ref, 'purchase_order': purchase_order, 'project_id': pid, 'operations_instructions': operations_instructions, 'warehouse_observations': warehouse_observations }
 
                     # Procesar Líneas
                     for line_info in lines_with_nums:
@@ -679,7 +689,9 @@ async def import_pickings_csv(
                         "partner_id": valid_row.get('partner_id'),
                         "location_src_id": valid_row['src_loc_id'],
                         "location_dest_id": valid_row['dest_loc_id'],
-                        "custom_operation_type": valid_row['op_rule']['name']
+                        "custom_operation_type": valid_row['op_rule']['name'],
+                        "operations_instructions": valid_row.get('operations_instructions'),
+                        "warehouse_observations": valid_row.get('warehouse_observations')
                     }
                     db.update_picking_header(new_picking_id, updates)
                     created_headers += 1
@@ -1040,6 +1052,8 @@ async def mark_picking_ready(picking_id: int, auth: AuthDependency):
         db.mark_picking_as_ready(picking_id)
         return {"message": "Albarán marcado como 'listo'. Stock reservado correctamente."}
 
+    except HTTPException:
+        raise
     except ValidationError as ve:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=ve.message)
     except BusinessRuleError as bre:
@@ -1077,6 +1091,8 @@ async def validate_picking(picking_id: int, tracking_data: schemas.ValidateReque
         if not success:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
         return {"message": message}
+    except HTTPException:
+        raise  # [FIX] No capturar HTTPException, dejar que pase directo
     except ValidationError as ve:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=ve.message)
     except BusinessRuleError as bre:
@@ -1096,6 +1112,8 @@ async def return_picking_to_draft(picking_id: int, auth: AuthDependency):
         if not success:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
         return {"message": message}
+    except HTTPException:
+        raise
     except BusinessRuleError as bre:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=bre.message)
     except Exception as e:
@@ -1113,6 +1131,8 @@ async def cancel_picking(picking_id: int, auth: AuthDependency):
         if not success:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
         return {"message": message}
+    except HTTPException:
+        raise
     except BusinessRuleError as bre:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=bre.message)
     except Exception as e:
@@ -1161,6 +1181,8 @@ async def update_picking_header(picking_id: int, data: PickingHeaderUpdate, auth
         )
         return {"message": "Cabecera actualizada."}
 
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al actualizar cabecera: {e}")
@@ -1192,6 +1214,8 @@ async def add_stock_move(
         )
         # Convertimos el DictRow a un dict normal y lo devolvemos
         return dict(new_move_object)
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al añadir línea: {e}")
@@ -1204,6 +1228,8 @@ async def delete_stock_move(move_id: int, auth: AuthDependency):
     try:
         db.delete_stock_move(move_id)
         return {"message": "Línea eliminada."}
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al eliminar línea: {e}")
@@ -1233,7 +1259,8 @@ async def update_move_quantity(
             return dict(updated_move_object)
         else:
             raise HTTPException(status_code=404, detail="No se encontró la línea a actualizar.")
-            
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al actualizar cantidad: {e}")
@@ -1264,6 +1291,8 @@ async def save_move_lines(move_id: int, tracking_data: Dict[str, float], auth: A
         if not success:
             raise HTTPException(status_code=400, detail=message)
         return {"message": message}
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al guardar series: {e}")
@@ -1311,6 +1340,8 @@ async def update_stock_notes(
             data.apply_to_group
         )
         return {"message": "Nota actualizada"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     

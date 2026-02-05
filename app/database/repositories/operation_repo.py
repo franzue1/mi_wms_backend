@@ -640,20 +640,23 @@ def import_picking_atomic(header_data: dict, lines_data: list, company_id: int, 
             required_ownership = OWNERSHIP_RULES.get(op_type_name)
 
             if required_ownership:
-                # Validar ownership de TODOS los productos ANTES de insertar
+                # [OPTIMIZADO] Una sola consulta para todos los productos (evita N+1)
+                product_ids = [line['product_id'] for line in lines_data]
+                cursor.execute(
+                    "SELECT id, name, ownership FROM products WHERE id = ANY(%s) AND company_id = %s",
+                    (product_ids, company_id)
+                )
+                products_map = {row['id']: row for row in cursor.fetchall()}
+
+                # Validar cada línea contra el mapa precargado
                 for i, line in enumerate(lines_data):
                     product_id = line['product_id']
-                    cursor.execute(
-                        "SELECT name, ownership FROM products WHERE id = %s AND company_id = %s",
-                        (product_id, company_id)
-                    )
-                    prod = cursor.fetchone()
+                    prod = products_map.get(product_id)
                     if not prod:
                         raise ValueError(f"Línea {i+1}: Producto ID {product_id} no encontrado.")
 
                     actual_ownership = prod['ownership'] or 'owned'
                     if actual_ownership != required_ownership:
-                        # Mensaje de error específico por operación
                         if op_type_name == "Compra Nacional":
                             msg = f"No puedes comprar '{prod['name']}' porque es material Consignado."
                         elif op_type_name == "Consignación Recibida":
@@ -664,7 +667,6 @@ def import_picking_atomic(header_data: dict, lines_data: list, company_id: int, 
                             msg = f"No puedes devolver '{prod['name']}' a cliente porque es Propio."
                         else:
                             msg = f"Producto '{prod['name']}' no compatible con operación '{op_type_name}'."
-
                         raise ValueError(f"Regla de Negocio: {msg}")
 
             # ═══════════════════════════════════════════════════════════════════
@@ -705,9 +707,10 @@ def import_picking_atomic(header_data: dict, lines_data: list, company_id: int, 
                     company_id, name, picking_type_id,
                     location_src_id, location_dest_id,
                     scheduled_date, state, responsible_user, project_id,
-                    partner_id, partner_ref, purchase_order, date_transfer, custom_operation_type
+                    partner_id, partner_ref, purchase_order, date_transfer, custom_operation_type,
+                    operations_instructions, warehouse_observations
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, 'draft', %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, 'draft', %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (
                 company_id, new_name, header_data['picking_type_id'],
@@ -715,7 +718,8 @@ def import_picking_atomic(header_data: dict, lines_data: list, company_id: int, 
                 datetime.now(), responsible_user, header_data.get('project_id'),
                 header_data.get('partner_id'), header_data.get('partner_ref'),
                 header_data.get('purchase_order'), header_data.get('date_transfer_db'),
-                header_data.get('op_type_name')
+                header_data.get('op_type_name'),
+                header_data.get('operations_instructions'), header_data.get('warehouse_observations')
             ))
 
             new_picking_id = cursor.fetchone()[0]
@@ -942,71 +946,71 @@ def update_stock_quant(cursor, product_id, location_id, quantity_change, lot_id=
 
 def _check_stock_with_cursor(cursor, picking_id, picking_type_code):
     """
-    [CORREGIDO - LÓGICA UNIVERSAL]
-    Valida disponibilidad REAL.
+    [OPTIMIZADO - Sin N+1]
+    Valida disponibilidad REAL con solo 3 queries totales (sin importar N productos).
     Disponible = (Físico Total) - (Reservado por TODOS en Moves 'listo').
     """
     # 1. Obtener demanda del Picking Actual
     cursor.execute("""
-        SELECT sm.product_id, sm.location_src_id, 
-               SUM(sm.product_uom_qty) as qty_needed, 
+        SELECT sm.product_id, sm.location_src_id,
+               SUM(sm.product_uom_qty) as qty_needed,
                MAX(p.name) as prod_name
-        FROM stock_moves sm 
-        JOIN products p ON sm.product_id = p.id 
+        FROM stock_moves sm
+        JOIN products p ON sm.product_id = p.id
         JOIN locations l ON sm.location_src_id = l.id
         WHERE sm.picking_id = %s AND l.type = 'internal'
         GROUP BY sm.product_id, sm.location_src_id
     """, (picking_id,))
     demands = cursor.fetchall()
-    
+
     if not demands: return True, "Ok"
 
+    # Extraer pares únicos (product_id, location_id)
+    product_ids = list(set(row['product_id'] for row in demands))
+    location_ids = list(set(row['location_src_id'] for row in demands))
+
+    # 2. [BATCH] Obtener stock físico de TODOS los productos/ubicaciones en UNA query
+    cursor.execute("""
+        SELECT product_id, location_id, COALESCE(SUM(quantity), 0) as qty
+        FROM stock_quants
+        WHERE product_id = ANY(%s) AND location_id = ANY(%s)
+        GROUP BY product_id, location_id
+    """, (product_ids, location_ids))
+    physical_map = {(row['product_id'], row['location_id']): float(row['qty']) for row in cursor.fetchall()}
+
+    # 3. [BATCH] Obtener reservas globales de TODOS en UNA query
+    cursor.execute("""
+        SELECT sm.product_id, sm.location_src_id, COALESCE(SUM(sm.product_uom_qty), 0) as qty
+        FROM stock_moves sm
+        JOIN pickings p ON sm.picking_id = p.id
+        WHERE sm.product_id = ANY(%s)
+          AND sm.location_src_id = ANY(%s)
+          AND p.state = 'listo'
+          AND p.id != %s
+          AND sm.state != 'cancelled'
+        GROUP BY sm.product_id, sm.location_src_id
+    """, (product_ids, location_ids, picking_id))
+    reserved_map = {(row['product_id'], row['location_src_id']): float(row['qty']) for row in cursor.fetchall()}
+
+    # 4. Validar cada demanda usando los mapas precargados
     errors = []
-    
     for row in demands:
-        pid = row['product_id']
-        loc = row['location_src_id']
+        pid, loc = row['product_id'], row['location_src_id']
         needed = float(row['qty_needed'])
         p_name = row['prod_name']
 
-        # 2. Calcular Físico (Lo que existe en la estantería)
-        # Sumamos TODO lo que hay en esa ubicación (General + Proyectos)
-        # Porque si está en la ubicación, físicamente está ahí.
-        cursor.execute("""
-            SELECT COALESCE(SUM(quantity), 0) 
-            FROM stock_quants 
-            WHERE product_id = %s AND location_id = %s
-        """, (pid, loc))
-        physical_qty = float(cursor.fetchone()[0])
-
-        # 3. Calcular Reservado TOTAL (La Competencia)
-        # Sumamos TODO lo que otros pickings 'listo' ya apartaron de esa ubicación.
-        # NO filtramos por proyecto. Si la Obra A reservó 3, esas 3 ya no existen para nadie.
-        cursor.execute("""
-            SELECT COALESCE(SUM(sm.product_uom_qty), 0)
-            FROM stock_moves sm
-            JOIN pickings p ON sm.picking_id = p.id
-            WHERE sm.product_id = %s 
-              AND sm.location_src_id = %s
-              AND p.state = 'listo'
-              AND p.id != %s  -- Excluirnos a nosotros mismos para no autobloquearnos
-              AND sm.state != 'cancelled'
-        """, (pid, loc, picking_id))
-        reserved_global = float(cursor.fetchone()[0])
-
-        # 4. Cálculo Final
+        physical_qty = physical_map.get((pid, loc), 0.0)
+        reserved_global = reserved_map.get((pid, loc), 0.0)
         available_real = physical_qty - reserved_global
 
         if picking_type_code == 'ADJ':
-            # Para ajustes negativos (restar stock), validamos contra físico puro
             if needed < 0 and physical_qty < abs(needed):
-                 errors.append(f"- {p_name}: Físico {physical_qty} < Ajuste {abs(needed)}")
+                errors.append(f"- {p_name}: Físico {physical_qty} < Ajuste {abs(needed)}")
         else:
-            # Para salidas normales, validamos contra disponible neto
             if available_real < needed:
                 errors.append(
                     f"- {p_name}: Requerido {needed} > Disponible {available_real} "
-                    f"(Físico: {physical_qty} - Reservado Global: {reserved_global})"
+                    f"(Físico: {physical_qty} - Reservado: {reserved_global})"
                 )
 
     if errors: return False, "Stock insuficiente:\n" + "\n".join(errors)
@@ -1169,9 +1173,9 @@ def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_track
                 # REGLA DE LA VIRGINIDAD (Solo Entradas - IN)
                 if p_code == 'IN' and m['tracking'] == 'serial':
                     cursor.execute("""
-                        SELECT w.name FROM stock_quants sq 
-                        JOIN stock_lots sl ON sq.lot_id = sl.id 
-                        JOIN locations l ON sq.location_id = l.id 
+                        SELECT w.name FROM stock_quants sq
+                        JOIN stock_lots sl ON sq.lot_id = sl.id
+                        JOIN locations l ON sq.location_id = l.id
                         JOIN warehouses w ON l.warehouse_id = w.id
                         WHERE sl.name = %s AND sl.product_id = %s AND sq.quantity > 0 AND l.type = 'internal'
                         LIMIT 1
@@ -1179,6 +1183,17 @@ def _process_picking_validation_with_cursor(cursor, picking_id, moves_with_track
                     existing = cursor.fetchone()
                     if existing:
                         return False, f"La serie '{lname}' YA EXISTE en '{existing['name']}'."
+
+                # [REGLA CRÍTICA] VALIDACIÓN DE EXISTENCIA EN ORIGEN (Solo Salidas/Internas)
+                if p_code in ('OUT', 'INT'):
+                    cursor.execute("""
+                        SELECT 1 FROM stock_quants sq
+                        JOIN stock_lots sl ON sq.lot_id = sl.id
+                        WHERE sl.name = %s AND sl.product_id = %s AND sq.location_id = %s AND sq.quantity > 0
+                        LIMIT 1
+                    """, (lname, m['product_id'], src))
+                    if not cursor.fetchone():
+                        return False, f"La serie '{lname}' NO existe en la ubicación de origen."
 
                 lot_id = create_lot(cursor, m['product_id'], lname)
                 lot_ids_to_process.append((lot_id, lqty))
@@ -2556,13 +2571,13 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
         return execute_query(query, tuple(params), fetchall=True)
 
     elif export_type == 'full':
-        # [v4] NUEVA LÓGICA: 1 FILA POR SERIE
+        # [v5] LÓGICA CORREGIDA: LEFT JOIN para incluir productos sin series asignadas
         # Usamos UNION de dos consultas:
-        # 1. Productos CON series: JOIN directo con stock_move_lines (1 fila por serie)
-        # 2. Productos SIN series: 1 fila por movimiento
+        # 1. Productos CON tracking: LEFT JOIN con stock_move_lines (incluye pendientes)
+        # 2. Productos SIN tracking: 1 fila por movimiento
 
         query = f"""
-            -- PARTE 1: Productos CON series (1 fila por cada serie)
+            -- PARTE 1: Productos CON tracking (1 fila por serie, o 1 fila si no hay series)
             SELECT
                 p.name as picking_name,
                 pt.code as picking_type_code,
@@ -2581,20 +2596,22 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
 
                 prod.sku as product_sku,
                 prod.name as product_name,
-                COALESCE(sml.qty_done, 1) as quantity,
+                -- [FIX] Si no hay líneas asignadas, usar cantidad demandada
+                COALESCE(sml.qty_done, sm.product_uom_qty) as quantity,
                 sm.price_unit,
 
                 {notes_col}
 
-                sl.name as serial
+                -- [FIX] Si no hay serie asignada, mostrar indicador
+                COALESCE(sl.name, '') as serial
 
             FROM pickings p
             JOIN stock_moves sm ON sm.picking_id = p.id
             JOIN products prod ON sm.product_id = prod.id
             JOIN picking_types pt ON p.picking_type_id = pt.id
-            -- JOIN con stock_move_lines y stock_lots para obtener 1 fila por serie
-            JOIN stock_move_lines sml ON sml.move_id = sm.id
-            JOIN stock_lots sl ON sml.lot_id = sl.id
+            -- [FIX] LEFT JOIN para incluir movimientos sin series asignadas (estado Ready)
+            LEFT JOIN stock_move_lines sml ON sml.move_id = sm.id
+            LEFT JOIN stock_lots sl ON sml.lot_id = sl.id
             LEFT JOIN partners part ON p.partner_id = part.id
             LEFT JOIN projects proj ON p.project_id = proj.id
             LEFT JOIN locations l_src ON p.location_src_id = l_src.id
@@ -2610,7 +2627,7 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
 
             UNION ALL
 
-            -- PARTE 2: Productos SIN series (1 fila por movimiento)
+            -- PARTE 2: Productos SIN tracking (1 fila por movimiento)
             SELECT
                 p.name as picking_name,
                 pt.code as picking_type_code,
