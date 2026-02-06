@@ -307,8 +307,8 @@ async def export_pickings_csv(
                 'almacen_destino', 'ubicacion_destino',
                 'partner_ref', 'purchase_order',
                 'date_transfer', 'responsible_user',
-                'employee_name', 
-                'operations_instructions', 
+                'employee_name',
+                'operations_instructions',
                 'warehouse_observations'
             ]
         elif export_type == 'full':
@@ -319,8 +319,8 @@ async def export_pickings_csv(
                 'almacen_destino', 'ubicacion_destino',
                 'partner_ref', 'purchase_order',
                 'date_transfer', 'responsible_user',
-                'employee_name', 
-                'operations_instructions', 
+                'employee_name',
+                'operations_instructions',
                 'warehouse_observations',
                 'product_sku', 'product_name', 'quantity', 'price_unit', 'serial'
             ]
