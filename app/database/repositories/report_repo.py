@@ -9,13 +9,22 @@ from ..core import get_db_connection, return_db_connection, execute_query
 def get_dashboard_kpis(company_id):
     """
     Obtiene contadores de operaciones pendientes por tipo.
-    [CORREGIDO] Solo cuenta estado 'listo' - operaciones que requieren
-    atención inmediata para ser validadas (excluye borradores).
+    [CORREGIDO] Usa date_transfer (fecha de traslado) para determinar urgencia.
+    - atrasadas: date_transfer < HOY en Lima
+    - a_tiempo: date_transfer >= HOY en Lima, o es NULL (sin fecha = a tiempo)
     """
     query = """
+        WITH lima_today AS (
+            SELECT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC' AT TIME ZONE 'America/Lima')::date AS today
+        )
         SELECT
             pt.code,
-            COUNT(p.id) as pending_count
+            COUNT(p.id) as pending_count,
+            COUNT(CASE
+                WHEN p.date_transfer IS NOT NULL
+                 AND p.date_transfer < (SELECT today FROM lima_today)
+                THEN 1
+            END) as late_count
         FROM pickings p
         JOIN picking_types pt ON p.picking_type_id = pt.id
         WHERE p.company_id = %s AND p.state = 'listo'
@@ -23,10 +32,17 @@ def get_dashboard_kpis(company_id):
     """
     results = execute_query(query, (company_id,), fetchall=True)
 
-    kpis = {'IN': 0, 'OUT': 0, 'INT': 0}
+    kpis = {
+        'IN': 0, 'OUT': 0, 'INT': 0,
+        'IN_late': 0, 'OUT_late': 0, 'INT_late': 0
+    }
+
     for row in results:
-        if row['code'] in kpis:
-            kpis[row['code']] = row['pending_count']
+        code = row['code']
+        if code in ('IN', 'OUT', 'INT'):
+            kpis[code] = row['pending_count']
+            kpis[f'{code}_late'] = row['late_count'] or 0
+
     return kpis
 
 def get_operations_throughput(company_id):

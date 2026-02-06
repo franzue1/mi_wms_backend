@@ -36,15 +36,18 @@ def get_picking_details(picking_id, company_id):
     p_info = execute_query(query, {"picking_id": picking_id}, fetchone=True)
 
     moves_query = """
-            SELECT 
-                sm.id, pr.name, pr.sku, sm.product_uom_qty, 
+            SELECT
+                sm.id, pr.name, pr.sku, sm.product_uom_qty,
                 sm.quantity_done, pr.tracking, pr.id as product_id,
                 u.name as uom_name,
                 sm.price_unit,
                 pr.standard_price,
+                pr.ownership,  -- Para badge CONSIGNADO
                 sm.cost_at_adjustment,
-                sm.project_id, proj.name as project_name
-            FROM stock_moves sm 
+                sm.project_id, proj.name as project_name,
+                sm.location_src_id,   -- [MULTI-UBICACIÓN] Ubicación origen por línea
+                sm.location_dest_id   -- [MULTI-UBICACIÓN] Ubicación destino por línea
+            FROM stock_moves sm
             JOIN products pr ON (sm.product_id = pr.id AND pr.company_id = %(company_id)s)
             LEFT JOIN uom u ON pr.uom_id = u.id
             LEFT JOIN projects proj ON sm.project_id = proj.id
@@ -2161,24 +2164,25 @@ def get_picking_ui_details_optimized(picking_id, company_id):
     -- 2. Movimientos
     moves_data AS (
         SELECT COALESCE(json_agg(json_build_object(
-            'id', sm.id, 
+            'id', sm.id,
             'product_id', pr.id,
             'location_src_id', sm.location_src_id,
-            'name', pr.name, 
-            'sku', pr.sku, 
-            'product_uom_qty', sm.product_uom_qty, 
-            'quantity_done', sm.quantity_done, 
-            'tracking', pr.tracking, 
-            'uom_name', u.name, 
+            'location_dest_id', sm.location_dest_id,
+            'name', pr.name,
+            'sku', pr.sku,
+            'product_uom_qty', sm.product_uom_qty,
+            'quantity_done', sm.quantity_done,
+            'tracking', pr.tracking,
+            'uom_name', u.name,
             'price_unit', sm.price_unit,
             'project_id', sm.project_id,
             'standard_price', pr.standard_price,
             'cost_at_adjustment', sm.cost_at_adjustment,
             'ownership', pr.ownership
         )), '[]'::json) as moves
-        FROM stock_moves sm 
-        JOIN products pr ON sm.product_id = pr.id 
-        LEFT JOIN uom u ON pr.uom_id = u.id 
+        FROM stock_moves sm
+        JOIN products pr ON sm.product_id = pr.id
+        LEFT JOIN uom u ON pr.uom_id = u.id
         WHERE sm.picking_id = %(pid)s
     ),
     -- 3. Series

@@ -200,15 +200,20 @@ class StockMoveResponse(BaseModel):
     id: int
     product_id: int
     sku: str
-    name: str 
+    name: str
     product_uom_qty: float
-    quantity_done: float # <-- A veces faltaba este en la definición base
+    quantity_done: float
     tracking: str
     uom_name: Optional[str] = None
     price_unit: Optional[float] = None
     cost_at_adjustment: Optional[float] = None
-    project_id: Optional[int] = None      # <--- AGREGAR
-    project_name: Optional[str] = None    # <--- AGREGAR
+    project_id: Optional[int] = None
+    project_name: Optional[str] = None
+    # [MULTI-UBICACIÓN] Ubicaciones por línea
+    location_src_id: Optional[int] = None
+    location_dest_id: Optional[int] = None
+    # [PROPIEDAD] Para badge CONSIGNADO
+    ownership: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -403,6 +408,11 @@ class DashboardResponse(BaseModel):
     pending_receptions: int = 0
     pending_transfers: int = 0
     pending_liquidations: int = 0
+
+    # [ELEGANTE] Atrasadas por categoría (para indicador sutil)
+    in_late: int = 0   # Recepciones atrasadas
+    int_late: int = 0  # Transferencias atrasadas
+    out_late: int = 0  # OTs/Liquidaciones atrasadas
 
     # 3. Gráficos y Listas
     throughput_chart: List[ThroughputDataPoint] = []

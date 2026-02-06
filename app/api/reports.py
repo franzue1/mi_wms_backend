@@ -101,6 +101,11 @@ async def get_dashboard_kpis(
             pending_transfers=kpis_counts.get('INT', 0),
             pending_liquidations=ots_pendientes,
 
+            # [ELEGANTE] Atrasadas por categoría
+            in_late=kpis_counts.get('IN_late', 0),
+            int_late=kpis_counts.get('INT_late', 0),
+            out_late=kpis_counts.get('OUT_late', 0),
+
             # Gráficos
             throughput_chart=[{"day": day.strftime("%a"), "count": count} for day, count in throughput],
             aging_chart=aging,
