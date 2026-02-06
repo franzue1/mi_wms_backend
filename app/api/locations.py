@@ -30,7 +30,9 @@ async def get_all_locations(
     warehouse_status: Optional[str] = Query(None) # Para filtrar por estado de almacén
 ):
     """ Obtiene una lista de ubicaciones filtrada y paginada. """
-    if "locations.can_crud" not in auth.permissions:
+    # [FIX] Permitir lectura con varios permisos de visualización
+    read_perms = {"locations.can_view", "locations.can_crud", "adjustments.can_view", "operations.can_view"}
+    if not any(p in auth.permissions for p in read_perms):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
     # Usar LocationService para construir filtros
@@ -64,7 +66,9 @@ async def get_locations_count(
     warehouse_status: Optional[str] = Query(None)):
     
     """ Obtiene el conteo total de ubicaciones filtradas. """
-    if "locations.can_crud" not in auth.permissions:
+    # [FIX] Permitir lectura con varios permisos de visualización
+    read_perms = {"locations.can_view", "locations.can_crud", "adjustments.can_view", "operations.can_view"}
+    if not any(p in auth.permissions for p in read_perms):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
 
     # Usar LocationService para construir filtros
@@ -81,7 +85,9 @@ async def get_locations_count(
 @router.get("/{location_id}", response_model=schemas.LocationResponse)
 async def get_location(location_id: int, auth: AuthDependency):
     """ Obtiene una ubicación por su ID. """
-    if "locations.can_crud" not in auth.permissions:
+    # [FIX] Permitir lectura con varios permisos de visualización
+    read_perms = {"locations.can_view", "locations.can_crud", "adjustments.can_view", "operations.can_view"}
+    if not any(p in auth.permissions for p in read_perms):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No autorizado")
         
     loc = db.get_location_details_by_id(location_id)

@@ -1,0 +1,990 @@
+<!DOCTYPE html>
+<html lang="es" class="scroll-smooth">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SpaceCom WMS | Control de Inventario para Contratistas de Telecomunicaciones</title>
+    <meta name="description" content="Sistema de gestión de inventario diseñado para contratistas de última milla. Evita descuentos, controla tus cuadrillas y liquida obras sin errores.">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        'inter': ['Inter', 'sans-serif'],
+                    },
+                    colors: {
+                        'electric': '#3b82f6',
+                        'electric-dark': '#2563eb',
+                        'cyan-accent': '#06b6d4',
+                    },
+                }
+            }
+        }
+    </script>
+
+    <style>
+        * { font-family: 'Inter', sans-serif; }
+
+        .bg-gradient-radial {
+            background: radial-gradient(ellipse at top, rgba(59, 130, 246, 0.15) 0%, transparent 50%),
+                        radial-gradient(ellipse at bottom right, rgba(6, 182, 212, 0.1) 0%, transparent 50%),
+                        #030712;
+        }
+
+        .glass {
+            background: rgba(255, 255, 255, 0.03);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        .glass-strong {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(30px);
+            -webkit-backdrop-filter: blur(30px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .btn-glow {
+            position: relative;
+            overflow: hidden;
+            transition: all 0.3s ease;
+        }
+
+        .btn-glow::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+            transition: left 0.5s ease;
+        }
+
+        .btn-glow:hover::before { left: 100%; }
+
+        .btn-glow:hover {
+            box-shadow: 0 0 30px rgba(59, 130, 246, 0.5), 0 0 60px rgba(59, 130, 246, 0.3);
+            transform: translateY(-2px);
+        }
+
+        @keyframes border-glow {
+            0%, 100% { box-shadow: 0 0 5px #3b82f6, 0 0 10px #3b82f6, 0 0 20px #3b82f6, 0 0 40px #06b6d4; }
+            50% { box-shadow: 0 0 10px #06b6d4, 0 0 20px #06b6d4, 0 0 40px #06b6d4, 0 0 80px #3b82f6; }
+        }
+
+        .neon-border { animation: border-glow 3s ease-in-out infinite; }
+
+        .bg-grid {
+            background-image:
+                linear-gradient(rgba(59, 130, 246, 0.03) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(59, 130, 246, 0.03) 1px, transparent 1px);
+            background-size: 50px 50px;
+        }
+
+        .card-hover { transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1); }
+
+        .card-hover:hover {
+            transform: translateY(-8px);
+            border-color: rgba(59, 130, 246, 0.5);
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3), 0 0 40px rgba(59, 130, 246, 0.1);
+        }
+
+        .counter {
+            background: linear-gradient(135deg, #3b82f6, #06b6d4);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #030712; }
+        ::-webkit-scrollbar-thumb { background: linear-gradient(180deg, #3b82f6, #06b6d4); border-radius: 4px; }
+
+        .line-gradient {
+            background: linear-gradient(90deg, transparent, #3b82f6, #06b6d4, transparent);
+            height: 1px;
+        }
+
+        .text-gradient {
+            background: linear-gradient(135deg, #3b82f6, #06b6d4);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+    </style>
+</head>
+
+<body class="bg-gray-950 text-white bg-gradient-radial bg-grid min-h-screen">
+
+    <!-- ========== NAVBAR ========== -->
+    <nav class="fixed top-0 left-0 right-0 z-50 glass">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex items-center justify-between h-16 md:h-20">
+                <div class="flex items-center space-x-3">
+                    <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-electric to-cyan-accent flex items-center justify-center">
+                        <i data-lucide="satellite" class="w-6 h-6 text-white"></i>
+                    </div>
+                    <span class="text-xl md:text-2xl font-bold tracking-tight">
+                        Space<span class="text-electric">Com</span>
+                    </span>
+                </div>
+
+                <div class="hidden md:flex items-center space-x-8">
+                    <a href="#problema" class="text-gray-400 hover:text-white transition-colors duration-300 text-sm font-medium">El Problema</a>
+                    <a href="#modulos" class="text-gray-400 hover:text-white transition-colors duration-300 text-sm font-medium">Módulos</a>
+                    <a href="#nosotros" class="text-gray-400 hover:text-white transition-colors duration-300 text-sm font-medium">Nosotros</a>
+                    <a href="#pricing" class="text-gray-400 hover:text-white transition-colors duration-300 text-sm font-medium">Planes</a>
+                </div>
+
+                <a href="#" class="btn-glow bg-electric hover:bg-electric-dark text-white px-5 py-2.5 rounded-xl text-sm font-semibold flex items-center space-x-2">
+                    <i data-lucide="log-in" class="w-4 h-4"></i>
+                    <span>Acceso Clientes</span>
+                </a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- ========== HERO SECTION ========== -->
+    <section class="relative min-h-screen flex items-center justify-center pt-20 overflow-hidden">
+        <div class="absolute top-1/4 left-10 w-72 h-72 bg-electric/20 rounded-full blur-[100px] animate-pulse"></div>
+        <div class="absolute bottom-1/4 right-10 w-96 h-96 bg-cyan-accent/15 rounded-full blur-[120px] animate-pulse" style="animation-delay: 2s;"></div>
+
+        <div class="relative z-10 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
+            <div class="inline-flex items-center space-x-2 glass rounded-full px-4 py-2 mb-8">
+                <span class="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
+                <span class="text-sm text-gray-300">Diseñado por y para contratistas de Telecomunicaciones</span>
+            </div>
+
+            <h1 class="text-4xl sm:text-5xl md:text-6xl lg:text-7xl font-black leading-tight mb-6">
+                <span class="block text-white">Deja de Perder Dinero</span>
+                <span class="block text-gradient">en Descuentos por</span>
+                <span class="block text-white">Materiales Perdidos</span>
+            </h1>
+
+            <p class="text-lg md:text-xl text-gray-400 max-w-3xl mx-auto mb-10 leading-relaxed">
+                El sistema de inventario que <span class="text-cyan-accent font-semibold">las contratistas de última milla necesitan</span>.
+                Controla tus cuadrillas, rastrea cada serial, liquida obras sin errores y
+                <span class="text-white font-semibold">recupera el dinero que hoy pierdes en penalidades</span>.
+            </p>
+
+            <div class="flex flex-col sm:flex-row items-center justify-center gap-4 mb-16">
+                <a href="#pricing" class="btn-glow bg-gradient-to-r from-electric to-cyan-accent text-white px-8 py-4 rounded-2xl text-lg font-bold flex items-center space-x-3 w-full sm:w-auto justify-center">
+                    <span>Empieza Gratis Hoy</span>
+                    <i data-lucide="arrow-right" class="w-5 h-5"></i>
+                </a>
+                <a href="#problema" class="glass hover:bg-white/10 text-white px-8 py-4 rounded-2xl text-lg font-semibold flex items-center space-x-3 transition-all duration-300 w-full sm:w-auto justify-center">
+                    <i data-lucide="play-circle" class="w-5 h-5 text-electric"></i>
+                    <span>¿Te suena familiar?</span>
+                </a>
+            </div>
+
+            <div class="flex flex-wrap items-center justify-center gap-6 text-gray-500 text-sm">
+                <span class="font-medium text-gray-400">Contratistas activas en:</span>
+                <div class="flex items-center space-x-2"><span>🇵🇪</span><span>Perú</span></div>
+                <div class="flex items-center space-x-2"><span>🇲🇽</span><span>México</span></div>
+                <div class="flex items-center space-x-2"><span>🇪🇸</span><span>España</span></div>
+                <div class="flex items-center space-x-2"><span>🇨🇴</span><span>Colombia</span></div>
+                <div class="flex items-center space-x-2"><span>🇨🇱</span><span>Chile</span></div>
+            </div>
+        </div>
+
+        <div class="absolute bottom-8 left-1/2 -translate-x-1/2 animate-bounce">
+            <i data-lucide="chevrons-down" class="w-6 h-6 text-gray-500"></i>
+        </div>
+    </section>
+
+    <!-- ========== PROBLEMA SECTION ========== -->
+    <section id="problema" class="py-24 relative">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="text-center mb-16">
+                <div class="inline-flex items-center space-x-2 bg-red-500/10 border border-red-500/20 rounded-full px-4 py-2 mb-6">
+                    <i data-lucide="alert-triangle" class="w-4 h-4 text-red-400"></i>
+                    <span class="text-sm text-red-300">El dolor que conocemos bien</span>
+                </div>
+                <h2 class="text-3xl md:text-5xl font-black mb-6">
+                    ¿Cuánto Dinero Pierdes <span class="text-red-400">Cada Mes</span>?
+                </h2>
+                <p class="text-gray-400 max-w-3xl mx-auto text-lg">
+                    Si eres contratista de telecomunicaciones, seguro conoces estos problemas.
+                    Los vivimos, los sufrimos, y por eso creamos SpaceCom.
+                </p>
+            </div>
+
+            <div class="grid md:grid-cols-2 lg:grid-cols-3 gap-6 mb-16">
+                <!-- Problema 1 -->
+                <div class="glass-strong rounded-2xl p-6 border-l-4 border-red-500/50">
+                    <div class="flex items-start space-x-4">
+                        <div class="w-12 h-12 rounded-xl bg-red-500/10 flex items-center justify-center flex-shrink-0">
+                            <i data-lucide="file-x" class="w-6 h-6 text-red-400"></i>
+                        </div>
+                        <div>
+                            <h3 class="text-lg font-bold mb-2 text-white">Descuentos en Liquidaciones</h3>
+                            <p class="text-gray-400 text-sm">
+                                "No puedo demostrar qué materiales usé en cada obra. La operadora me descuenta
+                                miles de soles cada mes por falta de sustento."
+                            </p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Problema 2 -->
+                <div class="glass-strong rounded-2xl p-6 border-l-4 border-red-500/50">
+                    <div class="flex items-start space-x-4">
+                        <div class="w-12 h-12 rounded-xl bg-red-500/10 flex items-center justify-center flex-shrink-0">
+                            <i data-lucide="users-x" class="w-6 h-6 text-red-400"></i>
+                        </div>
+                        <div>
+                            <h3 class="text-lg font-bold mb-2 text-white">Cuadrillas Sin Control</h3>
+                            <p class="text-gray-400 text-sm">
+                                "Mis técnicos dicen que instalaron el material, pero no hay registro.
+                                No sé quién tiene qué equipo en campo."
+                            </p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Problema 3 -->
+                <div class="glass-strong rounded-2xl p-6 border-l-4 border-red-500/50">
+                    <div class="flex items-start space-x-4">
+                        <div class="w-12 h-12 rounded-xl bg-red-500/10 flex items-center justify-center flex-shrink-0">
+                            <i data-lucide="scan-barcode" class="w-6 h-6 text-red-400"></i>
+                        </div>
+                        <div>
+                            <h3 class="text-lg font-bold mb-2 text-white">Seriales Perdidos</h3>
+                            <p class="text-gray-400 text-sm">
+                                "Tengo ONTs y routers que no sé dónde están. La operadora me cobra equipos
+                                que supuestamente nunca devolví."
+                            </p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Problema 4 -->
+                <div class="glass-strong rounded-2xl p-6 border-l-4 border-red-500/50">
+                    <div class="flex items-start space-x-4">
+                        <div class="w-12 h-12 rounded-xl bg-red-500/10 flex items-center justify-center flex-shrink-0">
+                            <i data-lucide="table" class="w-6 h-6 text-red-400"></i>
+                        </div>
+                        <div>
+                            <h3 class="text-lg font-bold mb-2 text-white">Excel Interminable</h3>
+                            <p class="text-gray-400 text-sm">
+                                "Mi almacenero maneja todo en Excel. Cuando necesito un dato,
+                                tarda horas en encontrarlo. Y los errores de fórmula..."
+                            </p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Problema 5 -->
+                <div class="glass-strong rounded-2xl p-6 border-l-4 border-red-500/50">
+                    <div class="flex items-start space-x-4">
+                        <div class="w-12 h-12 rounded-xl bg-red-500/10 flex items-center justify-center flex-shrink-0">
+                            <i data-lucide="clock" class="w-6 h-6 text-red-400"></i>
+                        </div>
+                        <div>
+                            <h3 class="text-lg font-bold mb-2 text-white">Liquidaciones Atrasadas</h3>
+                            <p class="text-gray-400 text-sm">
+                                "Cerrar el mes me toma semanas. Recopilar información de todas las obras
+                                es un caos total."
+                            </p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Problema 6 -->
+                <div class="glass-strong rounded-2xl p-6 border-l-4 border-red-500/50">
+                    <div class="flex items-start space-x-4">
+                        <div class="w-12 h-12 rounded-xl bg-red-500/10 flex items-center justify-center flex-shrink-0">
+                            <i data-lucide="trending-down" class="w-6 h-6 text-red-400"></i>
+                        </div>
+                        <div>
+                            <h3 class="text-lg font-bold mb-2 text-white">Márgenes que Desaparecen</h3>
+                            <p class="text-gray-400 text-sm">
+                                "Mi utilidad se va en penalidades y materiales no sustentados.
+                                Trabajo para pagar descuentos."
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Solución -->
+            <div class="glass-strong rounded-3xl p-8 md:p-12 text-center relative overflow-hidden">
+                <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-electric via-cyan-accent to-electric"></div>
+                <div class="relative z-10">
+                    <div class="w-20 h-20 mx-auto mb-6 rounded-2xl bg-gradient-to-br from-electric to-cyan-accent flex items-center justify-center">
+                        <i data-lucide="shield-check" class="w-10 h-10 text-white"></i>
+                    </div>
+                    <h3 class="text-2xl md:text-3xl font-bold mb-4">
+                        SpaceCom nació para <span class="text-gradient">resolver exactamente esto</span>
+                    </h3>
+                    <p class="text-gray-400 text-lg max-w-2xl mx-auto">
+                        Un sistema pensado desde la realidad del contratista de última milla.
+                        No es un ERP genérico adaptado, es una herramienta diseñada específicamente
+                        para tu operación diaria.
+                    </p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ========== STATS SECTION ========== -->
+    <section class="relative py-20">
+        <div class="line-gradient w-full mb-20"></div>
+
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-8">
+                <div class="text-center group">
+                    <div class="glass-strong rounded-2xl p-6 card-hover">
+                        <div class="w-14 h-14 mx-auto mb-4 rounded-xl bg-gradient-to-br from-electric/20 to-cyan-accent/20 flex items-center justify-center group-hover:scale-110 transition-transform duration-300">
+                            <i data-lucide="building-2" class="w-7 h-7 text-electric"></i>
+                        </div>
+                        <div class="counter text-4xl md:text-5xl font-black mb-2">+150</div>
+                        <div class="text-gray-400 text-sm font-medium">Contratistas Activas</div>
+                    </div>
+                </div>
+
+                <div class="text-center group">
+                    <div class="glass-strong rounded-2xl p-6 card-hover">
+                        <div class="w-14 h-14 mx-auto mb-4 rounded-xl bg-gradient-to-br from-electric/20 to-cyan-accent/20 flex items-center justify-center group-hover:scale-110 transition-transform duration-300">
+                            <i data-lucide="scan-barcode" class="w-7 h-7 text-cyan-accent"></i>
+                        </div>
+                        <div class="counter text-4xl md:text-5xl font-black mb-2">+5M</div>
+                        <div class="text-gray-400 text-sm font-medium">Seriales Rastreados</div>
+                    </div>
+                </div>
+
+                <div class="text-center group">
+                    <div class="glass-strong rounded-2xl p-6 card-hover">
+                        <div class="w-14 h-14 mx-auto mb-4 rounded-xl bg-gradient-to-br from-electric/20 to-cyan-accent/20 flex items-center justify-center group-hover:scale-110 transition-transform duration-300">
+                            <i data-lucide="hard-hat" class="w-7 h-7 text-electric"></i>
+                        </div>
+                        <div class="counter text-4xl md:text-5xl font-black mb-2">+50K</div>
+                        <div class="text-gray-400 text-sm font-medium">Obras Liquidadas</div>
+                    </div>
+                </div>
+
+                <div class="text-center group">
+                    <div class="glass-strong rounded-2xl p-6 card-hover">
+                        <div class="w-14 h-14 mx-auto mb-4 rounded-xl bg-gradient-to-br from-electric/20 to-cyan-accent/20 flex items-center justify-center group-hover:scale-110 transition-transform duration-300">
+                            <i data-lucide="badge-percent" class="w-7 h-7 text-cyan-accent"></i>
+                        </div>
+                        <div class="counter text-4xl md:text-5xl font-black mb-2">-85%</div>
+                        <div class="text-gray-400 text-sm font-medium">Reducción Descuentos</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="line-gradient w-full mt-20"></div>
+    </section>
+
+    <!-- ========== MÓDULOS SECTION ========== -->
+    <section id="modulos" class="py-24">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="text-center mb-16">
+                <div class="inline-flex items-center space-x-2 glass rounded-full px-4 py-2 mb-6">
+                    <i data-lucide="boxes" class="w-4 h-4 text-electric"></i>
+                    <span class="text-sm text-gray-300">Todo lo que necesitas</span>
+                </div>
+                <h2 class="text-3xl md:text-5xl font-black mb-6">
+                    Módulos Diseñados para <span class="text-gradient">Última Milla</span>
+                </h2>
+                <p class="text-gray-400 max-w-2xl mx-auto text-lg">
+                    No es solo un inventario. Es un ecosistema completo para gestionar toda tu operación de campo.
+                </p>
+            </div>
+
+            <div class="grid md:grid-cols-2 lg:grid-cols-3 gap-8">
+                <!-- Módulo 1: Inventario -->
+                <div class="glass-strong rounded-3xl p-8 card-hover group">
+                    <div class="w-16 h-16 rounded-2xl bg-gradient-to-br from-electric to-electric-dark flex items-center justify-center mb-6 group-hover:scale-110 transition-transform duration-300">
+                        <i data-lucide="warehouse" class="w-8 h-8 text-white"></i>
+                    </div>
+                    <h3 class="text-xl font-bold mb-4">Inventario Multi-Almacén</h3>
+                    <p class="text-gray-400 leading-relaxed mb-6">
+                        Gestiona tu almacén central, bodegas de cuadrillas y consignaciones a técnicos.
+                        Todo sincronizado en tiempo real.
+                    </p>
+                    <ul class="space-y-3">
+                        <li class="flex items-center space-x-3 text-sm text-gray-300">
+                            <i data-lucide="check-circle" class="w-5 h-5 text-green-500 flex-shrink-0"></i>
+                            <span>Entradas y Salidas con trazabilidad</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm text-gray-300">
+                            <i data-lucide="check-circle" class="w-5 h-5 text-green-500 flex-shrink-0"></i>
+                            <span>Transferencias entre ubicaciones</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm text-gray-300">
+                            <i data-lucide="check-circle" class="w-5 h-5 text-green-500 flex-shrink-0"></i>
+                            <span>Control de stock por cuadrilla</span>
+                        </li>
+                    </ul>
+                </div>
+
+                <!-- Módulo 2: Obras -->
+                <div class="glass-strong rounded-3xl p-8 card-hover group">
+                    <div class="w-16 h-16 rounded-2xl bg-gradient-to-br from-cyan-accent to-teal-600 flex items-center justify-center mb-6 group-hover:scale-110 transition-transform duration-300">
+                        <i data-lucide="hard-hat" class="w-8 h-8 text-white"></i>
+                    </div>
+                    <h3 class="text-xl font-bold mb-4">Gestión de Obras</h3>
+                    <p class="text-gray-400 leading-relaxed mb-6">
+                        Cada instalación, cada mantenimiento, cada visita técnica queda registrada
+                        con los materiales exactos utilizados.
+                    </p>
+                    <ul class="space-y-3">
+                        <li class="flex items-center space-x-3 text-sm text-gray-300">
+                            <i data-lucide="check-circle" class="w-5 h-5 text-green-500 flex-shrink-0"></i>
+                            <span>Registro de materiales por OT</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm text-gray-300">
+                            <i data-lucide="check-circle" class="w-5 h-5 text-green-500 flex-shrink-0"></i>
+                            <span>Seguimiento de estado de obras</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm text-gray-300">
+                            <i data-lucide="check-circle" class="w-5 h-5 text-green-500 flex-shrink-0"></i>
+                            <span>Asignación a técnicos/cuadrillas</span>
+                        </li>
+                    </ul>
+                </div>
+
+                <!-- Módulo 3: Liquidaciones -->
+                <div class="glass-strong rounded-3xl p-8 card-hover group">
+                    <div class="w-16 h-16 rounded-2xl bg-gradient-to-br from-green-500 to-emerald-600 flex items-center justify-center mb-6 group-hover:scale-110 transition-transform duration-300">
+                        <i data-lucide="receipt" class="w-8 h-8 text-white"></i>
+                    </div>
+                    <h3 class="text-xl font-bold mb-4">Liquidaciones Automáticas</h3>
+                    <p class="text-gray-400 leading-relaxed mb-6">
+                        Genera reportes de consumo listos para presentar a la operadora.
+                        Cada serial sustentado, cada material justificado.
+                    </p>
+                    <ul class="space-y-3">
+                        <li class="flex items-center space-x-3 text-sm text-gray-300">
+                            <i data-lucide="check-circle" class="w-5 h-5 text-green-500 flex-shrink-0"></i>
+                            <span>Reportes por período/proyecto</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm text-gray-300">
+                            <i data-lucide="check-circle" class="w-5 h-5 text-green-500 flex-shrink-0"></i>
+                            <span>Exportación a formatos requeridos</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm text-gray-300">
+                            <i data-lucide="check-circle" class="w-5 h-5 text-green-500 flex-shrink-0"></i>
+                            <span>Trazabilidad serial completa</span>
+                        </li>
+                    </ul>
+                </div>
+
+                <!-- Módulo 4: Trazabilidad -->
+                <div class="glass-strong rounded-3xl p-8 card-hover group">
+                    <div class="w-16 h-16 rounded-2xl bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center mb-6 group-hover:scale-110 transition-transform duration-300">
+                        <i data-lucide="scan-line" class="w-8 h-8 text-white"></i>
+                    </div>
+                    <h3 class="text-xl font-bold mb-4">Trazabilidad de Seriales</h3>
+                    <p class="text-gray-400 leading-relaxed mb-6">
+                        Cada ONT, cada router, cada decodificador tiene su historial completo.
+                        Desde que entra a tu almacén hasta que se instala.
+                    </p>
+                    <ul class="space-y-3">
+                        <li class="flex items-center space-x-3 text-sm text-gray-300">
+                            <i data-lucide="check-circle" class="w-5 h-5 text-green-500 flex-shrink-0"></i>
+                            <span>Historial completo por serial</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm text-gray-300">
+                            <i data-lucide="check-circle" class="w-5 h-5 text-green-500 flex-shrink-0"></i>
+                            <span>Escaneo masivo QR/Barcode</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm text-gray-300">
+                            <i data-lucide="check-circle" class="w-5 h-5 text-green-500 flex-shrink-0"></i>
+                            <span>Búsqueda instantánea</span>
+                        </li>
+                    </ul>
+                </div>
+
+                <!-- Módulo 5: Cuadrillas -->
+                <div class="glass-strong rounded-3xl p-8 card-hover group">
+                    <div class="w-16 h-16 rounded-2xl bg-gradient-to-br from-orange-500 to-amber-500 flex items-center justify-center mb-6 group-hover:scale-110 transition-transform duration-300">
+                        <i data-lucide="users" class="w-8 h-8 text-white"></i>
+                    </div>
+                    <h3 class="text-xl font-bold mb-4">Control de Cuadrillas</h3>
+                    <p class="text-gray-400 leading-relaxed mb-6">
+                        Asigna materiales a cada técnico o equipo. Sabe exactamente quién tiene qué
+                        y qué ha consumido en sus instalaciones.
+                    </p>
+                    <ul class="space-y-3">
+                        <li class="flex items-center space-x-3 text-sm text-gray-300">
+                            <i data-lucide="check-circle" class="w-5 h-5 text-green-500 flex-shrink-0"></i>
+                            <span>Consignación por técnico</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm text-gray-300">
+                            <i data-lucide="check-circle" class="w-5 h-5 text-green-500 flex-shrink-0"></i>
+                            <span>Devoluciones controladas</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm text-gray-300">
+                            <i data-lucide="check-circle" class="w-5 h-5 text-green-500 flex-shrink-0"></i>
+                            <span>Balance de materiales</span>
+                        </li>
+                    </ul>
+                </div>
+
+                <!-- Módulo 6: Reportes -->
+                <div class="glass-strong rounded-3xl p-8 card-hover group">
+                    <div class="w-16 h-16 rounded-2xl bg-gradient-to-br from-rose-500 to-red-600 flex items-center justify-center mb-6 group-hover:scale-110 transition-transform duration-300">
+                        <i data-lucide="bar-chart-3" class="w-8 h-8 text-white"></i>
+                    </div>
+                    <h3 class="text-xl font-bold mb-4">Reportes y Dashboard</h3>
+                    <p class="text-gray-400 leading-relaxed mb-6">
+                        Visualiza el estado de tu operación en tiempo real. Toma decisiones
+                        basadas en datos, no en suposiciones.
+                    </p>
+                    <ul class="space-y-3">
+                        <li class="flex items-center space-x-3 text-sm text-gray-300">
+                            <i data-lucide="check-circle" class="w-5 h-5 text-green-500 flex-shrink-0"></i>
+                            <span>Dashboard en tiempo real</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm text-gray-300">
+                            <i data-lucide="check-circle" class="w-5 h-5 text-green-500 flex-shrink-0"></i>
+                            <span>Exportación Excel/CSV/PDF</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm text-gray-300">
+                            <i data-lucide="check-circle" class="w-5 h-5 text-green-500 flex-shrink-0"></i>
+                            <span>Alertas de stock mínimo</span>
+                        </li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ========== NOSOTROS SECTION ========== -->
+    <section id="nosotros" class="py-24 relative">
+        <div class="absolute top-1/2 left-0 w-96 h-96 bg-electric/10 rounded-full blur-[150px]"></div>
+
+        <div class="relative z-10 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="grid lg:grid-cols-2 gap-16 items-center">
+                <!-- Texto -->
+                <div>
+                    <div class="inline-flex items-center space-x-2 glass rounded-full px-4 py-2 mb-6">
+                        <i data-lucide="heart" class="w-4 h-4 text-red-400"></i>
+                        <span class="text-sm text-gray-300">Nuestra Historia</span>
+                    </div>
+
+                    <h2 class="text-3xl md:text-5xl font-black mb-8">
+                        Creado por Alguien que <span class="text-gradient">Vivió tu Mismo Dolor</span>
+                    </h2>
+
+                    <div class="space-y-6 text-gray-300 leading-relaxed">
+                        <p>
+                            <span class="text-white font-semibold">No soy un desarrollador que decidió hacer un software de inventario.</span>
+                            Soy alguien que pasó años trabajando en el corazón de la industria de telecomunicaciones,
+                            viendo de cerca cómo operan las grandes operadoras y cómo sufren las contratistas.
+                        </p>
+
+                        <p>
+                            He trabajado con <span class="text-cyan-accent font-medium">diversas operadoras de telecomunicaciones</span>,
+                            conociendo desde adentro sus procesos de liquidación, sus exigencias de trazabilidad,
+                            y los famosos "descuentos" que tanto afectan a las contratistas.
+                        </p>
+
+                        <p>
+                            Vi cómo empresas trabajadoras perdían miles de dólares cada mes solo porque no tenían
+                            cómo demostrar el uso de sus materiales. Vi almaceneros ahogados en Excel.
+                            Vi técnicos culpados por equipos que nadie sabía dónde estaban.
+                        </p>
+
+                        <p class="text-white text-lg font-medium border-l-4 border-electric pl-4">
+                            "Busqué en el mercado una solución adecuada para contratistas de última milla.
+                            No existía. Los ERPs genéricos no entienden nuestra operación.
+                            Así que decidí crear el sistema que todos necesitábamos."
+                        </p>
+
+                        <p>
+                            <span class="text-white font-semibold">SpaceCom WMS</span> no es un software más.
+                            Es la herramienta que yo hubiera querido tener cuando empecé en este rubro.
+                            Está diseñada pensando en cada detalle de tu operación diaria,
+                            porque conozco esa operación de primera mano.
+                        </p>
+                    </div>
+                </div>
+
+                <!-- Visual -->
+                <div class="relative">
+                    <div class="glass-strong rounded-3xl p-8 md:p-12">
+                        <!-- Timeline -->
+                        <div class="space-y-8">
+                            <div class="flex items-start space-x-4">
+                                <div class="w-12 h-12 rounded-full bg-electric/20 flex items-center justify-center flex-shrink-0">
+                                    <i data-lucide="briefcase" class="w-6 h-6 text-electric"></i>
+                                </div>
+                                <div>
+                                    <h4 class="text-white font-bold mb-1">+10 años en Telecomunicaciones</h4>
+                                    <p class="text-gray-400 text-sm">Experiencia directa con operadoras líderes del mercado latinoamericano.</p>
+                                </div>
+                            </div>
+
+                            <div class="flex items-start space-x-4">
+                                <div class="w-12 h-12 rounded-full bg-cyan-accent/20 flex items-center justify-center flex-shrink-0">
+                                    <i data-lucide="eye" class="w-6 h-6 text-cyan-accent"></i>
+                                </div>
+                                <div>
+                                    <h4 class="text-white font-bold mb-1">Conocimiento de Primera Mano</h4>
+                                    <p class="text-gray-400 text-sm">Procesos de liquidación, auditorías, y las reglas del juego que nadie te explica.</p>
+                                </div>
+                            </div>
+
+                            <div class="flex items-start space-x-4">
+                                <div class="w-12 h-12 rounded-full bg-green-500/20 flex items-center justify-center flex-shrink-0">
+                                    <i data-lucide="lightbulb" class="w-6 h-6 text-green-500"></i>
+                                </div>
+                                <div>
+                                    <h4 class="text-white font-bold mb-1">La Solución que No Existía</h4>
+                                    <p class="text-gray-400 text-sm">Creamos lo que el mercado necesitaba: un WMS especializado en última milla.</p>
+                                </div>
+                            </div>
+
+                            <div class="flex items-start space-x-4">
+                                <div class="w-12 h-12 rounded-full bg-purple-500/20 flex items-center justify-center flex-shrink-0">
+                                    <i data-lucide="rocket" class="w-6 h-6 text-purple-500"></i>
+                                </div>
+                                <div>
+                                    <h4 class="text-white font-bold mb-1">Misión Clara</h4>
+                                    <p class="text-gray-400 text-sm">Que ninguna contratista vuelva a perder dinero por falta de control de inventario.</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Decoración -->
+                    <div class="absolute -top-4 -right-4 w-24 h-24 bg-electric/30 rounded-full blur-2xl"></div>
+                    <div class="absolute -bottom-4 -left-4 w-32 h-32 bg-cyan-accent/20 rounded-full blur-2xl"></div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ========== PRICING SECTION ========== -->
+    <section id="pricing" class="py-24 relative">
+        <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-electric/10 rounded-full blur-[150px]"></div>
+
+        <div class="relative z-10 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="text-center mb-16">
+                <div class="inline-flex items-center space-x-2 glass rounded-full px-4 py-2 mb-6">
+                    <i data-lucide="credit-card" class="w-4 h-4 text-electric"></i>
+                    <span class="text-sm text-gray-300">Planes Simples y Transparentes</span>
+                </div>
+                <h2 class="text-3xl md:text-5xl font-black mb-6">
+                    Invierte Menos de lo que <span class="text-gradient">Pierdes en Descuentos</span>
+                </h2>
+                <p class="text-gray-400 max-w-2xl mx-auto text-lg">
+                    Un mes de SpaceCom cuesta menos que un solo descuento injusto.
+                    La pregunta no es si puedes pagarlo, es si puedes seguir sin él.
+                </p>
+            </div>
+
+            <div class="grid md:grid-cols-3 gap-8 items-start">
+                <!-- Plan Free -->
+                <div class="glass-strong rounded-3xl p-8 card-hover">
+                    <div class="mb-8">
+                        <div class="inline-flex items-center space-x-2 bg-gray-800 rounded-full px-3 py-1 mb-4">
+                            <i data-lucide="gift" class="w-4 h-4 text-gray-400"></i>
+                            <span class="text-sm text-gray-400">Free</span>
+                        </div>
+                        <div class="flex items-baseline space-x-2 mb-2">
+                            <span class="text-5xl font-black">$0</span>
+                            <span class="text-gray-500">/mes por usuario</span>
+                        </div>
+                        <p class="text-gray-400 text-sm">Perfecto para probar el sistema o equipos muy pequeños.</p>
+                    </div>
+
+                    <ul class="space-y-4 mb-8">
+                        <li class="flex items-center space-x-3 text-sm">
+                            <i data-lucide="check" class="w-5 h-5 text-green-500"></i>
+                            <span class="text-gray-300">1 Almacén</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm">
+                            <i data-lucide="check" class="w-5 h-5 text-green-500"></i>
+                            <span class="text-gray-300">Hasta 500 productos</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm">
+                            <i data-lucide="check" class="w-5 h-5 text-green-500"></i>
+                            <span class="text-gray-300">2 usuarios incluidos</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm">
+                            <i data-lucide="check" class="w-5 h-5 text-green-500"></i>
+                            <span class="text-gray-300">Operaciones básicas</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm">
+                            <i data-lucide="x" class="w-5 h-5 text-gray-600"></i>
+                            <span class="text-gray-500">Módulo de Obras</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm">
+                            <i data-lucide="x" class="w-5 h-5 text-gray-600"></i>
+                            <span class="text-gray-500">Liquidaciones automáticas</span>
+                        </li>
+                    </ul>
+
+                    <a href="#" class="block w-full text-center glass hover:bg-white/10 text-white py-4 rounded-xl font-semibold transition-all duration-300">
+                        Empezar Gratis
+                    </a>
+                </div>
+
+                <!-- Plan Starter (Popular) -->
+                <div class="relative glass-strong rounded-3xl p-8 neon-border transform md:-translate-y-4">
+                    <div class="absolute -top-4 left-1/2 -translate-x-1/2">
+                        <div class="bg-gradient-to-r from-electric to-cyan-accent text-white text-sm font-bold px-4 py-1 rounded-full">
+                            MÁS POPULAR
+                        </div>
+                    </div>
+
+                    <div class="mb-8 pt-4">
+                        <div class="inline-flex items-center space-x-2 bg-electric/20 rounded-full px-3 py-1 mb-4">
+                            <i data-lucide="zap" class="w-4 h-4 text-electric"></i>
+                            <span class="text-sm text-electric">Starter</span>
+                        </div>
+                        <div class="flex items-baseline space-x-2 mb-2">
+                            <span class="text-5xl font-black counter">$15</span>
+                            <span class="text-gray-500">/mes por usuario</span>
+                        </div>
+                        <p class="text-gray-400 text-sm">Para contratistas que quieren control total de su operación.</p>
+                    </div>
+
+                    <ul class="space-y-4 mb-8">
+                        <li class="flex items-center space-x-3 text-sm">
+                            <i data-lucide="check" class="w-5 h-5 text-electric"></i>
+                            <span class="text-white font-medium">Almacenes ilimitados</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm">
+                            <i data-lucide="check" class="w-5 h-5 text-electric"></i>
+                            <span class="text-white font-medium">Productos y seriales ilimitados</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm">
+                            <i data-lucide="check" class="w-5 h-5 text-electric"></i>
+                            <span class="text-white font-medium">Módulo de Obras completo</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm">
+                            <i data-lucide="check" class="w-5 h-5 text-electric"></i>
+                            <span class="text-white font-medium">Liquidaciones automáticas</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm">
+                            <i data-lucide="check" class="w-5 h-5 text-electric"></i>
+                            <span class="text-white font-medium">Control de cuadrillas</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm">
+                            <i data-lucide="check" class="w-5 h-5 text-electric"></i>
+                            <span class="text-white font-medium">Soporte prioritario</span>
+                        </li>
+                    </ul>
+
+                    <a href="#" class="btn-glow block w-full text-center bg-gradient-to-r from-electric to-cyan-accent text-white py-4 rounded-xl font-bold">
+                        Elegir Starter
+                    </a>
+
+                    <p class="text-center text-gray-500 text-xs mt-4">
+                        5 usuarios = $75/mes · 10 usuarios = $150/mes
+                    </p>
+                </div>
+
+                <!-- Plan Enterprise -->
+                <div class="glass-strong rounded-3xl p-8 card-hover">
+                    <div class="mb-8">
+                        <div class="inline-flex items-center space-x-2 bg-purple-500/20 rounded-full px-3 py-1 mb-4">
+                            <i data-lucide="building" class="w-4 h-4 text-purple-400"></i>
+                            <span class="text-sm text-purple-400">Enterprise</span>
+                        </div>
+                        <div class="flex items-baseline space-x-2 mb-2">
+                            <span class="text-4xl font-black">Consultar</span>
+                        </div>
+                        <p class="text-gray-400 text-sm">Soluciones personalizadas para operaciones complejas.</p>
+                    </div>
+
+                    <ul class="space-y-4 mb-8">
+                        <li class="flex items-center space-x-3 text-sm">
+                            <i data-lucide="check" class="w-5 h-5 text-purple-500"></i>
+                            <span class="text-gray-300">Todo lo de Starter</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm">
+                            <i data-lucide="check" class="w-5 h-5 text-purple-500"></i>
+                            <span class="text-gray-300">Integraciones personalizadas</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm">
+                            <i data-lucide="check" class="w-5 h-5 text-purple-500"></i>
+                            <span class="text-gray-300">Módulos a medida</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm">
+                            <i data-lucide="check" class="w-5 h-5 text-purple-500"></i>
+                            <span class="text-gray-300">Reportes personalizados</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm">
+                            <i data-lucide="check" class="w-5 h-5 text-purple-500"></i>
+                            <span class="text-gray-300">API dedicada</span>
+                        </li>
+                        <li class="flex items-center space-x-3 text-sm">
+                            <i data-lucide="check" class="w-5 h-5 text-purple-500"></i>
+                            <span class="text-gray-300">Account Manager dedicado</span>
+                        </li>
+                    </ul>
+
+                    <a href="#" class="block w-full text-center glass hover:bg-white/10 text-white py-4 rounded-xl font-semibold transition-all duration-300 flex items-center justify-center space-x-2">
+                        <span>Contactar Ventas</span>
+                        <i data-lucide="arrow-right" class="w-4 h-4"></i>
+                    </a>
+                </div>
+            </div>
+
+            <!-- Garantía -->
+            <div class="mt-16 text-center">
+                <div class="glass-strong rounded-2xl p-6 inline-flex items-center space-x-4">
+                    <div class="w-12 h-12 rounded-full bg-green-500/20 flex items-center justify-center">
+                        <i data-lucide="shield-check" class="w-6 h-6 text-green-500"></i>
+                    </div>
+                    <div class="text-left">
+                        <p class="text-white font-semibold">Garantía de Satisfacción</p>
+                        <p class="text-gray-400 text-sm">Si en 30 días no ves resultados, te devolvemos tu dinero. Sin preguntas.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ========== CTA SECTION ========== -->
+    <section class="py-24">
+        <div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="glass-strong rounded-3xl p-12 text-center relative overflow-hidden">
+                <div class="absolute top-0 right-0 w-64 h-64 bg-electric/20 rounded-full blur-[80px]"></div>
+                <div class="absolute bottom-0 left-0 w-48 h-48 bg-cyan-accent/20 rounded-full blur-[60px]"></div>
+
+                <div class="relative z-10">
+                    <div class="w-20 h-20 mx-auto mb-8 rounded-2xl bg-gradient-to-br from-electric to-cyan-accent flex items-center justify-center">
+                        <i data-lucide="rocket" class="w-10 h-10 text-white"></i>
+                    </div>
+
+                    <h2 class="text-3xl md:text-4xl font-black mb-4">
+                        ¿Cuánto más vas a esperar?
+                    </h2>
+                    <p class="text-gray-400 text-lg mb-8 max-w-2xl mx-auto">
+                        Cada mes que pasa sin control es dinero que pierdes.
+                        Empieza gratis hoy y descubre por qué las contratistas
+                        que usan SpaceCom ya no sufren con sus liquidaciones.
+                    </p>
+
+                    <div class="flex flex-col sm:flex-row items-center justify-center gap-4">
+                        <a href="#" class="btn-glow bg-gradient-to-r from-electric to-cyan-accent text-white px-8 py-4 rounded-2xl text-lg font-bold flex items-center space-x-3">
+                            <span>Crear Cuenta Gratis</span>
+                            <i data-lucide="arrow-right" class="w-5 h-5"></i>
+                        </a>
+                        <a href="#" class="text-gray-400 hover:text-white transition-colors flex items-center space-x-2">
+                            <i data-lucide="message-circle" class="w-5 h-5"></i>
+                            <span>Hablar con Ventas</span>
+                        </a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ========== FOOTER ========== -->
+    <footer class="py-12 border-t border-gray-800">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="grid md:grid-cols-4 gap-12 mb-12">
+                <div class="md:col-span-2">
+                    <div class="flex items-center space-x-3 mb-6">
+                        <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-electric to-cyan-accent flex items-center justify-center">
+                            <i data-lucide="satellite" class="w-6 h-6 text-white"></i>
+                        </div>
+                        <span class="text-2xl font-bold tracking-tight">
+                            Space<span class="text-electric">Com</span>
+                        </span>
+                    </div>
+                    <p class="text-gray-400 mb-6 max-w-md">
+                        El sistema de gestión de inventario creado específicamente para
+                        contratistas de telecomunicaciones e instalaciones de última milla.
+                    </p>
+                    <div class="flex space-x-4">
+                        <a href="#" class="w-10 h-10 glass rounded-lg flex items-center justify-center hover:bg-electric/20 transition-colors">
+                            <i data-lucide="linkedin" class="w-5 h-5 text-gray-400 hover:text-white"></i>
+                        </a>
+                        <a href="#" class="w-10 h-10 glass rounded-lg flex items-center justify-center hover:bg-electric/20 transition-colors">
+                            <i data-lucide="facebook" class="w-5 h-5 text-gray-400 hover:text-white"></i>
+                        </a>
+                        <a href="#" class="w-10 h-10 glass rounded-lg flex items-center justify-center hover:bg-electric/20 transition-colors">
+                            <i data-lucide="instagram" class="w-5 h-5 text-gray-400 hover:text-white"></i>
+                        </a>
+                        <a href="#" class="w-10 h-10 glass rounded-lg flex items-center justify-center hover:bg-electric/20 transition-colors">
+                            <i data-lucide="youtube" class="w-5 h-5 text-gray-400 hover:text-white"></i>
+                        </a>
+                    </div>
+                </div>
+
+                <div>
+                    <h4 class="text-white font-semibold mb-4">Producto</h4>
+                    <ul class="space-y-3">
+                        <li><a href="#modulos" class="text-gray-400 hover:text-white transition-colors text-sm">Módulos</a></li>
+                        <li><a href="#pricing" class="text-gray-400 hover:text-white transition-colors text-sm">Precios</a></li>
+                        <li><a href="#" class="text-gray-400 hover:text-white transition-colors text-sm">Casos de Éxito</a></li>
+                        <li><a href="#" class="text-gray-400 hover:text-white transition-colors text-sm">Actualizaciones</a></li>
+                    </ul>
+                </div>
+
+                <div>
+                    <h4 class="text-white font-semibold mb-4">Soporte</h4>
+                    <ul class="space-y-3">
+                        <li><a href="#" class="text-gray-400 hover:text-white transition-colors text-sm">Centro de Ayuda</a></li>
+                        <li><a href="#" class="text-gray-400 hover:text-white transition-colors text-sm">Contacto</a></li>
+                        <li><a href="#" class="text-gray-400 hover:text-white transition-colors text-sm">Capacitaciones</a></li>
+                        <li><a href="#nosotros" class="text-gray-400 hover:text-white transition-colors text-sm">Sobre Nosotros</a></li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="border-t border-gray-800 pt-8 flex flex-col md:flex-row items-center justify-between">
+                <p class="text-gray-500 text-sm mb-4 md:mb-0">
+                    © 2024 SpaceCom WMS. Todos los derechos reservados.
+                </p>
+                <div class="flex space-x-6">
+                    <a href="#" class="text-gray-500 hover:text-gray-300 text-sm transition-colors">Términos</a>
+                    <a href="#" class="text-gray-500 hover:text-gray-300 text-sm transition-colors">Privacidad</a>
+                    <a href="#" class="text-gray-500 hover:text-gray-300 text-sm transition-colors">Cookies</a>
+                </div>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+        lucide.createIcons();
+
+        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+            anchor.addEventListener('click', function (e) {
+                e.preventDefault();
+                const target = document.querySelector(this.getAttribute('href'));
+                if (target) {
+                    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }
+            });
+        });
+
+        const observerOptions = { threshold: 0.1, rootMargin: '0px 0px -50px 0px' };
+        const observer = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting) {
+                    entry.target.style.opacity = '1';
+                    entry.target.style.transform = 'translateY(0)';
+                }
+            });
+        }, observerOptions);
+
+        document.querySelectorAll('.card-hover, .glass-strong').forEach(el => {
+            el.style.opacity = '0';
+            el.style.transform = 'translateY(20px)';
+            el.style.transition = 'opacity 0.6s ease, transform 0.6s ease';
+            observer.observe(el);
+        });
+    </script>
+</body>
+</html>

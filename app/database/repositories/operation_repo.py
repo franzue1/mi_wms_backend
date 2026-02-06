@@ -164,14 +164,21 @@ def update_picking_header(pid: int, updates: dict):
                 'project_id': 'project_id'
             }
 
-            # [PROTECCIÓN CRÍTICA] 
+            # [PROTECCIÓN CRÍTICA]
             # Si es Ajuste (ADJ), NO sobrescribir ubicaciones de líneas con la cabecera.
             if pt_code == 'ADJ':
                 cascade_map.pop('location_src_id', None)
                 cascade_map.pop('location_dest_id', None)
 
+            # [MULTI-UBICACIÓN] Si el frontend indica que hay ubicaciones mixtas,
+            # NO cascadeamos las ubicaciones (cada línea mantiene la suya)
+            skip_location_cascade = fields_to_update.pop('_skip_location_cascade', False)
+
             for head_field, move_field in cascade_map.items():
                 if head_field in fields_to_update:
+                    # Si se solicita NO cascadear ubicaciones, saltamos esos campos
+                    if skip_location_cascade and head_field in ('location_src_id', 'location_dest_id'):
+                        continue
                     moves_updates.append(f"{move_field} = %s")
                     moves_params.append(fields_to_update[head_field])
             
@@ -603,6 +610,27 @@ def update_move_price(move_id, new_price):
     res = execute_commit_query(query, (new_price, move_id), fetchone=True)
     return True if res else False
 
+
+def update_move_location(move_id: int, loc_src_id: int = None, loc_dest_id: int = None):
+    """
+    Actualiza la ubicación origen/destino de una línea específica.
+    Permite que cada línea tenga su propia ubicación independiente de la cabecera.
+    """
+    updates, params = [], []
+    if loc_src_id is not None:
+        updates.append("location_src_id = %s")
+        params.append(loc_src_id)
+    if loc_dest_id is not None:
+        updates.append("location_dest_id = %s")
+        params.append(loc_dest_id)
+    if not updates:
+        return False
+    params.append(move_id)
+    query = f"UPDATE stock_moves SET {', '.join(updates)} WHERE id = %s RETURNING id"
+    res = execute_commit_query(query, tuple(params), fetchone=True)
+    return res is not None
+
+
 def delete_stock_move(move_id):
     conn = None
     try:
@@ -653,12 +681,80 @@ OWNERSHIP_RULES = {
     "Devolución a Cliente": "consigned",
 }
 
+
+def _aggregate_import_lines(lines_data: list) -> list:
+    """
+    Agrega líneas de importación que comparten el mismo product_id.
+
+    - Suma las cantidades (final_qty)
+    - Consolida las series de todas las filas duplicadas
+    - Promedia los precios si difieren (o toma el primero si son iguales)
+
+    Args:
+        lines_data: Lista de dicts con keys: product_id, final_qty, final_price, serials
+
+    Returns:
+        Lista consolidada donde cada product_id aparece una sola vez
+    """
+    if not lines_data:
+        return []
+
+    # Diccionario para agrupar por product_id
+    # Key: product_id, Value: dict con qty acumulada, series acumuladas, precios para promediar
+    aggregated = {}
+
+    for line in lines_data:
+        product_id = line['product_id']
+        qty = float(line.get('final_qty', 0))
+        price = float(line.get('final_price', 0))
+        serials = line.get('serials', []) or []
+
+        if product_id not in aggregated:
+            # Primera aparición de este producto
+            aggregated[product_id] = {
+                'product_id': product_id,
+                'final_qty': qty,
+                'final_price': price,
+                'serials': list(serials),  # Copia para no mutar original
+                '_prices': [price],  # Lista interna para calcular promedio
+                '_count': 1
+            }
+        else:
+            # Producto ya existe, agregar
+            agg = aggregated[product_id]
+            agg['final_qty'] += qty
+            agg['serials'].extend(serials)
+            agg['_prices'].append(price)
+            agg['_count'] += 1
+
+    # Calcular precio promedio para productos con múltiples filas
+    result = []
+    for product_id, agg in aggregated.items():
+        # Calcular precio promedio (si todos son iguales, queda igual)
+        prices = agg['_prices']
+        if len(prices) > 1:
+            avg_price = sum(prices) / len(prices)
+        else:
+            avg_price = prices[0] if prices else 0
+
+        result.append({
+            'product_id': agg['product_id'],
+            'final_qty': agg['final_qty'],
+            'final_price': avg_price,
+            'serials': agg['serials']
+        })
+
+    return result
+
 def import_picking_atomic(header_data: dict, lines_data: list, company_id: int, responsible_user: str):
     """
     [TRANSACCIÓN ATÓMICA] Importa un picking completo (cabecera + líneas) de forma segura.
 
     Si CUALQUIER validación o inserción falla, se hace ROLLBACK total.
     Nada queda guardado en la BD hasta que TODO sea exitoso.
+
+    [AGREGACIÓN AUTOMÁTICA] Si el CSV contiene múltiples filas para el mismo
+    producto, se consolidan en una sola línea con cantidad sumada y series unificadas.
 
     Args:
         header_data: dict con keys:
@@ -678,6 +774,12 @@ def import_picking_atomic(header_data: dict, lines_data: list, company_id: int, 
     try:
         conn = get_db_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+
+            # ═══════════════════════════════════════════════════════════════════
+            # FASE 0: AGREGACIÓN DE LÍNEAS DUPLICADAS
+            # ═══════════════════════════════════════════════════════════════════
+            # Consolida filas con el mismo product_id: suma cantidades, une series
+            lines_data = _aggregate_import_lines(lines_data)
 
             # ═══════════════════════════════════════════════════════════════════
             # FASE 1: VALIDACIÓN PREVIA DE TODAS LAS LÍNEAS (Antes de crear nada)
@@ -1668,6 +1770,64 @@ def get_real_available_stock(product_id, location_id, project_id=None):
     
     return available
 
+def get_product_stock_all_locations(product_id: int, warehouse_id: int = None):
+    """
+    [STOCK INTELIGENTE] Obtiene el stock disponible de un producto en TODAS las ubicaciones.
+    Retorna lista de {location_id, location_name, qty_available} ordenada por cantidad desc.
+    Solo incluye ubicaciones con stock > 0.
+    Si se proporciona warehouse_id, filtra solo ubicaciones de ese almacén.
+    """
+    if not product_id:
+        return []
+
+    # Query para obtener stock físico por ubicación
+    query = """
+        WITH physical_stock AS (
+            SELECT sq.location_id, COALESCE(SUM(sq.quantity), 0) as physical
+            FROM stock_quants sq
+            JOIN locations l ON sq.location_id = l.id
+            WHERE sq.product_id = %s
+              AND l.type = 'internal'
+    """
+    params = [product_id]
+
+    if warehouse_id:
+        query += " AND l.warehouse_id = %s"
+        params.append(warehouse_id)
+
+    query += """
+            GROUP BY sq.location_id
+        ),
+        reserved_stock AS (
+            SELECT sm.location_src_id as location_id, COALESCE(SUM(sm.product_uom_qty), 0) as reserved
+            FROM stock_moves sm
+            JOIN pickings p ON sm.picking_id = p.id
+            WHERE sm.product_id = %s
+              AND p.state = 'listo'
+              AND sm.state != 'cancelled'
+            GROUP BY sm.location_src_id
+        )
+        SELECT
+            l.id as location_id,
+            l.name as location_name,
+            COALESCE(ps.physical, 0) - COALESCE(rs.reserved, 0) as qty_available
+        FROM locations l
+        LEFT JOIN physical_stock ps ON l.id = ps.location_id
+        LEFT JOIN reserved_stock rs ON l.id = rs.location_id
+        WHERE l.type = 'internal'
+          AND (COALESCE(ps.physical, 0) - COALESCE(rs.reserved, 0)) > 0
+    """
+    params.append(product_id)
+
+    if warehouse_id:
+        query += " AND l.warehouse_id = %s"
+        params.append(warehouse_id)
+
+    query += " ORDER BY qty_available DESC"
+
+    results = execute_query(query, tuple(params), fetchall=True)
+    return [dict(r) for r in results] if results else []
+
 def get_products_with_stock_at_location(location_id):
     if not location_id: return []
     query = """
@@ -2539,9 +2699,9 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
 
     notes_col = "p.notes as comentarios,"
 
-    # Definimos la lógica de visualización de ubicaciones
-    smart_locations_sql = """
-        -- LOGICA INTELIGENTE ORIGEN
+    # Definimos la lógica de visualización de ubicaciones (para cabeceras)
+    smart_locations_sql_header = """
+        -- LOGICA INTELIGENTE ORIGEN (CABECERA)
         CASE
             WHEN pt.code = 'IN' THEN part.name
             WHEN l_src.type = 'internal' THEN w_src.name
@@ -2553,7 +2713,7 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
             ELSE l_src.path
         END as ubicacion_origen,
 
-        -- LOGICA INTELIGENTE DESTINO
+        -- LOGICA INTELIGENTE DESTINO (CABECERA)
         CASE
             WHEN pt.code = 'OUT' THEN part.name
             WHEN l_dest.type = 'internal' THEN w_dest.name
@@ -2563,6 +2723,33 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
         CASE
             WHEN pt.code = 'OUT' THEN part.name
             ELSE l_dest.path
+        END as ubicacion_destino
+    """
+
+    # [MULTI-UBICACIÓN] Ubicaciones a nivel de línea (stock_move)
+    smart_locations_sql_move = """
+        -- LOGICA INTELIGENTE ORIGEN (LINEA - usa sm.location_src_id)
+        CASE
+            WHEN pt.code = 'IN' THEN part.name
+            WHEN l_src_move.type = 'internal' THEN w_src_move.name
+            ELSE l_src_move.path
+        END as almacen_origen,
+
+        CASE
+            WHEN pt.code = 'IN' THEN part.name
+            ELSE l_src_move.path
+        END as ubicacion_origen,
+
+        -- LOGICA INTELIGENTE DESTINO (LINEA - usa sm.location_dest_id)
+        CASE
+            WHEN pt.code = 'OUT' THEN part.name
+            WHEN l_dest_move.type = 'internal' THEN w_dest_move.name
+            ELSE l_dest_move.path
+        END as almacen_destino,
+
+        CASE
+            WHEN pt.code = 'OUT' THEN part.name
+            ELSE l_dest_move.path
         END as ubicacion_destino
     """
 
@@ -2582,7 +2769,7 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
                 p.custom_operation_type,
                 proj.name as project_name,
 
-                {smart_locations_sql},
+                {smart_locations_sql_header},
 
                 p.partner_ref,
                 p.purchase_order,
@@ -2631,7 +2818,7 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
                 p.custom_operation_type,
                 proj.name as project_name,
 
-                {smart_locations_sql},
+                {smart_locations_sql_move},
 
                 p.partner_ref,
                 p.purchase_order,
@@ -2660,10 +2847,11 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
             LEFT JOIN stock_lots sl ON sml.lot_id = sl.id
             LEFT JOIN partners part ON p.partner_id = part.id
             LEFT JOIN projects proj ON p.project_id = proj.id
-            LEFT JOIN locations l_src ON p.location_src_id = l_src.id
-            LEFT JOIN locations l_dest ON p.location_dest_id = l_dest.id
-            LEFT JOIN warehouses w_src ON l_src.warehouse_id = w_src.id
-            LEFT JOIN warehouses w_dest ON l_dest.warehouse_id = w_dest.id
+            -- [MULTI-UBICACIÓN] Usar ubicaciones del stock_move, no del picking
+            LEFT JOIN locations l_src_move ON sm.location_src_id = l_src_move.id
+            LEFT JOIN locations l_dest_move ON sm.location_dest_id = l_dest_move.id
+            LEFT JOIN warehouses w_src_move ON l_src_move.warehouse_id = w_src_move.id
+            LEFT JOIN warehouses w_dest_move ON l_dest_move.warehouse_id = w_dest_move.id
             LEFT JOIN employees emp ON p.employee_id = emp.id
 
             WHERE p.company_id = %s
@@ -2681,7 +2869,7 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
                 p.custom_operation_type,
                 proj.name as project_name,
 
-                {smart_locations_sql},
+                {smart_locations_sql_move},
 
                 p.partner_ref,
                 p.purchase_order,
@@ -2705,10 +2893,11 @@ def get_data_for_export(company_id, export_type, selected_ids=None):
             JOIN picking_types pt ON p.picking_type_id = pt.id
             LEFT JOIN partners part ON p.partner_id = part.id
             LEFT JOIN projects proj ON p.project_id = proj.id
-            LEFT JOIN locations l_src ON p.location_src_id = l_src.id
-            LEFT JOIN locations l_dest ON p.location_dest_id = l_dest.id
-            LEFT JOIN warehouses w_src ON l_src.warehouse_id = w_src.id
-            LEFT JOIN warehouses w_dest ON l_dest.warehouse_id = w_dest.id
+            -- [MULTI-UBICACIÓN] Usar ubicaciones del stock_move, no del picking
+            LEFT JOIN locations l_src_move ON sm.location_src_id = l_src_move.id
+            LEFT JOIN locations l_dest_move ON sm.location_dest_id = l_dest_move.id
+            LEFT JOIN warehouses w_src_move ON l_src_move.warehouse_id = w_src_move.id
+            LEFT JOIN warehouses w_dest_move ON l_dest_move.warehouse_id = w_dest_move.id
             LEFT JOIN employees emp ON p.employee_id = emp.id
 
             WHERE p.company_id = %s

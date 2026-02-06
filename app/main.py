@@ -1,9 +1,11 @@
 # mi_wms_backend/app/main.py
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 import traceback
 from app import database as db
 from app.exceptions import (
@@ -127,6 +129,20 @@ app.include_router(reports.router, prefix="/reports", tags=["Reports"])
 app.include_router(projects.router, prefix="/projects", tags=["Projects"])
 app.include_router(employees.router, prefix="/employees", tags=["Employees"])
 
-@app.get("/")
-def read_root():
-    return {"message": "Bienvenido a la API de Mi WMS"}
+# Montar archivos estáticos (CSS, JS, imágenes si los hubiera)
+STATIC_DIR = Path(__file__).parent.parent / "static"
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+@app.get("/", response_class=HTMLResponse)
+def landing_page():
+    """Sirve la landing page de SpaceCom WMS."""
+    landing_path = STATIC_DIR / "landing.html"
+    if landing_path.exists():
+        return landing_path.read_text(encoding="utf-8")
+    return "<h1>SpaceCom WMS</h1><p>Landing page no encontrada.</p>"
+
+@app.get("/api/health")
+def health_check():
+    """Health check para Render y monitoreo."""
+    return {"status": "ok", "message": "API de Mi WMS funcionando correctamente"}

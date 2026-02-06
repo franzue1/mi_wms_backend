@@ -940,6 +940,23 @@ async def get_available_serials(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.get("/stock/by-product-all-locations", response_model=List[dict])
+async def get_product_stock_all_locations(
+    auth: AuthDependency,
+    product_id: int,
+    warehouse_id: Optional[int] = None
+):
+    """
+    [STOCK INTELIGENTE] Obtiene stock disponible de un producto en TODAS las ubicaciones.
+    Retorna lista de {location_id, location_name, qty_available} ordenada por cantidad desc.
+    Solo ubicaciones con stock > 0.
+    """
+    try:
+        results = await asyncio.to_thread(db.get_product_stock_all_locations, product_id, warehouse_id)
+        return results
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # --- 5. Endpoints Dinámicos (AL FINAL) ---
 
 @router.get("/{picking_id}", response_model=schemas.PickingResponse)
@@ -1318,6 +1335,38 @@ async def update_move_price_endpoint(
     if not success:
         raise HTTPException(status_code=404, detail="No se encontró la línea.")
     return {"message": "Precio actualizado."}
+
+
+class MoveLocationUpdate(BaseModel):
+    """Schema para actualizar ubicación de una línea específica."""
+    location_src_id: Optional[int] = None
+    location_dest_id: Optional[int] = None
+
+
+@router.put("/moves/{move_id}/location", status_code=200)
+async def update_move_location_endpoint(
+    move_id: int,
+    data: MoveLocationUpdate,
+    auth: AuthDependency
+):
+    """
+    Actualiza la ubicación origen/destino de una línea específica.
+    Permite multi-ubicación: cada línea puede tener su propia ubicación.
+    """
+    if "operations.can_edit" not in auth.permissions:
+        raise HTTPException(status_code=403, detail="No autorizado")
+
+    success = await asyncio.to_thread(
+        db.update_move_location,
+        move_id,
+        data.location_src_id,
+        data.location_dest_id
+    )
+
+    if not success:
+        raise HTTPException(status_code=404, detail="No se encontró la línea.")
+    return {"message": "Ubicación actualizada."}
+
 
 @router.put("/moves/{move_id}/tracking", status_code=200)
 async def save_move_lines(move_id: int, tracking_data: Dict[str, float], auth: AuthDependency):
